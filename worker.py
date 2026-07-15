@@ -23,6 +23,7 @@ MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen2.5-0.5B")
 MODEL_DTYPE = os.getenv("MODEL_DTYPE", "float32")
 USE_CSR = os.getenv("KIWI_USE_CSR", "false").lower() in ("true", "1", "yes")
 CSR_SPARSITY_RATIO = float(os.getenv("KIWI_CSR_SPARSITY", "0.0"))
+USE_INT8 = os.getenv("KIWI_USE_INT8", "false").lower() in ("true", "1", "yes")
 
 stage: Literal["A", "B"] | None = None
 layer_range: tuple[int, int] | None = None
@@ -168,7 +169,55 @@ async def forward(request: Request):
         async with model_lock:
             hidden_states = await asyncio.to_thread(_run_stage_a, input_ids, request_id, step)
         
-        if USE_CSR:
+        if USE_INT8 and USE_CSR:
+            shape = list(hidden_states.shape)
+            hidden_2d = hidden_states.view(-1, shape[-1])
+            if CSR_SPARSITY_RATIO > 0.0:
+                k = int(hidden_2d.numel() * (1.0 - CSR_SPARSITY_RATIO))
+                if k > 0:
+                    if k < hidden_2d.numel():
+                        flat_abs = torch.abs(hidden_2d).flatten()
+                        threshold = torch.topk(flat_abs, k).values[-1]
+                        mask = torch.abs(hidden_2d) >= threshold
+                        hidden_2d_sparse = hidden_2d * mask
+                    else:
+                        hidden_2d_sparse = hidden_2d
+                else:
+                    hidden_2d_sparse = torch.zeros_like(hidden_2d)
+            else:
+                hidden_2d_sparse = hidden_2d
+                
+            t_sparse = hidden_2d_sparse.to_sparse_csr()
+            crow = t_sparse.crow_indices()
+            col = t_sparse.col_indices()
+            val = t_sparse.values()
+            
+            max_val = val.abs().max().item()
+            scale = max(max_val, 1e-8) / 127.0
+            quantized_val = (val / scale).round().to(torch.int8)
+            
+            original_elements = hidden_states.numel()
+            sparse_elements = val.numel()
+            sparsity_percent = (1.0 - (sparse_elements / max(original_elements, 1))) * 100.0
+            print(f"[{NODE_NAME}] [CSR+INT8 Stage A] Sparsified & Quantized activations: {original_elements} -> {sparse_elements} non-zero values ({sparsity_percent:.2f}% sparse, scale: {scale:.6f})", flush=True)
+            
+            binary_hidden_states = safetensors_save({
+                "crow_indices": crow,
+                "col_indices": col,
+                "quantized_values": quantized_val,
+                "scale": torch.tensor([scale], dtype=torch.float32),
+                "original_shape": torch.tensor(shape, dtype=torch.long)
+            })
+        elif USE_INT8:
+            max_val = hidden_states.abs().max().item()
+            scale = max(max_val, 1e-8) / 127.0
+            quantized = (hidden_states / scale).round().to(torch.int8)
+            print(f"[{NODE_NAME}] [INT8 Stage A] Quantized activations: {hidden_states.numel()} elements (scale: {scale:.6f})", flush=True)
+            binary_hidden_states = safetensors_save({
+                "quantized_hidden_states": quantized,
+                "scale": torch.tensor([scale], dtype=torch.float32)
+            })
+        elif USE_CSR:
             shape = list(hidden_states.shape)
             hidden_2d = hidden_states.view(-1, shape[-1])
             if CSR_SPARSITY_RATIO > 0.0:
@@ -228,19 +277,44 @@ async def forward(request: Request):
 
     hidden_states = tensors.get("hidden_states")
     if hidden_states is None:
-        # Check for CSR components
+        # Check for CSR + INT8 combined components
         crow = tensors.get("crow_indices")
         col = tensors.get("col_indices")
-        val = tensors.get("values")
+        quantized_val = tensors.get("quantized_values")
+        scale_tensor = tensors.get("scale")
         shape_tensor = tensors.get("original_shape")
-        if crow is not None and col is not None and val is not None and shape_tensor is not None:
+        if crow is not None and col is not None and quantized_val is not None and scale_tensor is not None and shape_tensor is not None:
+            # Dequantize values
+            scale = scale_tensor.item()
+            val = quantized_val.float() * scale
+            # Reconstruct CSR
             original_shape = list(shape_tensor.tolist())
             size_2d = (original_shape[0] * original_shape[1], original_shape[2])
             sparse_2d = torch.sparse_csr_tensor(crow, col, val, size=size_2d)
             hidden_states = sparse_2d.to_dense().view(original_shape)
-            print(f"[{NODE_NAME}] [CSR Stage B] Decompressed sparse activations back to shape {original_shape}", flush=True)
+            print(f"[{NODE_NAME}] [CSR+INT8 Stage B] Dequantized & Decompressed sparse activations back to shape {original_shape}", flush=True)
+        # Check for INT8 components
         else:
-            raise HTTPException(status_code=400, detail="Stage B requires hidden_states or CSR components (crow_indices, col_indices, values, original_shape)")
+            quantized = tensors.get("quantized_hidden_states")
+            scale_tensor = tensors.get("scale")
+            if quantized is not None and scale_tensor is not None:
+                scale = scale_tensor.item()
+                hidden_states = quantized.float() * scale
+                print(f"[{NODE_NAME}] [INT8 Stage B] Dequantized activations back to shape {list(hidden_states.shape)}", flush=True)
+            else:
+                # Check for CSR components
+                crow = tensors.get("crow_indices")
+                col = tensors.get("col_indices")
+                val = tensors.get("values")
+                shape_tensor = tensors.get("original_shape")
+                if crow is not None and col is not None and val is not None and shape_tensor is not None:
+                    original_shape = list(shape_tensor.tolist())
+                    size_2d = (original_shape[0] * original_shape[1], original_shape[2])
+                    sparse_2d = torch.sparse_csr_tensor(crow, col, val, size=size_2d)
+                    hidden_states = sparse_2d.to_dense().view(original_shape)
+                    print(f"[{NODE_NAME}] [CSR Stage B] Decompressed sparse activations back to shape {original_shape}", flush=True)
+                else:
+                    raise HTTPException(status_code=400, detail="Stage B requires hidden_states, INT8 components, or CSR components")
 
     async with model_lock:
         token_id = await asyncio.to_thread(_run_stage_b, hidden_states, request_id, step)

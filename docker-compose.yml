@@ -28,6 +28,7 @@ services:
       MODEL_ID: Qwen/Qwen2.5-0.5B
       MODEL_DTYPE: float32
       KIWI_USE_CSR: "true"
+      KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.80"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -46,6 +47,7 @@ services:
       MODEL_ID: Qwen/Qwen2.5-0.5B
       MODEL_DTYPE: float32
       KIWI_USE_CSR: "true"
+      KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.80"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -64,6 +66,7 @@ services:
       MODEL_ID: Qwen/Qwen2.5-0.5B
       MODEL_DTYPE: float32
       KIWI_USE_CSR: "true"
+      KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.80"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -82,6 +85,7 @@ services:
       MODEL_ID: Qwen/Qwen2.5-0.5B
       MODEL_DTYPE: float32
       KIWI_USE_CSR: "true"
+      KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.80"
     volumes:
       - hf_cache:/root/.cache/huggingface
