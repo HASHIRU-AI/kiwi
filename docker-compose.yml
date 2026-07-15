@@ -27,6 +27,8 @@ services:
       GATEWAY_URL: http://gateway:8080
       MODEL_ID: Qwen/Qwen2.5-0.5B
       MODEL_DTYPE: float32
+      KIWI_USE_CSR: "true"
+      KIWI_CSR_SPARSITY: "0.80"
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
@@ -43,6 +45,8 @@ services:
       GATEWAY_URL: http://gateway:8080
       MODEL_ID: Qwen/Qwen2.5-0.5B
       MODEL_DTYPE: float32
+      KIWI_USE_CSR: "true"
+      KIWI_CSR_SPARSITY: "0.80"
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
@@ -59,6 +63,8 @@ services:
       GATEWAY_URL: http://gateway:8080
       MODEL_ID: Qwen/Qwen2.5-0.5B
       MODEL_DTYPE: float32
+      KIWI_USE_CSR: "true"
+      KIWI_CSR_SPARSITY: "0.80"
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
@@ -75,6 +81,8 @@ services:
       GATEWAY_URL: http://gateway:8080
       MODEL_ID: Qwen/Qwen2.5-0.5B
       MODEL_DTYPE: float32
+      KIWI_USE_CSR: "true"
+      KIWI_CSR_SPARSITY: "0.80"
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
