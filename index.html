@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en" class="h-full bg-slate-950">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kiwi — Enterprise Compute Swarm</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-full bg-slate-950 text-slate-100">
+  <main class="mx-auto flex min-h-screen max-w-5xl flex-col px-5 py-8">
+    <header class="mb-7 flex items-center gap-3">
+      <div class="grid h-11 w-11 place-items-center rounded-xl bg-lime-400 text-2xl text-slate-950">K</div>
+      <div>
+        <h1 class="text-xl font-semibold tracking-tight">Kiwi Compute Swarm</h1>
+        <p class="text-sm text-slate-400">Fault-tolerant P2P tensor forwarding</p>
+      </div>
+      <a href="/registry" target="_blank" class="ml-auto text-sm text-lime-300 hover:text-lime-200">View live registry</a>
+    </header>
+
+    <section id="chat" class="flex-1 space-y-5 rounded-2xl border border-slate-800 bg-slate-900/50 p-5 shadow-2xl shadow-black/20" aria-live="polite">
+      <div class="rounded-xl bg-slate-800/70 p-4 text-slate-300">
+        Ask the distributed Qwen pipeline anything. Stop an active worker mid-stream to watch cache rebuild and rerouting.
+      </div>
+    </section>
+
+    <form id="composer" class="mt-5 flex gap-3">
+      <label class="sr-only" for="prompt">Message</label>
+      <textarea id="prompt" rows="2" required placeholder="Write a 300-word essay about the history of distributed systems."
+        class="min-h-14 flex-1 resize-none rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-slate-100 outline-none placeholder:text-slate-500 focus:border-lime-400"></textarea>
+      <button id="send" type="submit" class="rounded-xl bg-lime-400 px-5 font-semibold text-slate-950 transition hover:bg-lime-300 disabled:cursor-not-allowed disabled:opacity-50">Send</button>
+    </form>
+  </main>
+
+  <script>
+    const chat = document.querySelector('#chat');
+    const form = document.querySelector('#composer');
+    const promptInput = document.querySelector('#prompt');
+    const sendButton = document.querySelector('#send');
+
+    function addMessage(text, kind) {
+      const message = document.createElement('div');
+      message.className = kind === 'user'
+        ? 'ml-auto max-w-3xl rounded-xl bg-lime-400 px-4 py-3 text-slate-950'
+        : 'max-w-3xl whitespace-pre-wrap rounded-xl bg-slate-800 px-4 py-3 text-slate-100';
+      message.textContent = text;
+      chat.appendChild(message);
+      chat.scrollTop = chat.scrollHeight;
+      return message;
+    }
+
+    function appendDelta(container, text) {
+      if (text === '[REROUTING...]') {
+        const warning = document.createElement('span');
+        warning.className = 'font-bold text-red-500';
+        warning.textContent = '[REROUTING...]';
+        container.appendChild(warning);
+        container.appendChild(document.createTextNode(' '));
+      } else {
+        container.appendChild(document.createTextNode(text));
+      }
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const prompt = promptInput.value.trim();
+      if (!prompt) return;
+      addMessage(prompt, 'user');
+      const answer = addMessage('', 'assistant');
+      promptInput.value = '';
+      sendButton.disabled = true;
+
+      try {
+        const response = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            model: 'kiwi-qwen2.5-0.5b',
+            messages: [{role: 'user', content: prompt}],
+            stream: true,
+            max_tokens: 300,
+          }),
+        });
+        if (!response.ok || !response.body) throw new Error(`Gateway returned ${response.status}`);
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+          const {value, done} = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, {stream: true});
+          const events = buffer.split('\n\n');
+          buffer = events.pop();
+          for (const eventText of events) {
+            const line = eventText.split('\n').find(line => line.startsWith('data: '));
+            if (!line) continue;
+            const data = line.slice(6);
+            if (data === '[DONE]') continue;
+            const event = JSON.parse(data);
+            if (event.error) throw new Error(event.error.message);
+            const delta = event.choices?.[0]?.delta?.content;
+            if (delta) appendDelta(answer, delta);
+          }
+        }
+      } catch (error) {
+        const errorText = document.createElement('span');
+        errorText.className = 'font-bold text-red-500';
+        errorText.textContent = `Error: ${error.message}`;
+        answer.appendChild(errorText);
+      } finally {
+        sendButton.disabled = false;
+        promptInput.focus();
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,85 @@
+services:
+  gateway:
+    build: .
+    container_name: kiwi_gateway_1
+    command: uvicorn gateway:app --host 0.0.0.0 --port 8080
+    ports:
+      - "8080:8080"
+    environment:
+      MODEL_ID: Qwen/Qwen2.5-0.5B
+      REQUEST_TIMEOUT_SECONDS: "120"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  worker_1:
+    build: .
+    container_name: kiwi-worker_1-1
+    command: uvicorn worker:app --host 0.0.0.0 --port 8000
+    environment:
+      NODE_NAME: worker_1
+      NODE_URL: http://worker_1:8000
+      GATEWAY_URL: http://gateway:8080
+      MODEL_ID: Qwen/Qwen2.5-0.5B
+      MODEL_DTYPE: float32
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  worker_2:
+    build: .
+    container_name: kiwi-worker_2-1
+    command: uvicorn worker:app --host 0.0.0.0 --port 8000
+    environment:
+      NODE_NAME: worker_2
+      NODE_URL: http://worker_2:8000
+      GATEWAY_URL: http://gateway:8080
+      MODEL_ID: Qwen/Qwen2.5-0.5B
+      MODEL_DTYPE: float32
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  worker_3:
+    build: .
+    container_name: kiwi-worker_3-1
+    command: uvicorn worker:app --host 0.0.0.0 --port 8000
+    environment:
+      NODE_NAME: worker_3
+      NODE_URL: http://worker_3:8000
+      GATEWAY_URL: http://gateway:8080
+      MODEL_ID: Qwen/Qwen2.5-0.5B
+      MODEL_DTYPE: float32
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  worker_4:
+    build: .
+    container_name: kiwi-worker_4-1
+    command: uvicorn worker:app --host 0.0.0.0 --port 8000
+    environment:
+      NODE_NAME: worker_4
+      NODE_URL: http://worker_4:8000
+      GATEWAY_URL: http://gateway:8080
+      MODEL_ID: Qwen/Qwen2.5-0.5B
+      MODEL_DTYPE: float32
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+volumes:
+  hf_cache:
