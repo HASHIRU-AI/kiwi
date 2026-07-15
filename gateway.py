@@ -22,10 +22,11 @@ from safetensors.torch import save as safetensors_save
 from transformers import AutoTokenizer
 
 
-MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen2.5-0.5B")
+MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct")
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
 MAX_REROUTES = int(os.getenv("MAX_REROUTES", "4"))
 INDEX_FILE = Path(__file__).with_name("index.html")
+HEARTBEAT_STALE_SECONDS = float(os.getenv("HEARTBEAT_STALE_SECONDS", "15"))
 
 
 class WorkerRegistration(BaseModel):
@@ -59,6 +60,7 @@ class Worker:
     vram_gb: float
     healthy: bool = True
     registered_at: float = 0.0
+    last_seen: float = 0.0
 
 
 class WorkerRegistry:
@@ -77,6 +79,7 @@ class WorkerRegistry:
                 existing.vram_gb = registration.vram_gb
                 existing.healthy = True
                 existing.registered_at = time.time()
+                existing.last_seen = time.time()
                 return existing
 
             stage = self._choose_stage(registration.pool_hint)
@@ -89,6 +92,7 @@ class WorkerRegistry:
                 cpu_cores=registration.cpu_cores,
                 vram_gb=registration.vram_gb,
                 registered_at=time.time(),
+                last_seen=time.time(),
             )
             self._workers[worker.node_url] = worker
             # Keep the name lookup too: restart registration must retain its assignment.
@@ -139,10 +143,29 @@ class WorkerRegistry:
                     "stage": worker.stage,
                     "layers": list(worker.layers),
                     "healthy": worker.healthy,
+                    "last_seen": round(time.time() - worker.last_seen, 1),
                 }
                 for key, worker in self._workers.items()
                 if key == worker.node_url
             ]
+
+    async def heartbeat(self, node_url: str) -> None:
+        async with self._lock:
+            worker = self._workers.get(node_url.rstrip("/"))
+            if worker:
+                worker.last_seen = time.time()
+                worker.healthy = True
+
+    async def evict_stale(self, stale_seconds: float) -> list[str]:
+        """Mark workers as unhealthy if they haven't sent a heartbeat recently."""
+        async with self._lock:
+            cutoff = time.time() - stale_seconds
+            evicted = []
+            for key, worker in self._workers.items():
+                if key == worker.node_url and worker.healthy and worker.last_seen < cutoff:
+                    worker.healthy = False
+                    evicted.append(worker.node_name)
+            return evicted
 
 
 registry = WorkerRegistry()
@@ -154,7 +177,18 @@ async def lifespan(_: FastAPI):
     global tokenizer
     # Tokenization is gateway-only; workers never receive raw prompt text.
     tokenizer = await asyncio.to_thread(AutoTokenizer.from_pretrained, MODEL_ID)
+
+    async def _staleness_loop() -> None:
+        """Proactively evict workers that stopped sending heartbeats."""
+        while True:
+            await asyncio.sleep(HEARTBEAT_STALE_SECONDS / 2)
+            evicted = await registry.evict_stale(HEARTBEAT_STALE_SECONDS)
+            if evicted:
+                print(f"[gateway] Evicted stale workers: {evicted}")
+
+    staleness_task = asyncio.create_task(_staleness_loop())
     yield
+    staleness_task.cancel()
 
 
 app = FastAPI(title="Kiwi Enterprise Compute Swarm", lifespan=lifespan)
@@ -181,6 +215,23 @@ async def register_worker(registration: WorkerRegistration) -> JSONResponse:
     return JSONResponse({"stage": worker.stage, "layers": list(worker.layers)})
 
 
+class HeartbeatRequest(BaseModel):
+    node_name: str
+    node_url: str
+
+
+@app.post("/heartbeat")
+async def heartbeat(request: HeartbeatRequest) -> dict[str, str]:
+    await registry.heartbeat(request.node_url)
+    return {"status": "ok"}
+
+
+@app.post("/deregister")
+async def deregister(request: HeartbeatRequest) -> dict[str, str]:
+    await registry.evict(request.node_url)
+    return {"status": "evicted"}
+
+
 def _prompt_ids(messages: list[ChatMessage]) -> torch.Tensor:
     if tokenizer is None:
         raise HTTPException(status_code=503, detail="Tokenizer is still loading")
@@ -201,7 +252,7 @@ def _sse(payload: dict[str, object]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def _chunk(request_id: str, content: str | None, finish_reason: str | None = None) -> str:
+def _chunk(request_id: str, content: str | None, active_nodes: dict[str, str] | None = None, finish_reason: str | None = None) -> str:
     return _sse(
         {
             "id": f"chatcmpl-{request_id}",
@@ -209,6 +260,7 @@ def _chunk(request_id: str, content: str | None, finish_reason: str | None = Non
             "created": int(time.time()),
             "model": MODEL_ID,
             "choices": [{"index": 0, "delta": {"content": content} if content else {}, "finish_reason": finish_reason}],
+            "active_nodes": active_nodes,
         }
     )
 
@@ -237,6 +289,7 @@ async def _stream_completion(request: ChatCompletionRequest) -> AsyncIterator[st
             input_ids = context_ids if is_prefill else torch.tensor([[generated_ids[-1]]], dtype=torch.long)
             body = safetensors_save({"input_ids": input_ids.contiguous()})
 
+            active_nodes = {"A": node_a.node_url, "B": node_b.node_url}
             try:
                 response = await client.post(
                     f"{node_a.node_url}/forward",
@@ -257,12 +310,13 @@ async def _stream_completion(request: ChatCompletionRequest) -> AsyncIterator[st
                 if isinstance(error, httpx.HTTPStatusError):
                     failed_url = error.response.headers.get("X-Kiwi-Failed-Node")
                 await registry.evict(failed_url or node_a.node_url)
-                yield _chunk(request_id, "[REROUTING...]")
+                yield _chunk(request_id, "[REROUTING...]", active_nodes=active_nodes)
                 if reroutes > MAX_REROUTES:
                     yield _sse({"error": {"message": "Retry budget exhausted", "type": "server_error"}})
                     break
                 try:
                     node_a, node_b = await registry.select_pair()
+                    active_nodes = {"A": node_a.node_url, "B": node_b.node_url}
                 except RuntimeError as no_pair:
                     yield _sse({"error": {"message": str(no_pair), "type": "server_error"}})
                     break
@@ -280,7 +334,7 @@ async def _stream_completion(request: ChatCompletionRequest) -> AsyncIterator[st
             if token_id in eos_set:
                 break
             if text:
-                yield _chunk(request_id, text)
+                yield _chunk(request_id, text, active_nodes=active_nodes)
             is_prefill = False
 
     yield _chunk(request_id, None, "stop")

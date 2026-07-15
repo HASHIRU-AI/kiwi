@@ -2,7 +2,7 @@
 
 Kiwi is a fault-tolerant, pipeline-parallel LLM gateway that unifies a fleet of machines into a single inference endpoint. Inspired by [Petals](https://github.com/bigscience-workshop/petals), it splits a transformer model across multiple workers and chains them via direct peer-to-peer tensor forwarding — the heavy intermediate activations never touch the central gateway.
 
-> **Current PoC:** 5 Docker containers running [Qwen/Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B) split across 4 workers (2 × Stage A, 2 × Stage B), orchestrated by a single gateway with a built-in chat UI.
+> **Current PoC:** 5 Docker containers running [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) split across 4 workers (2 × Stage A, 2 × Stage B), orchestrated by a single gateway with a built-in chat UI.
 
 ---
 
@@ -19,6 +19,21 @@ When a worker dies mid-generation, the gateway selects a new healthy pair and se
 
 ### Dynamic Block Assignment
 Workers boot completely agnostic — no hardcoded roles. On startup, each worker sends its URL and hardware telemetry to the gateway's `/register` endpoint. The gateway's scheduler counts active nodes per stage and assigns the worker to whichever stage has fewer replicas, returning the layer range to load. The worker then slices the model accordingly.
+
+### Heartbeat & Eviction Loop
+Workers ping the gateway `/heartbeat` every 5 seconds to announce health status. The gateway maintains a background loop that evaluates all nodes, automatically evicting any worker that stops sending heartbeats for over 15 seconds.
+
+### Graceful Worker Drain
+When a worker container is stopped or restarted, it invokes `/deregister` during the shutdown lifecycle. This allows the gateway to evict the worker immediately, bypassing the staleness timeout.
+
+### KV-Cache TTL Eviction
+To avoid Memory leaks and Out-of-Memory (OOM) situations on workers, a background task automatically purges request cache entries that have not been accessed for more than 60 seconds.
+
+### Multi-Turn Conversation History
+The frontend stores conversation history and includes full turns in successive generation requests, allowing the model to leverage prior context.
+
+### Live Topology Visualization & Active Highlighting
+The chat UI includes an interactive network topology panel. During text generation, the canvas highlights the exact Stage A and Stage B worker pair currently processing the request in neon green, draws active data stream particles along the edge, and dims (reduces opacity of) all inactive worker nodes in the swarm. Evicted nodes are colored red.
 
 ---
 
@@ -95,7 +110,7 @@ Kiwi exposes an OpenAI-compatible chat completions endpoint:
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "kiwi-qwen2.5-0.5b",
+    "model": "kiwi-qwen2.5-0.5b-instruct",
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": true,
     "max_tokens": 128
@@ -118,21 +133,23 @@ kiwi/
 
 ### Gateway (`gateway.py`)
 - Owns the `AutoTokenizer` — workers never see raw text
-- Maintains an in-memory `WorkerRegistry` with stage balancing
-- Runs the generation loop: tokenize → dispatch to Stage A → receive token → stream SSE
-- Implements active recompute on failure: evict dead node → select new pair → re-prefill with full context
+- Maintains an in-memory `WorkerRegistry` with stage balancing and `last_seen` heartbeat metrics
+- Runs the generation loop: tokenize ➔ dispatch to Stage A ➔ receive token ➔ stream SSE (including active node mapping)
+- Implements active recompute on failure: evict dead node ➔ select new pair ➔ re-prefill with full context
 
 ### Worker (`worker.py`)
 - Boots agnostically, registers via `POST /register`, receives stage + layer assignment
-- Dynamically slices the Qwen model (keeps only assigned layers)
+- Runs a background loop pinging `/heartbeat` to gateway every 5s
+- Sends `POST /deregister` on shutdown for graceful eviction
+- Runs a background TTL cache manager to evict idle KV cache items older than 60s
 - Stage A: computes hidden states, P2P forwards to Stage B via `httpx`
 - Stage B: computes logits + argmax, returns `next_token_id`
 - Maintains per-request KV cache keyed by `X-Request-ID`
 
 ### Frontend (`index.html`)
-- Dark-mode TailwindCSS chat interface
+- Dark-mode TailwindCSS chat interface supporting multi-turn conversation memory
 - SSE streaming with progressive token rendering
-- `[REROUTING...]` events rendered in red to visualize fault tolerance
+- Canvas-based topology panel with active pipeline path highlighting and eviction visualizers
 
 ---
 
