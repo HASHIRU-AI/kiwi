@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
@@ -19,14 +20,16 @@ from transformers import AutoModelForCausalLM
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://gateway:8080").rstrip("/")
 NODE_NAME = os.getenv("NODE_NAME", "worker")
 NODE_URL = os.getenv("NODE_URL", "http://worker:8000").rstrip("/")
-MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen2.5-0.5B")
+MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct")
 MODEL_DTYPE = os.getenv("MODEL_DTYPE", "float32")
 
 stage: Literal["A", "B"] | None = None
 layer_range: tuple[int, int] | None = None
 model: Any | None = None
-kv_cache: dict[str, Any] = {}
+kv_cache: dict[str, tuple[float, Any]] = {}  # request_id -> (last_accessed, past_key_values)
 model_lock = asyncio.Lock()
+KV_CACHE_TTL_SECONDS = float(os.getenv("KV_CACHE_TTL_SECONDS", "60"))
+HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "5"))
 
 
 def _dtype() -> torch.dtype:
@@ -81,6 +84,42 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
     return loaded_model
 
 
+async def _heartbeat_loop() -> None:
+    """Ping the gateway periodically so it knows we're alive."""
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                await client.post(
+                    f"{GATEWAY_URL}/heartbeat",
+                    json={"node_name": NODE_NAME, "node_url": NODE_URL},
+                )
+        except httpx.HTTPError:
+            pass  # Gateway may be temporarily unreachable; keep retrying.
+
+
+async def _cache_eviction_loop() -> None:
+    """Evict KV-cache entries that haven't been accessed within the TTL."""
+    while True:
+        await asyncio.sleep(10)
+        cutoff = time.time() - KV_CACHE_TTL_SECONDS
+        stale = [k for k, (ts, _) in kv_cache.items() if ts < cutoff]
+        for k in stale:
+            del kv_cache[k]
+
+
+async def _deregister() -> None:
+    """Notify the gateway we're shutting down so it can evict us immediately."""
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            await client.post(
+                f"{GATEWAY_URL}/deregister",
+                json={"node_name": NODE_NAME, "node_url": NODE_URL},
+            )
+    except httpx.HTTPError:
+        pass
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global stage, layer_range, model
@@ -89,7 +128,12 @@ async def lifespan(_: FastAPI):
     layer_range = tuple(assignment["layers"])
     # Deliberately not global import-time initialization: role assignment comes first.
     model = await asyncio.to_thread(_load_assigned_model, assignment)
+    heartbeat_task = asyncio.create_task(_heartbeat_loop())
+    eviction_task = asyncio.create_task(_cache_eviction_loop())
     yield
+    heartbeat_task.cancel()
+    eviction_task.cancel()
+    await _deregister()
     kv_cache.clear()
 
 
@@ -112,7 +156,8 @@ def _cache_for(request_id: str, step: str) -> Any | None:
         # Recompute and explicit new prompts replace stale cache state atomically.
         kv_cache.pop(request_id, None)
         return None
-    return kv_cache.get(request_id)
+    entry = kv_cache.get(request_id)
+    return entry[1] if entry else None
 
 
 def _run_stage_a(input_ids: torch.Tensor, request_id: str, step: str) -> torch.Tensor:
@@ -124,7 +169,7 @@ def _run_stage_a(input_ids: torch.Tensor, request_id: str, step: str) -> torch.T
             use_cache=True,
             return_dict=True,
         )
-    kv_cache[request_id] = outputs.past_key_values
+    kv_cache[request_id] = (time.time(), outputs.past_key_values)
     return outputs.last_hidden_state.contiguous()
 
 
@@ -138,7 +183,7 @@ def _run_stage_b(hidden_states: torch.Tensor, request_id: str, step: str) -> int
             return_dict=True,
         )
         logits = model.lm_head(outputs.last_hidden_state[:, -1, :])
-    kv_cache[request_id] = outputs.past_key_values
+    kv_cache[request_id] = (time.time(), outputs.past_key_values)
     return int(torch.argmax(logits, dim=-1).item())
 
 

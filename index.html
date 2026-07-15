@@ -15,7 +15,12 @@
         <p class="text-sm text-slate-400">Fault-tolerant P2P tensor forwarding</p>
       </div>
       <a href="/registry" target="_blank" class="ml-auto text-sm text-lime-300 hover:text-lime-200">View live registry</a>
+      <button id="toggleTopo" class="rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs text-slate-300 transition hover:border-lime-400 hover:text-lime-300">Topology</button>
     </header>
+
+    <section id="topoPanel" class="mb-5 hidden rounded-2xl border border-slate-800 bg-slate-900/50 p-3 shadow-2xl shadow-black/20">
+      <canvas id="topoCanvas" width="960" height="200" class="mx-auto block"></canvas>
+    </section>
 
     <section id="chat" class="flex-1 space-y-5 rounded-2xl border border-slate-800 bg-slate-900/50 p-5 shadow-2xl shadow-black/20" aria-live="polite">
       <div class="rounded-xl bg-slate-800/70 p-4 text-slate-300">
@@ -32,10 +37,210 @@
   </main>
 
   <script>
+    /* ── Topology Visualization ────────────────────────────────── */
+    const topoPanel = document.querySelector('#topoPanel');
+    const topoCanvas = document.querySelector('#topoCanvas');
+    const toggleTopo = document.querySelector('#toggleTopo');
+    const ctx = topoCanvas.getContext('2d');
+    let topoVisible = false;
+    let registryData = [];
+    let particlePhase = 0;
+    let isGenerating = false;
+    let activeNodes = null;
+
+    toggleTopo.addEventListener('click', () => {
+      topoVisible = !topoVisible;
+      topoPanel.classList.toggle('hidden', !topoVisible);
+      toggleTopo.textContent = topoVisible ? 'Hide Topology' : 'Topology';
+    });
+
+    function drawRoundedRect(x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.lineTo(x + w - r, y);
+      ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+      ctx.lineTo(x + w, y + h - r);
+      ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+      ctx.lineTo(x + r, y + h);
+      ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+      ctx.lineTo(x, y + r);
+      ctx.quadraticCurveTo(x, y, x + r, y);
+      ctx.closePath();
+    }
+
+    function drawTopo() {
+      const W = topoCanvas.width, H = topoCanvas.height;
+      ctx.clearRect(0, 0, W, H);
+      if (!registryData.length) {
+        ctx.fillStyle = '#64748b';
+        ctx.font = '13px system-ui';
+        ctx.textAlign = 'center';
+        ctx.fillText('No workers registered', W / 2, H / 2);
+        return;
+      }
+
+      const stageA = registryData.filter(w => w.stage === 'A');
+      const stageB = registryData.filter(w => w.stage === 'B');
+      const gwX = W / 2, gwY = 30;
+      const nodeW = 120, nodeH = 52, nodeR = 10;
+
+      // Gateway node
+      drawRoundedRect(gwX - nodeW / 2, gwY - 18, nodeW, 36, 8);
+      ctx.fillStyle = '#1e293b';
+      ctx.fill();
+      ctx.strokeStyle = '#a3e635';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = '#a3e635';
+      ctx.font = 'bold 13px system-ui';
+      ctx.textAlign = 'center';
+      ctx.fillText('Gateway', gwX, gwY + 5);
+
+      // Position helpers
+      const aY = 110, bY = 110;
+      const aStartX = W / 2 - (stageA.length * (nodeW + 20)) / 2 + 10;
+      const bStartX = W / 2 - (stageB.length * (nodeW + 20)) / 2 + 10;
+      const aXOff = stageA.length ? -((stageA.length * (nodeW + 20)) / 2) + nodeW / 2 + 10 : 0;
+      const bXOff = stageB.length ? ((stageB.length * (nodeW + 20)) / 2) - nodeW / 2 - 10 : 0;
+
+      function drawWorker(w, x, y, stageLabel) {
+        const isActive = activeNodes && (w.node_url === activeNodes.A || w.node_url === activeNodes.B);
+        const isDimmed = isGenerating && activeNodes && !isActive;
+
+        // Edge from gateway
+        ctx.beginPath();
+        ctx.moveTo(gwX, gwY + 18);
+        ctx.lineTo(x, y - nodeH / 2);
+        ctx.strokeStyle = w.healthy ? (isActive ? '#a3e635' : '#334155') : '#7f1d1d';
+        ctx.lineWidth = isActive ? 2.5 : 1.5;
+        ctx.setLineDash(w.healthy ? [] : [4, 4]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Flowing particle on edge (only draw on the active Stage A worker)
+        if (w.healthy && isGenerating && activeNodes && w.node_url === activeNodes.A) {
+          const t = (particlePhase % 100) / 100;
+          const px = gwX + (x - gwX) * t;
+          const py = (gwY + 18) + (y - nodeH / 2 - gwY - 18) * t;
+          ctx.beginPath();
+          ctx.arc(px, py, 3.5, 0, Math.PI * 2);
+          ctx.fillStyle = '#a3e635';
+          ctx.shadowColor = '#a3e635';
+          ctx.shadowBlur = 4;
+          ctx.fill();
+          ctx.shadowBlur = 0;
+        }
+
+        // Node box
+        drawRoundedRect(x - nodeW / 2, y - nodeH / 2, nodeW, nodeH, nodeR);
+        const healthy = w.healthy;
+        ctx.fillStyle = healthy ? '#0f172a' : '#1c0a0a';
+        ctx.globalAlpha = isDimmed ? 0.35 : 1.0;
+        ctx.fill();
+        ctx.strokeStyle = healthy ? (isActive ? '#a3e635' : '#22c55e') : '#ef4444';
+        ctx.lineWidth = healthy ? (isActive ? 3.0 : 1.5) : 2;
+        ctx.stroke();
+
+        // Glow effect
+        if (healthy) {
+          ctx.shadowColor = isActive ? '#a3e635' : '#22c55e';
+          ctx.shadowBlur = isActive ? 12 : 8;
+          ctx.strokeStyle = isActive ? '#a3e63566' : '#22c55e44';
+          ctx.stroke();
+          ctx.shadowBlur = 0;
+        }
+
+        // Text
+        ctx.fillStyle = healthy ? (isActive ? '#fff' : '#e2e8f0') : '#fca5a5';
+        ctx.font = isActive ? 'bold 13px system-ui' : 'bold 12px system-ui';
+        ctx.textAlign = 'center';
+        ctx.fillText(w.node_name, x, y - 6);
+        ctx.fillStyle = healthy ? (isActive ? '#a3e635' : '#94a3b8') : '#f87171';
+        ctx.font = '10px system-ui';
+        ctx.fillText(`Stage ${w.stage} · L${w.layers[0]}-${w.layers[1]}`, x, y + 8);
+        ctx.fillText(healthy ? `${w.last_seen.toFixed(0)}s ago` : 'EVICTED', x, y + 20);
+        ctx.globalAlpha = 1.0;
+      }
+
+      // Draw Stage A workers (left side)
+      stageA.forEach((w, i) => {
+        const totalWidth = stageA.length * nodeW + (stageA.length - 1) * 20;
+        const x = (W / 2 - totalWidth / 2 + nodeW / 2 + i * (nodeW + 20)) - (stageB.length ? (W * 0.12) : 0);
+        drawWorker(w, x, aY, 'A');
+
+        // Draw P2P edges from A to B workers
+        stageB.forEach((bw, j) => {
+          const bTotalWidth = stageB.length * nodeW + (stageB.length - 1) * 20;
+          const bx = (W / 2 - bTotalWidth / 2 + nodeW / 2 + j * (nodeW + 20)) + (stageA.length ? (W * 0.12) : 0);
+          const isLinkActive = activeNodes && w.node_url === activeNodes.A && bw.node_url === activeNodes.B;
+
+          ctx.beginPath();
+          ctx.moveTo(x + nodeW / 2, aY);
+          ctx.lineTo(bx - nodeW / 2, bY);
+          ctx.strokeStyle = (w.healthy && bw.healthy) ? (isLinkActive ? '#38bdf8' : '#1e3a5f') : '#3f1515';
+          ctx.lineWidth = isLinkActive ? 2.5 : 1;
+          ctx.setLineDash(isLinkActive ? [] : [3, 5]);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          // P2P particle (only on active link)
+          if (w.healthy && bw.healthy && isGenerating && isLinkActive) {
+            const t = ((particlePhase + 50) % 100) / 100;
+            const px = (x + nodeW / 2) + (bx - nodeW / 2 - x - nodeW / 2) * t;
+            const py = aY + (bY - aY) * t;
+            ctx.beginPath();
+            ctx.arc(px, py, 3.5, 0, Math.PI * 2);
+            ctx.fillStyle = '#38bdf8';
+            ctx.shadowColor = '#38bdf8';
+            ctx.shadowBlur = 4;
+            ctx.fill();
+            ctx.shadowBlur = 0;
+          }
+        });
+      });
+
+      // Draw Stage B workers (right side)
+      stageB.forEach((w, i) => {
+        const totalWidth = stageB.length * nodeW + (stageB.length - 1) * 20;
+        const x = (W / 2 - totalWidth / 2 + nodeW / 2 + i * (nodeW + 20)) + (stageA.length ? (W * 0.12) : 0);
+        drawWorker(w, x, bY, 'B');
+      });
+
+      // Labels
+      ctx.fillStyle = '#475569';
+      ctx.font = '10px system-ui';
+      ctx.textAlign = 'left';
+      if (stageA.length) ctx.fillText('STAGE A', 16, H - 8);
+      ctx.textAlign = 'right';
+      if (stageB.length) ctx.fillText('STAGE B', W - 16, H - 8);
+    }
+
+    // Poll registry and animate
+    async function pollRegistry() {
+      try {
+        const resp = await fetch('/registry');
+        const data = await resp.json();
+        registryData = data.workers || [];
+      } catch (e) { /* ignore */ }
+    }
+
+    pollRegistry();
+    setInterval(pollRegistry, 2000);
+    setInterval(() => {
+      if (topoVisible) {
+        particlePhase = (particlePhase + 2) % 100;
+        drawTopo();
+      }
+    }, 50);
+  </script>
+
+  <script>
+    /* ── Chat Logic ────────────────────────────────────────────── */
     const chat = document.querySelector('#chat');
     const form = document.querySelector('#composer');
     const promptInput = document.querySelector('#prompt');
     const sendButton = document.querySelector('#send');
+    const conversationHistory = [];
 
     function addMessage(text, kind) {
       const message = document.createElement('div');
@@ -66,17 +271,20 @@
       const prompt = promptInput.value.trim();
       if (!prompt) return;
       addMessage(prompt, 'user');
+      conversationHistory.push({role: 'user', content: prompt});
       const answer = addMessage('', 'assistant');
       promptInput.value = '';
       sendButton.disabled = true;
+      let assistantText = '';
+      isGenerating = true;
 
       try {
         const response = await fetch('/v1/chat/completions', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
-            model: 'kiwi-qwen2.5-0.5b',
-            messages: [{role: 'user', content: prompt}],
+            model: 'kiwi-qwen2.5-0.5b-instruct',
+            messages: [...conversationHistory],
             stream: true,
             max_tokens: 300,
           }),
@@ -98,16 +306,23 @@
             if (data === '[DONE]') continue;
             const event = JSON.parse(data);
             if (event.error) throw new Error(event.error.message);
+            if (event.active_nodes) activeNodes = event.active_nodes;
             const delta = event.choices?.[0]?.delta?.content;
-            if (delta) appendDelta(answer, delta);
+            if (delta) {
+              appendDelta(answer, delta);
+              if (delta !== '[REROUTING...]') assistantText += delta;
+            }
           }
         }
+        if (assistantText) conversationHistory.push({role: 'assistant', content: assistantText});
       } catch (error) {
         const errorText = document.createElement('span');
         errorText.className = 'font-bold text-red-500';
         errorText.textContent = `Error: ${error.message}`;
         answer.appendChild(errorText);
       } finally {
+        activeNodes = null;
+        isGenerating = false;
         sendButton.disabled = false;
         promptInput.focus();
       }

@@ -6,7 +6,7 @@ services:
     ports:
       - "8080:8080"
     environment:
-      MODEL_ID: Qwen/Qwen2.5-0.5B
+      MODEL_ID: Qwen/Qwen2.5-0.5B-Instruct
       REQUEST_TIMEOUT_SECONDS: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -25,7 +25,7 @@ services:
       NODE_NAME: worker_1
       NODE_URL: http://worker_1:8000
       GATEWAY_URL: http://gateway:8080
-      MODEL_ID: Qwen/Qwen2.5-0.5B
+      MODEL_ID: Qwen/Qwen2.5-0.5B-Instruct
       MODEL_DTYPE: float32
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -41,7 +41,7 @@ services:
       NODE_NAME: worker_2
       NODE_URL: http://worker_2:8000
       GATEWAY_URL: http://gateway:8080
-      MODEL_ID: Qwen/Qwen2.5-0.5B
+      MODEL_ID: Qwen/Qwen2.5-0.5B-Instruct
       MODEL_DTYPE: float32
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -57,7 +57,7 @@ services:
       NODE_NAME: worker_3
       NODE_URL: http://worker_3:8000
       GATEWAY_URL: http://gateway:8080
-      MODEL_ID: Qwen/Qwen2.5-0.5B
+      MODEL_ID: Qwen/Qwen2.5-0.5B-Instruct
       MODEL_DTYPE: float32
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -73,7 +73,7 @@ services:
       NODE_NAME: worker_4
       NODE_URL: http://worker_4:8000
       GATEWAY_URL: http://gateway:8080
-      MODEL_ID: Qwen/Qwen2.5-0.5B
+      MODEL_ID: Qwen/Qwen2.5-0.5B-Instruct
       MODEL_DTYPE: float32
     volumes:
       - hf_cache:/root/.cache/huggingface
