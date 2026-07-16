@@ -38,8 +38,8 @@ services:
       MODEL_ID: Qwen/Qwen2.5-0.5B-Instruct
       MODEL_DTYPE: float32
       KIWI_USE_CSR: "true"
-      KIWI_USE_INT8: "false"
-      KIWI_CSR_SPARSITY: "0.80"
+      KIWI_USE_INT8: "true"
+      KIWI_CSR_SPARSITY: "0.40"
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "1.0" # Small VRAM, will split model layers (e.g. 0-11)
     volumes:
@@ -66,8 +66,8 @@ services:
       MODEL_ID: Qwen/Qwen2.5-0.5B-Instruct
       MODEL_DTYPE: float32
       KIWI_USE_CSR: "true"
-      KIWI_USE_INT8: "false"
-      KIWI_CSR_SPARSITY: "0.80"
+      KIWI_USE_INT8: "true"
+      KIWI_CSR_SPARSITY: "0.40"
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "2.6" # Larger VRAM, will fit all model layers (0-23)
     volumes:
@@ -94,8 +94,8 @@ services:
       MODEL_ID: Qwen/Qwen2.5-0.5B-Instruct
       MODEL_DTYPE: float32
       KIWI_USE_CSR: "true"
-      KIWI_USE_INT8: "false"
-      KIWI_CSR_SPARSITY: "0.80"
+      KIWI_USE_INT8: "true"
+      KIWI_CSR_SPARSITY: "0.40"
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "1.0" # Small VRAM, will split model layers (e.g. 12-23)
     volumes:
@@ -122,8 +122,8 @@ services:
       MODEL_ID: Qwen/Qwen2.5-0.5B-Instruct
       MODEL_DTYPE: float32
       KIWI_USE_CSR: "true"
-      KIWI_USE_INT8: "false"
-      KIWI_CSR_SPARSITY: "0.80"
+      KIWI_USE_INT8: "true"
+      KIWI_CSR_SPARSITY: "0.40"
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "2.6" # Larger VRAM, will fit all model layers (0-23)
     volumes:
