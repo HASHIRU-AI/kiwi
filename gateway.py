@@ -486,6 +486,8 @@ def _prompt_ids(
             add_generation_prompt=True,
             return_tensors="pt",
         )
+        if hasattr(ids, "get"):
+            ids = ids.get("input_ids", ids)
         return (
             ids
             if isinstance(ids, torch.Tensor)
