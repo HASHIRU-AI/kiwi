@@ -20,8 +20,6 @@ from transformers import AutoModelForCausalLM
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://gateway:8080").rstrip("/")
 NODE_NAME = os.getenv("NODE_NAME", "worker")
 NODE_URL = os.getenv("NODE_URL", "http://worker:8000").rstrip("/")
-MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct")
-MODEL_DTYPE = os.getenv("MODEL_DTYPE", "float32")
 USE_CSR = os.getenv("KIWI_USE_CSR", "false").lower() in ("true", "1", "yes")
 CSR_SPARSITY_RATIO = float(os.getenv("KIWI_CSR_SPARSITY", "0.0"))
 USE_INT8 = os.getenv("KIWI_USE_INT8", "false").lower() in ("true", "1", "yes")
