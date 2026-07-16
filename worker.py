@@ -478,6 +478,7 @@ async def forward(request: Request):
                             status_code=400,
                             detail="Non-first-stage worker requires hidden_states, INT8 components, or CSR components",
                         )
+        hidden_in = hidden_in.to(_dtype())
 
         async with model_lock:
             result = await asyncio.to_thread(
