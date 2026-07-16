@@ -9,11 +9,10 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # Serve two models to test the ModelRegistry and automatic load balancing
+      # Serve one model (Qwen 0.5B)
       KIWI_MODELS: |
         [
-          {"model_id": "Qwen/Qwen2.5-0.5B-Instruct", "aliases": ["qwen-0.5b", "kiwi-small"], "default_dtype": "bfloat16"},
-          {"model_id": "Qwen/Qwen2.5-1.5B-Instruct", "aliases": ["qwen-1.5b", "kiwi-medium"], "default_dtype": "bfloat16"}
+          {"model_id": "Qwen/Qwen2.5-0.5B-Instruct", "aliases": ["qwen-0.5b", "kiwi-small"], "default_dtype": "bfloat16"}
         ]
       REQUEST_TIMEOUT_SECONDS: "120"
     volumes:
@@ -37,7 +36,7 @@ services:
       NODE_URL: http://worker_1:8000
       GATEWAY_URL: http://gateway:8080
       GPU_MEMORY_RESERVE_MB: "512"
-      KIWI_VRAM_GB_OVERRIDE: "1.0"  # Small VRAM, will match Qwen 0.5B (split across 2 workers)
+      KIWI_VRAM_GB_OVERRIDE: "1.0"  # Small VRAM, will split model layers (e.g. 0-11)
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
@@ -60,7 +59,7 @@ services:
       NODE_URL: http://worker_2:8000
       GATEWAY_URL: http://gateway:8080
       GPU_MEMORY_RESERVE_MB: "512"
-      KIWI_VRAM_GB_OVERRIDE: "2.6"  # Medium VRAM, will match Qwen 1.5B (split across 2 workers)
+      KIWI_VRAM_GB_OVERRIDE: "2.6"  # Larger VRAM, will fit all model layers (0-23)
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
@@ -83,7 +82,7 @@ services:
       NODE_URL: http://worker_3:8000
       GATEWAY_URL: http://gateway:8080
       GPU_MEMORY_RESERVE_MB: "512"
-      KIWI_VRAM_GB_OVERRIDE: "1.0"  # Small VRAM, will match Qwen 0.5B (split across 2 workers)
+      KIWI_VRAM_GB_OVERRIDE: "1.0"  # Small VRAM, will split model layers (e.g. 12-23)
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
@@ -106,7 +105,7 @@ services:
       NODE_URL: http://worker_4:8000
       GATEWAY_URL: http://gateway:8080
       GPU_MEMORY_RESERVE_MB: "512"
-      KIWI_VRAM_GB_OVERRIDE: "2.6"  # Medium VRAM, will match Qwen 1.5B (split across 2 workers)
+      KIWI_VRAM_GB_OVERRIDE: "2.6"  # Larger VRAM, will fit all model layers (0-23)
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:

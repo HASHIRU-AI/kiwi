@@ -38,6 +38,8 @@ class WorkerRegistration(BaseModel):
     node_url: str
     cpu_cores: int = Field(ge=1)
     vram_gb: float = Field(ge=0)
+    model_id: str | None = None
+    layers: list[int] | None = None
 
 
 class ChatMessage(BaseModel):
@@ -229,12 +231,21 @@ class WorkerRegistry:
                 existing.last_seen = time.time()
                 return existing
 
-            model = self._pick_model(model_registry, registration.vram_gb)
-            layers = self._pick_layers(model, registration.vram_gb)
+            if registration.model_id is not None and registration.layers is not None:
+                # Restore existing assignment if worker is re-registering
+                model = model_registry.resolve(registration.model_id)
+                model_id = model.model_id if model else registration.model_id
+                layers = (registration.layers[0], registration.layers[1])
+            else:
+                # Dynamic model and layer assignment
+                model = self._pick_model(model_registry, registration.vram_gb)
+                model_id = model.model_id
+                layers = self._pick_layers(model, registration.vram_gb)
+
             worker = Worker(
                 node_name=registration.node_name,
                 node_url=registration.node_url.rstrip("/"),
-                model_id=model.model_id,
+                model_id=model_id,
                 layers=layers,
                 cpu_cores=registration.cpu_cores,
                 vram_gb=registration.vram_gb,
@@ -327,12 +338,14 @@ class WorkerRegistry:
                 }
             return result
 
-    async def heartbeat(self, node_url: str) -> None:
+    async def heartbeat(self, node_url: str) -> bool:
         async with self._lock:
             worker = self._workers.get(node_url.rstrip("/"))
             if worker:
                 worker.last_seen = time.time()
                 worker.healthy = True
+                return True
+            return False
 
     async def evict_stale(self, stale_seconds: float) -> list[str]:
         """Mark workers as unhealthy if they haven't sent a heartbeat recently."""
@@ -462,7 +475,9 @@ class HeartbeatRequest(BaseModel):
 
 @app.post("/heartbeat")
 async def heartbeat(request: HeartbeatRequest) -> dict[str, str]:
-    await registry.heartbeat(request.node_url)
+    exists = await registry.heartbeat(request.node_url)
+    if not exists:
+        raise HTTPException(status_code=404, detail="Worker not registered")
     return {"status": "ok"}
 
 

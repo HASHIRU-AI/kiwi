@@ -199,16 +199,36 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
     return loaded_model
 
 
+async def _re_register() -> None:
+    _, vram_gb = _detect_device()
+    payload = {
+        "node_name": NODE_NAME,
+        "node_url": NODE_URL,
+        "cpu_cores": os.cpu_count() or 1,
+        "vram_gb": vram_gb,
+        "model_id": assigned_model_id,
+        "layers": list(layer_range) if layer_range else None,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(f"{GATEWAY_URL}/register", json=payload)
+            response.raise_for_status()
+    except httpx.HTTPError:
+        pass
+
+
 async def _heartbeat_loop() -> None:
     """Ping the gateway periodically so it knows we're alive."""
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
-                await client.post(
+                response = await client.post(
                     f"{GATEWAY_URL}/heartbeat",
                     json={"node_name": NODE_NAME, "node_url": NODE_URL},
                 )
+                if response.status_code == 404:
+                    await _re_register()
         except httpx.HTTPError:
             pass  # Gateway may be temporarily unreachable; keep retrying.
 
