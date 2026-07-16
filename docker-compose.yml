@@ -1,12 +1,20 @@
 services:
   gateway:
-    build: .
+    build:
+      context: .
+      target: gateway
+    image: kiwi-gateway:latest
     container_name: kiwi_gateway_1
     command: uvicorn gateway:app --host 0.0.0.0 --port 8080
     ports:
       - "8080:8080"
     environment:
-      MODEL_ID: Qwen/Qwen2.5-0.5B-Instruct
+      # Serve two models to test the ModelRegistry and automatic load balancing
+      KIWI_MODELS: |
+        [
+          {"model_id": "Qwen/Qwen2.5-0.5B-Instruct", "aliases": ["qwen-0.5b", "kiwi-small"], "default_dtype": "bfloat16"},
+          {"model_id": "Qwen/Qwen2.5-1.5B-Instruct", "aliases": ["qwen-1.5b", "kiwi-medium"], "default_dtype": "bfloat16"}
+        ]
       REQUEST_TIMEOUT_SECONDS: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -18,7 +26,10 @@ services:
       start_period: 20s
 
   worker_1:
-    build: .
+    build:
+      context: .
+      target: worker
+    image: kiwi-worker:latest
     container_name: kiwi-worker_1-1
     command: uvicorn worker:app --host 0.0.0.0 --port 8000
     environment:
@@ -30,14 +41,23 @@ services:
       KIWI_USE_CSR: "true"
       KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.80"
+      GPU_MEMORY_RESERVE_MB: "512"
+      KIWI_VRAM_GB_OVERRIDE: "1.0"  # Small VRAM, will match Qwen 0.5B (split across 2 workers)
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
       gateway:
         condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   worker_2:
-    build: .
+    image: kiwi-worker:latest
     container_name: kiwi-worker_2-1
     command: uvicorn worker:app --host 0.0.0.0 --port 8000
     environment:
@@ -49,14 +69,23 @@ services:
       KIWI_USE_CSR: "true"
       KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.80"
+      GPU_MEMORY_RESERVE_MB: "512"
+      KIWI_VRAM_GB_OVERRIDE: "2.6"  # Medium VRAM, will match Qwen 1.5B (split across 2 workers)
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
       gateway:
         condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   worker_3:
-    build: .
+    image: kiwi-worker:latest
     container_name: kiwi-worker_3-1
     command: uvicorn worker:app --host 0.0.0.0 --port 8000
     environment:
@@ -68,14 +97,23 @@ services:
       KIWI_USE_CSR: "true"
       KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.80"
+      GPU_MEMORY_RESERVE_MB: "512"
+      KIWI_VRAM_GB_OVERRIDE: "1.0"  # Small VRAM, will match Qwen 0.5B (split across 2 workers)
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
       gateway:
         condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   worker_4:
-    build: .
+    image: kiwi-worker:latest
     container_name: kiwi-worker_4-1
     command: uvicorn worker:app --host 0.0.0.0 --port 8000
     environment:
@@ -87,11 +125,20 @@ services:
       KIWI_USE_CSR: "true"
       KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.80"
+      GPU_MEMORY_RESERVE_MB: "512"
+      KIWI_VRAM_GB_OVERRIDE: "2.6"  # Medium VRAM, will match Qwen 1.5B (split across 2 workers)
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
       gateway:
         condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
 volumes:
   hf_cache:

@@ -19,20 +19,34 @@
     </header>
 
     <section id="topoPanel" class="mb-5 hidden rounded-2xl border border-slate-800 bg-slate-900/50 p-3 shadow-2xl shadow-black/20">
-      <canvas id="topoCanvas" width="960" height="200" class="mx-auto block"></canvas>
+      <canvas id="topoCanvas" width="960" height="220" class="mx-auto block"></canvas>
     </section>
 
     <section id="chat" class="flex-1 space-y-5 rounded-2xl border border-slate-800 bg-slate-900/50 p-5 shadow-2xl shadow-black/20" aria-live="polite">
       <div class="rounded-xl bg-slate-800/70 p-4 text-slate-300">
-        Ask the distributed Qwen pipeline anything. Stop an active worker mid-stream to watch cache rebuild and rerouting.
+        Ask the distributed compute swarm anything. Stop an active worker mid-stream to watch cache rebuild and rerouting.
       </div>
     </section>
 
-    <form id="composer" class="mt-5 flex gap-3">
-      <label class="sr-only" for="prompt">Message</label>
-      <textarea id="prompt" rows="2" required placeholder="Write a 300-word essay about the history of distributed systems."
-        class="min-h-14 flex-1 resize-none rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-slate-100 outline-none placeholder:text-slate-500 focus:border-lime-400"></textarea>
-      <button id="send" type="submit" class="rounded-xl bg-lime-400 px-5 font-semibold text-slate-950 transition hover:bg-lime-300 disabled:cursor-not-allowed disabled:opacity-50">Send</button>
+    <form id="composer" class="mt-5 flex flex-col gap-3 sm:flex-row">
+      <div class="flex flex-1 gap-3">
+        <textarea id="prompt" rows="2" required placeholder="Write a 300-word essay about the history of distributed systems."
+          class="min-h-14 flex-1 resize-none rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-slate-100 outline-none placeholder:text-slate-500 focus:border-lime-400"></textarea>
+      </div>
+      <div class="flex items-center gap-3">
+        <div class="relative flex-1 sm:w-48">
+          <label class="sr-only" for="modelSelect">Select Model</label>
+          <select id="modelSelect" class="w-full h-full min-h-14 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-slate-100 outline-none focus:border-lime-400 appearance-none cursor-pointer">
+            <option value="">Loading models...</option>
+          </select>
+          <div class="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-slate-400">
+            <svg class="fill-current h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+              <path d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z"/>
+            </svg>
+          </div>
+        </div>
+        <button id="send" type="submit" class="h-14 rounded-xl bg-lime-400 px-6 font-semibold text-slate-950 transition hover:bg-lime-300 disabled:cursor-not-allowed disabled:opacity-50">Send</button>
+      </div>
     </form>
   </main>
 
@@ -79,10 +93,8 @@
         return;
       }
 
-      const stageA = registryData.filter(w => w.stage === 'A');
-      const stageB = registryData.filter(w => w.stage === 'B');
       const gwX = W / 2, gwY = 30;
-      const nodeW = 120, nodeH = 52, nodeR = 10;
+      const nodeW = 130, nodeH = 58, nodeR = 10;
 
       // Gateway node
       drawRoundedRect(gwX - nodeW / 2, gwY - 18, nodeW, 36, 8);
@@ -96,123 +108,200 @@
       ctx.textAlign = 'center';
       ctx.fillText('Gateway', gwX, gwY + 5);
 
-      // Position helpers
-      const aY = 110, bY = 110;
-      const aStartX = W / 2 - (stageA.length * (nodeW + 20)) / 2 + 10;
-      const bStartX = W / 2 - (stageB.length * (nodeW + 20)) / 2 + 10;
-      const aXOff = stageA.length ? -((stageA.length * (nodeW + 20)) / 2) + nodeW / 2 + 10 : 0;
-      const bXOff = stageB.length ? ((stageB.length * (nodeW + 20)) / 2) - nodeW / 2 - 10 : 0;
+      // Group workers by model
+      const models = {};
+      registryData.forEach(w => {
+        const mid = w.model_id || 'unknown';
+        if (!models[mid]) models[mid] = [];
+        models[mid].push(w);
+      });
 
-      function drawWorker(w, x, y, stageLabel) {
-        const isActive = activeNodes && (w.node_url === activeNodes.A || w.node_url === activeNodes.B);
-        const isDimmed = isGenerating && activeNodes && !isActive;
+      const modelIds = Object.keys(models);
+      const workerY = 130;
 
-        // Edge from gateway
-        ctx.beginPath();
-        ctx.moveTo(gwX, gwY + 18);
-        ctx.lineTo(x, y - nodeH / 2);
-        ctx.strokeStyle = w.healthy ? (isActive ? '#a3e635' : '#334155') : '#7f1d1d';
-        ctx.lineWidth = isActive ? 2.5 : 1.5;
-        ctx.setLineDash(w.healthy ? [] : [4, 4]);
-        ctx.stroke();
-        ctx.setLineDash([]);
+      // Active node URLs as a set for quick lookups
+      const activeSet = new Set();
+      if (activeNodes) Object.values(activeNodes).forEach(u => activeSet.add(u));
 
-        // Flowing particle on edge (only draw on the active Stage A worker)
-        if (w.healthy && isGenerating && activeNodes && w.node_url === activeNodes.A) {
-          const t = (particlePhase % 100) / 100;
-          const px = gwX + (x - gwX) * t;
-          const py = (gwY + 18) + (y - nodeH / 2 - gwY - 18) * t;
-          ctx.beginPath();
-          ctx.arc(px, py, 3.5, 0, Math.PI * 2);
-          ctx.fillStyle = '#a3e635';
-          ctx.shadowColor = '#a3e635';
-          ctx.shadowBlur = 4;
-          ctx.fill();
-          ctx.shadowBlur = 0;
-        }
+      // Lay out workers in a flat row, grouped by model
+      let allWorkers = [];
+      modelIds.forEach(mid => {
+        models[mid].forEach(w => allWorkers.push({ ...w, _modelId: mid }));
+      });
 
-        // Node box
-        drawRoundedRect(x - nodeW / 2, y - nodeH / 2, nodeW, nodeH, nodeR);
-        const healthy = w.healthy;
-        ctx.fillStyle = healthy ? '#0f172a' : '#1c0a0a';
-        ctx.globalAlpha = isDimmed ? 0.35 : 1.0;
-        ctx.fill();
-        ctx.strokeStyle = healthy ? (isActive ? '#a3e635' : '#22c55e') : '#ef4444';
-        ctx.lineWidth = healthy ? (isActive ? 3.0 : 1.5) : 2;
-        ctx.stroke();
+      const totalWidth = allWorkers.length * nodeW + (allWorkers.length - 1) * 20;
+      const startX = W / 2 - totalWidth / 2 + nodeW / 2;
 
-        // Glow effect
-        if (healthy) {
-          ctx.shadowColor = isActive ? '#a3e635' : '#22c55e';
-          ctx.shadowBlur = isActive ? 12 : 8;
-          ctx.strokeStyle = isActive ? '#a3e63566' : '#22c55e44';
-          ctx.stroke();
-          ctx.shadowBlur = 0;
-        }
+      // Calculate coordinates first
+      const coords = {};
+      allWorkers.forEach((w, i) => {
+        coords[w.node_url] = {
+          x: startX + i * (nodeW + 20),
+          y: workerY
+        };
+      });
 
-        // Text
-        ctx.fillStyle = healthy ? (isActive ? '#fff' : '#e2e8f0') : '#fca5a5';
-        ctx.font = isActive ? 'bold 13px system-ui' : 'bold 12px system-ui';
-        ctx.textAlign = 'center';
-        ctx.fillText(w.node_name, x, y - 6);
-        ctx.fillStyle = healthy ? (isActive ? '#a3e635' : '#94a3b8') : '#f87171';
-        ctx.font = '10px system-ui';
-        ctx.fillText(`Stage ${w.stage} · L${w.layers[0]}-${w.layers[1]}`, x, y + 8);
-        ctx.fillText(healthy ? `${w.last_seen.toFixed(0)}s ago` : 'EVICTED', x, y + 20);
-        ctx.globalAlpha = 1.0;
+      // ── Draw Edges & Paths ──
+      // Build the active pipeline path if generating
+      const pathPoints = [];
+      if (isGenerating && activeNodes) {
+        pathPoints.push({ x: gwX, y: gwY + 18 });
+        // Sort keys like stage_0, stage_1, stage_2 to get correct order
+        const sortedKeys = Object.keys(activeNodes).sort((a, b) => {
+          const idxA = parseInt(a.split('_')[1]) || 0;
+          const idxB = parseInt(b.split('_')[1]) || 0;
+          return idxA - idxB;
+        });
+        sortedKeys.forEach(k => {
+          const url = activeNodes[k];
+          const pt = coords[url];
+          if (pt) pathPoints.push(pt);
+        });
+        pathPoints.push({ x: gwX, y: gwY + 18 });
       }
 
-      // Draw Stage A workers (left side)
-      stageA.forEach((w, i) => {
-        const totalWidth = stageA.length * nodeW + (stageA.length - 1) * 20;
-        const x = (W / 2 - totalWidth / 2 + nodeW / 2 + i * (nodeW + 20)) - (stageB.length ? (W * 0.12) : 0);
-        drawWorker(w, x, aY, 'A');
-
-        // Draw P2P edges from A to B workers
-        stageB.forEach((bw, j) => {
-          const bTotalWidth = stageB.length * nodeW + (stageB.length - 1) * 20;
-          const bx = (W / 2 - bTotalWidth / 2 + nodeW / 2 + j * (nodeW + 20)) + (stageA.length ? (W * 0.12) : 0);
-          const isLinkActive = activeNodes && w.node_url === activeNodes.A && bw.node_url === activeNodes.B;
-
+      // 1. Draw idle/pool edges
+      allWorkers.forEach(w => {
+        const pt = coords[w.node_url];
+        const isActive = activeSet.has(w.node_url);
+        // Only draw radial gateway lines for workers that are not in the active pipeline
+        if (!isGenerating || !isActive) {
           ctx.beginPath();
-          ctx.moveTo(x + nodeW / 2, aY);
-          ctx.lineTo(bx - nodeW / 2, bY);
-          ctx.strokeStyle = (w.healthy && bw.healthy) ? (isLinkActive ? '#38bdf8' : '#1e3a5f') : '#3f1515';
-          ctx.lineWidth = isLinkActive ? 2.5 : 1;
-          ctx.setLineDash(isLinkActive ? [] : [3, 5]);
+          ctx.moveTo(gwX, gwY + 18);
+          ctx.lineTo(pt.x, pt.y - nodeH / 2);
+          ctx.strokeStyle = w.healthy ? '#334155' : '#7f1d1d';
+          ctx.lineWidth = 1.0;
+          ctx.setLineDash(w.healthy ? [] : [4, 4]);
           ctx.stroke();
           ctx.setLineDash([]);
+        }
+      });
 
-          // P2P particle (only on active link)
-          if (w.healthy && bw.healthy && isGenerating && isLinkActive) {
-            const t = ((particlePhase + 50) % 100) / 100;
-            const px = (x + nodeW / 2) + (bx - nodeW / 2 - x - nodeW / 2) * t;
-            const py = aY + (bY - aY) * t;
-            ctx.beginPath();
-            ctx.arc(px, py, 3.5, 0, Math.PI * 2);
-            ctx.fillStyle = '#38bdf8';
-            ctx.shadowColor = '#38bdf8';
-            ctx.shadowBlur = 4;
-            ctx.fill();
-            ctx.shadowBlur = 0;
+      // 2. Draw active sequential P2P pipeline path
+      if (pathPoints.length > 1) {
+        ctx.beginPath();
+        ctx.moveTo(pathPoints[0].x, pathPoints[0].y);
+        for (let i = 1; i < pathPoints.length; i++) {
+          // If connecting back to gateway or from gateway, use top boundary; else center
+          const targetY = (i === 0 || i === pathPoints.length - 1) ? pathPoints[i].y : pathPoints[i].y;
+          ctx.lineTo(pathPoints[i].x, targetY);
+        }
+        ctx.strokeStyle = '#a3e635';
+        ctx.lineWidth = 2.5;
+        ctx.stroke();
+
+        // 3. Draw the flowing sequential particle
+        const numSegs = pathPoints.length - 1;
+        const segProgress = particlePhase / 100;
+        const segFloat = segProgress * numSegs;
+        const segIdx = Math.min(Math.floor(segFloat), numSegs - 1);
+        const t = segFloat - segIdx;
+        const startPt = pathPoints[segIdx];
+        const endPt = pathPoints[segIdx + 1];
+
+        const px = startPt.x + (endPt.x - startPt.x) * t;
+        const py = startPt.y + (endPt.y - startPt.y) * t;
+
+        ctx.beginPath();
+        ctx.arc(px, py, 4.0, 0, Math.PI * 2);
+        ctx.fillStyle = '#a3e635';
+        ctx.shadowColor = '#a3e635';
+        ctx.shadowBlur = 6;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+      }
+
+      // ── Draw Worker Nodes ──
+      allWorkers.forEach((w, i) => {
+        const pt = coords[w.node_url];
+        const x = pt.x;
+        const y = pt.y;
+        const isActive = activeSet.has(w.node_url);
+        const isDimmed = isGenerating && activeNodes && !isActive;
+
+        // Node box styling based on state
+        let borderStroke = '#334155';
+        let borderWidth = 1.0;
+        let shadowColor = 'transparent';
+        let shadowBlur = 0;
+        let mainTextColor = '#94a3b8';
+        let subTextColor = '#64748b';
+
+        if (w.healthy) {
+          if (isGenerating) {
+            if (isActive) {
+              borderStroke = '#a3e635'; // Bright lime green for active
+              borderWidth = 3.0;
+              shadowColor = '#a3e635';
+              shadowBlur = 12;
+              mainTextColor = '#ffffff';
+              subTextColor = '#a3e635';
+            } else {
+              borderStroke = '#1e293b'; // Darker/dimmed for inactive
+              borderWidth = 1.0;
+              mainTextColor = '#475569';
+              subTextColor = '#334155';
+            }
+          } else {
+            // Idle and ready
+            borderStroke = '#475569';
+            borderWidth = 1.5;
+            mainTextColor = '#e2e8f0';
+            subTextColor = '#94a3b8';
           }
-        });
+        } else {
+          // Unhealthy/Evicted
+          borderStroke = '#ef4444';
+          borderWidth = 2.0;
+          mainTextColor = '#fca5a5';
+          subTextColor = '#f87171';
+        }
+
+        // Draw node background
+        drawRoundedRect(x - nodeW / 2, y - nodeH / 2, nodeW, nodeH, nodeR);
+        ctx.fillStyle = w.healthy ? '#0f172a' : '#1c0a0a';
+        ctx.globalAlpha = isDimmed ? 0.35 : 1.0;
+        ctx.fill();
+
+        // Draw node border with glow if active
+        if (shadowBlur > 0) {
+          ctx.shadowColor = shadowColor;
+          ctx.shadowBlur = shadowBlur;
+          ctx.strokeStyle = borderStroke + '66'; // semi-transparent glow
+          ctx.lineWidth = borderWidth + 4;
+          ctx.stroke();
+          ctx.shadowBlur = 0;
+        }
+
+        ctx.strokeStyle = borderStroke;
+        ctx.lineWidth = borderWidth;
+        ctx.stroke();
+
+        // Text
+        ctx.fillStyle = mainTextColor;
+        ctx.font = isActive ? 'bold 13px system-ui' : 'bold 12px system-ui';
+        ctx.textAlign = 'center';
+        ctx.fillText(w.node_name, x, y - 12);
+
+        ctx.fillStyle = subTextColor;
+        ctx.font = '10px system-ui';
+        // Show model short name + layer range
+        const shortModel = (w.model_id || '').split('/').pop() || '?';
+        ctx.fillText(`${shortModel}`, x, y + 2);
+        ctx.fillText(`L${w.layers[0]}-${w.layers[1]}`, x, y + 14);
+        ctx.fillText(w.healthy ? `${w.last_seen.toFixed(0)}s ago` : 'EVICTED', x, y + 26);
+        ctx.globalAlpha = 1.0;
       });
 
-      // Draw Stage B workers (right side)
-      stageB.forEach((w, i) => {
-        const totalWidth = stageB.length * nodeW + (stageB.length - 1) * 20;
-        const x = (W / 2 - totalWidth / 2 + nodeW / 2 + i * (nodeW + 20)) + (stageA.length ? (W * 0.12) : 0);
-        drawWorker(w, x, bY, 'B');
-      });
-
-      // Labels
+      // Model labels at bottom
       ctx.fillStyle = '#475569';
       ctx.font = '10px system-ui';
       ctx.textAlign = 'left';
-      if (stageA.length) ctx.fillText('STAGE A', 16, H - 8);
-      ctx.textAlign = 'right';
-      if (stageB.length) ctx.fillText('STAGE B', W - 16, H - 8);
+      modelIds.forEach((mid, i) => {
+        const shortModel = mid.split('/').pop() || mid;
+        const count = models[mid].length;
+        ctx.fillText(`${shortModel} (${count} workers)`, 16, H - 8 - i * 14);
+      });
     }
 
     // Poll registry and animate
@@ -240,7 +329,37 @@
     const form = document.querySelector('#composer');
     const promptInput = document.querySelector('#prompt');
     const sendButton = document.querySelector('#send');
+    const modelSelect = document.querySelector('#modelSelect');
     const conversationHistory = [];
+
+    // Fetch and populate servable models dynamically
+    async function loadModels() {
+      try {
+        const response = await fetch('/v1/models');
+        const result = await response.json();
+        modelSelect.innerHTML = '';
+        
+        if (result.data && result.data.length > 0) {
+          result.data.forEach(model => {
+            const opt = document.createElement('option');
+            opt.value = model.id;
+            // Format model name for friendly reading
+            const shortName = model.id.split('/').pop();
+            const alias = model.aliases.length > 0 ? ` (${model.aliases[0]})` : '';
+            opt.textContent = `${shortName}${alias}${model.ready ? '' : ' (Not Ready)'}`;
+            modelSelect.appendChild(opt);
+          });
+        } else {
+          modelSelect.innerHTML = '<option value="">No models registered</option>';
+        }
+      } catch (error) {
+        modelSelect.innerHTML = '<option value="">Error loading models</option>';
+      }
+    }
+
+    // Load models initially and refresh periodically
+    loadModels();
+    setInterval(loadModels, 5000);
 
     function addMessage(text, kind) {
       const message = document.createElement('div');
@@ -269,7 +388,9 @@
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
       const prompt = promptInput.value.trim();
+      const selectedModel = modelSelect.value;
       if (!prompt) return;
+
       addMessage(prompt, 'user');
       conversationHistory.push({role: 'user', content: prompt});
       const answer = addMessage('', 'assistant');
@@ -283,7 +404,7 @@
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
-            model: 'kiwi-qwen2.5-0.5b-instruct',
+            model: selectedModel || undefined,
             messages: [...conversationHistory],
             stream: true,
             max_tokens: 300,
