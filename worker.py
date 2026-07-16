@@ -20,6 +20,11 @@ from transformers import AutoModelForCausalLM
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://gateway:8080").rstrip("/")
 NODE_NAME = os.getenv("NODE_NAME", "worker")
 NODE_URL = os.getenv("NODE_URL", "http://worker:8000").rstrip("/")
+MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct")
+MODEL_DTYPE = os.getenv("MODEL_DTYPE", "float32")
+USE_CSR = os.getenv("KIWI_USE_CSR", "false").lower() in ("true", "1", "yes")
+CSR_SPARSITY_RATIO = float(os.getenv("KIWI_CSR_SPARSITY", "0.0"))
+USE_INT8 = os.getenv("KIWI_USE_INT8", "false").lower() in ("true", "1", "yes")
 GPU_MEMORY_RESERVE_MB = float(os.getenv("GPU_MEMORY_RESERVE_MB", "512"))
 
 # ── Populated from gateway assignment ────────────────────────────────────────────
@@ -422,10 +427,58 @@ async def forward(request: Request):
     else:
         hidden_in = tensors.get("hidden_states")
         if hidden_in is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Non-first-stage worker requires hidden_states",
-            )
+            # Check for CSR + INT8 combined components
+            crow = tensors.get("crow_indices")
+            col = tensors.get("col_indices")
+            quantized_val = tensors.get("quantized_values")
+            scale_tensor = tensors.get("scale")
+            shape_tensor = tensors.get("original_shape")
+            if (
+                crow is not None
+                and col is not None
+                and quantized_val is not None
+                and scale_tensor is not None
+                and shape_tensor is not None
+            ):
+                # Dequantize values
+                scale = scale_tensor.item()
+                val = quantized_val.float() * scale
+                # Reconstruct CSR
+                original_shape = list(shape_tensor.tolist())
+                size_2d = (original_shape[0] * original_shape[1], original_shape[2])
+                sparse_2d = torch.sparse_csr_tensor(crow, col, val, size=size_2d)
+                hidden_in = sparse_2d.to_dense().view(original_shape)
+                print(f"[{NODE_NAME}] [CSR+INT8] Dequantized & Decompressed sparse activations back to shape {original_shape}", flush=True)
+            else:
+                quantized = tensors.get("quantized_hidden_states")
+                scale_tensor = tensors.get("scale")
+                if quantized is not None and scale_tensor is not None:
+                    scale = scale_tensor.item()
+                    hidden_in = quantized.float() * scale
+                    print(f"[{NODE_NAME}] [INT8] Dequantized activations back to shape {list(hidden_in.shape)}", flush=True)
+                else:
+                    # Check for CSR components
+                    crow = tensors.get("crow_indices")
+                    col = tensors.get("col_indices")
+                    val = tensors.get("values")
+                    shape_tensor = tensors.get("original_shape")
+                    if (
+                        crow is not None
+                        and col is not None
+                        and val is not None
+                        and shape_tensor is not None
+                    ):
+                        original_shape = list(shape_tensor.tolist())
+                        size_2d = (original_shape[0] * original_shape[1], original_shape[2])
+                        sparse_2d = torch.sparse_csr_tensor(crow, col, val, size=size_2d)
+                        hidden_in = sparse_2d.to_dense().view(original_shape)
+                        print(f"[{NODE_NAME}] [CSR] Decompressed sparse activations back to shape {original_shape}", flush=True)
+                    else:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Non-first-stage worker requires hidden_states, INT8 components, or CSR components",
+                        )
+
         async with model_lock:
             result = await asyncio.to_thread(
                 _run_forward, request_id, step, hidden_states=hidden_in
@@ -445,7 +498,92 @@ async def forward(request: Request):
 
     next_url = next_workers[0]
     remaining_pipeline = ",".join(next_workers[1:])
-    binary_hidden = safetensors_save({"hidden_states": result})
+
+    # Compress / serialize output before sending it down the pipeline
+    if USE_INT8 and USE_CSR:
+        shape = list(result.shape)
+        hidden_2d = result.view(-1, shape[-1])
+        if CSR_SPARSITY_RATIO > 0.0:
+            k = int(hidden_2d.numel() * (1.0 - CSR_SPARSITY_RATIO))
+            if k > 0:
+                if k < hidden_2d.numel():
+                    flat_abs = torch.abs(hidden_2d).flatten()
+                    threshold = torch.topk(flat_abs, k).values[-1]
+                    mask = torch.abs(hidden_2d) >= threshold
+                    hidden_2d_sparse = hidden_2d * mask
+                else:
+                    hidden_2d_sparse = hidden_2d
+            else:
+                hidden_2d_sparse = torch.zeros_like(hidden_2d)
+        else:
+            hidden_2d_sparse = hidden_2d
+            
+        t_sparse = hidden_2d_sparse.to_sparse_csr()
+        crow = t_sparse.crow_indices()
+        col = t_sparse.col_indices()
+        val = t_sparse.values()
+        
+        max_val = val.abs().max().item()
+        scale = max(max_val, 1e-8) / 127.0
+        quantized_val = (val / scale).round().to(torch.int8)
+        
+        original_elements = result.numel()
+        sparse_elements = val.numel()
+        sparsity_percent = (1.0 - (sparse_elements / max(original_elements, 1))) * 100.0
+        print(f"[{NODE_NAME}] [CSR+INT8] Sparsified & Quantized activations: {original_elements} -> {sparse_elements} non-zero values ({sparsity_percent:.2f}% sparse, scale: {scale:.6f})", flush=True)
+        
+        binary_hidden = safetensors_save({
+            "crow_indices": crow,
+            "col_indices": col,
+            "quantized_values": quantized_val,
+            "scale": torch.tensor([scale], dtype=torch.float32),
+            "original_shape": torch.tensor(shape, dtype=torch.long)
+        })
+    elif USE_INT8:
+        max_val = result.abs().max().item()
+        scale = max(max_val, 1e-8) / 127.0
+        quantized = (result / scale).round().to(torch.int8)
+        print(f"[{NODE_NAME}] [INT8] Quantized activations: {result.numel()} elements (scale: {scale:.6f})", flush=True)
+        binary_hidden = safetensors_save({
+            "quantized_hidden_states": quantized,
+            "scale": torch.tensor([scale], dtype=torch.float32)
+        })
+    elif USE_CSR:
+        shape = list(result.shape)
+        hidden_2d = result.view(-1, shape[-1])
+        if CSR_SPARSITY_RATIO > 0.0:
+            k = int(hidden_2d.numel() * (1.0 - CSR_SPARSITY_RATIO))
+            if k > 0:
+                if k < hidden_2d.numel():
+                    flat_abs = torch.abs(hidden_2d).flatten()
+                    threshold = torch.topk(flat_abs, k).values[-1]
+                    mask = torch.abs(hidden_2d) >= threshold
+                    hidden_2d_sparse = hidden_2d * mask
+                else:
+                    hidden_2d_sparse = hidden_2d
+            else:
+                hidden_2d_sparse = torch.zeros_like(hidden_2d)
+        else:
+            hidden_2d_sparse = hidden_2d
+            
+        t_sparse = hidden_2d_sparse.to_sparse_csr()
+        crow = t_sparse.crow_indices()
+        col = t_sparse.col_indices()
+        val = t_sparse.values()
+        
+        original_elements = result.numel()
+        sparse_elements = val.numel()
+        sparsity_percent = (1.0 - (sparse_elements / max(original_elements, 1))) * 100.0
+        print(f"[{NODE_NAME}] [CSR] Compressed activations: {original_elements} -> {sparse_elements} non-zero values ({sparsity_percent:.2f}% sparse)", flush=True)
+        
+        binary_hidden = safetensors_save({
+            "crow_indices": crow,
+            "col_indices": col,
+            "values": val,
+            "original_shape": torch.tensor(shape, dtype=torch.long)
+        })
+    else:
+        binary_hidden = safetensors_save({"hidden_states": result})
 
     try:
         async with httpx.AsyncClient(
