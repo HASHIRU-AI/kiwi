@@ -170,3 +170,23 @@ During split pipeline generation:
 - **Active Path**: Edges are drawn sequentially from Gateway to the first worker, then horizontally through the intermediate workers, and back to the Gateway.
 - **Sequential Particles**: Flowing green particles will physically traverse the pipeline stages one-by-one.
 - **Idle Nodes**: Workers that are registered but not actively running the query (e.g. idle or serving a different model) are drawn with faint, dark slate radial lines to the gateway and have no shadow glow, signifying they are idle.
+
+---
+
+## 10. Testing Gateway Recovery & Self-Healing
+
+To test the swarm's resilience to gateway failures or rolling updates:
+1. Re-deploy the swarm stack and verify workers are fully registered.
+2. Restart only the gateway container (this completely wipes the gateway's in-memory registry):
+   ```bash
+   docker compose restart gateway
+   ```
+3. Watch the gateway container logs:
+   ```bash
+   docker compose logs -f gateway
+   ```
+4. Observe the self-healing sequence:
+   - On the next heartbeat (every 5 seconds), the workers receive a `404 Not Found` response because the restarted gateway has no record of them.
+   - The workers immediately send a `/register` request containing their existing `model_id` and `layers` assignment.
+   - The gateway's registry accepts and restores their active assignments without forcing any worker to reload weights or download model configs again.
+5. Query `/registry` and verify that the exact previous registry topology is completely restored within 5-10 seconds of the restart.
