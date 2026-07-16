@@ -18,13 +18,7 @@ services:
     volumes:
       - hf_cache:/root/.cache/huggingface
     healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')",
-        ]
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')" ]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -41,8 +35,8 @@ services:
       NODE_NAME: worker_1
       NODE_URL: http://worker_1:8000
       GATEWAY_URL: http://gateway:8080
-      KIWI_USE_CSR: "true"
-      KIWI_USE_INT8: "true"
+      KIWI_USE_CSR: "false"
+      KIWI_USE_INT8: "false"
       KIWI_CSR_SPARSITY: "0.40"
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "1.0" # Small VRAM, will split model layers (e.g. 0-11)
@@ -57,7 +51,7 @@ services:
           devices:
             - driver: nvidia
               count: 1
-              capabilities: [gpu]
+              capabilities: [ gpu ]
 
   worker_2:
     image: kiwi-worker:latest
@@ -67,8 +61,8 @@ services:
       NODE_NAME: worker_2
       NODE_URL: http://worker_2:8000
       GATEWAY_URL: http://gateway:8080
-      KIWI_USE_CSR: "true"
-      KIWI_USE_INT8: "true"
+      KIWI_USE_CSR: "false"
+      KIWI_USE_INT8: "false"
       KIWI_CSR_SPARSITY: "0.40"
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "2.6" # Larger VRAM, will fit all model layers (0-23)
@@ -83,7 +77,7 @@ services:
           devices:
             - driver: nvidia
               count: 1
-              capabilities: [gpu]
+              capabilities: [ gpu ]
 
   worker_3:
     image: kiwi-worker:latest
@@ -93,8 +87,8 @@ services:
       NODE_NAME: worker_3
       NODE_URL: http://worker_3:8000
       GATEWAY_URL: http://gateway:8080
-      KIWI_USE_CSR: "true"
-      KIWI_USE_INT8: "true"
+      KIWI_USE_CSR: "false"
+      KIWI_USE_INT8: "false"
       KIWI_CSR_SPARSITY: "0.40"
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "1.0" # Small VRAM, will split model layers (e.g. 12-23)
@@ -109,7 +103,7 @@ services:
           devices:
             - driver: nvidia
               count: 1
-              capabilities: [gpu]
+              capabilities: [ gpu ]
 
   worker_4:
     image: kiwi-worker:latest
@@ -119,8 +113,8 @@ services:
       NODE_NAME: worker_4
       NODE_URL: http://worker_4:8000
       GATEWAY_URL: http://gateway:8080
-      KIWI_USE_CSR: "true"
-      KIWI_USE_INT8: "true"
+      KIWI_USE_CSR: "false"
+      KIWI_USE_INT8: "false"
       KIWI_CSR_SPARSITY: "0.40"
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "2.6" # Larger VRAM, will fit all model layers (0-23)
@@ -135,7 +129,7 @@ services:
           devices:
             - driver: nvidia
               count: 1
-              capabilities: [gpu]
+              capabilities: [ gpu ]
 
 volumes:
   hf_cache:

@@ -27,7 +27,14 @@ from models import ModelConfig, ModelRegistry, load_model_registry
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
 MAX_REROUTES = int(os.getenv("MAX_REROUTES", "4"))
 INDEX_FILE = Path(__file__).with_name("index.html")
-HEARTBEAT_STALE_SECONDS = float(os.getenv("HEARTBEAT_STALE_SECONDS", "15"))
+
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
+MAX_REROUTES = int(os.getenv("MAX_REROUTES", "4"))
+INDEX_FILE = Path(__file__).with_name("index.html")
+
+# ── 2-Stage Eviction Thresholds ──
+HEARTBEAT_SOFT_STALE_SECONDS = float(os.getenv("HEARTBEAT_SOFT_STALE_SECONDS", "15"))
+HEARTBEAT_HARD_STALE_SECONDS = float(os.getenv("HEARTBEAT_HARD_STALE_SECONDS", "120"))
 
 
 # ── Pydantic request models ─────────────────────────────────────────────────────
@@ -222,7 +229,9 @@ class WorkerRegistry:
     ) -> Worker:
         async with self._lock:
             existing = self._workers.get(registration.node_name)
+            
             if existing:
+                # Node is still in memory (soft restart / IP change)
                 existing.node_url = registration.node_url
                 existing.cpu_cores = registration.cpu_cores
                 existing.vram_gb = registration.vram_gb
@@ -231,16 +240,11 @@ class WorkerRegistry:
                 existing.last_seen = time.time()
                 return existing
 
-            if registration.model_id is not None and registration.layers is not None:
-                # Restore existing assignment if worker is re-registering
-                model = model_registry.resolve(registration.model_id)
-                model_id = model.model_id if model else registration.model_id
-                layers = (registration.layers[0], registration.layers[1])
-            else:
-                # Dynamic model and layer assignment
-                model = self._pick_model(model_registry, registration.vram_gb)
-                model_id = model.model_id
-                layers = self._pick_layers(model, registration.vram_gb)
+            # Node is brand new or was hard-evicted. 
+            # Force a fresh layer assignment based on current swarm bottlenecks.
+            model = self._pick_model(model_registry, registration.vram_gb)
+            model_id = model.model_id
+            layers = self._pick_layers(model, registration.vram_gb)
 
             worker = Worker(
                 node_name=registration.node_name,
@@ -253,7 +257,6 @@ class WorkerRegistry:
                 last_seen=time.time(),
             )
             self._workers[worker.node_url] = worker
-            # Keep the name lookup too: restart registration must retain its assignment.
             self._workers[registration.node_name] = worker
             return worker
 
@@ -347,20 +350,37 @@ class WorkerRegistry:
                 return True
             return False
 
-    async def evict_stale(self, stale_seconds: float) -> list[str]:
-        """Mark workers as unhealthy if they haven't sent a heartbeat recently."""
+    async def evict_stale(
+        self, soft_stale_seconds: float, hard_stale_seconds: float
+    ) -> dict[str, list[str]]:
+        """Two-stage eviction: pause routing on soft timeout, wipe memory on hard timeout."""
         async with self._lock:
-            cutoff = time.time() - stale_seconds
-            evicted: list[str] = []
+            now = time.time()
+            soft_cutoff = now - soft_stale_seconds
+            hard_cutoff = now - hard_stale_seconds
+            
+            soft_evicted: list[str] = []
+            hard_evicted: list[str] = []
+            keys_to_delete: list[str] = []
+            
             for key, worker in self._workers.items():
-                if (
-                    key == worker.node_url
-                    and worker.healthy
-                    and worker.last_seen < cutoff
-                ):
+                # Check Stage 2: Hard Eviction first
+                if worker.last_seen < hard_cutoff:
+                    keys_to_delete.append(key)
+                    if key == worker.node_url:
+                        hard_evicted.append(worker.node_name)
+                        
+                # Check Stage 1: Soft Eviction second
+                elif worker.healthy and worker.last_seen < soft_cutoff:
                     worker.healthy = False
-                    evicted.append(worker.node_name)
-            return evicted
+                    if key == worker.node_url:
+                        soft_evicted.append(worker.node_name)
+            
+            # Execute hard deletions
+            for key in keys_to_delete:
+                del self._workers[key]
+                
+            return {"soft": soft_evicted, "hard": hard_evicted}
 
 
 # ── Globals ──────────────────────────────────────────────────────────────────────
@@ -387,18 +407,25 @@ async def _get_tokenizer(model_id: str) -> AutoTokenizer:
 async def lifespan(_: FastAPI):
     global model_registry
     model_registry = await load_model_registry()
-    # Pre-load tokenizers for all registered models.
     for model in model_registry.list_models():
         await _get_tokenizer(model.model_id)
         print(f"[gateway] Registered model {model.model_id} ({model.num_layers} layers)")
 
     async def _staleness_loop() -> None:
-        """Proactively evict workers that stopped sending heartbeats."""
+        """Proactively manage 2-stage worker evictions."""
         while True:
-            await asyncio.sleep(HEARTBEAT_STALE_SECONDS / 2)
-            evicted = await registry.evict_stale(HEARTBEAT_STALE_SECONDS)
-            if evicted:
-                print(f"[gateway] Evicted stale workers: {evicted}")
+            # Run the loop aggressively enough to catch the 5-second soft limit
+            await asyncio.sleep(HEARTBEAT_SOFT_STALE_SECONDS / 2)
+            
+            evicted = await registry.evict_stale(
+                HEARTBEAT_SOFT_STALE_SECONDS, 
+                HEARTBEAT_HARD_STALE_SECONDS
+            )
+            
+            if evicted["soft"]:
+                print(f"[gateway] Soft-evicted (paused routing): {evicted['soft']}")
+            if evicted["hard"]:
+                print(f"[gateway] Hard-evicted (memory wiped): {evicted['hard']}")
 
     staleness_task = asyncio.create_task(_staleness_loop())
     yield
