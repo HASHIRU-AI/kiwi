@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import os
 import time
 from contextlib import asynccontextmanager
@@ -220,6 +221,44 @@ async def _re_register() -> None:
         pass
 
 
+async def _apply_recomputed_assignment(assignment: dict[str, Any]) -> None:
+    """Reload a new layer range without exposing the old range as healthy."""
+    global assigned_model_id, assigned_dtype, layer_range
+    global is_first_stage, is_last_stage, model
+
+    async with model_lock:
+        # A layer range changes cache layout, so no cache may survive the move.
+        kv_cache.clear()
+        model = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        assigned_model_id = assignment["model_id"]
+        assigned_dtype = assignment.get("dtype", "bfloat16")
+        layer_range = tuple(assignment["layers"])
+        total_layers = assignment["total_layers"]
+        is_first_stage = layer_range[0] == 0
+        is_last_stage = layer_range[1] == total_layers - 1
+        model = await asyncio.to_thread(_load_assigned_model, assignment)
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{GATEWAY_URL}/recompute/complete",
+                json={
+                    "node_name": NODE_NAME,
+                    "node_url": NODE_URL,
+                    "model_id": assigned_model_id,
+                    "layers": list(layer_range),
+                },
+            )
+            response.raise_for_status()
+    except httpx.HTTPError:
+        # The next heartbeat will receive the still-pending assignment and retry.
+        pass
+
+
 async def _heartbeat_loop() -> None:
     """Ping the gateway periodically so it knows we're alive."""
     while True:
@@ -232,6 +271,11 @@ async def _heartbeat_loop() -> None:
                 )
                 if response.status_code == 404:
                     await _re_register()
+                elif response.is_success:
+                    payload = response.json()
+                    assignment = payload.get("assignment")
+                    if assignment:
+                        await _apply_recomputed_assignment(assignment)
         except httpx.HTTPError:
             pass  # Gateway may be temporarily unreachable; keep retrying.
 

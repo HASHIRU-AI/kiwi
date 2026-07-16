@@ -33,7 +33,7 @@ MAX_REROUTES = int(os.getenv("MAX_REROUTES", "4"))
 INDEX_FILE = Path(__file__).with_name("index.html")
 
 # ── 2-Stage Eviction Thresholds ──
-HEARTBEAT_SOFT_STALE_SECONDS = float(os.getenv("HEARTBEAT_SOFT_STALE_SECONDS", "15"))
+HEARTBEAT_SOFT_STALE_SECONDS = float(os.getenv("HEARTBEAT_SOFT_STALE_SECONDS", "8"))
 HEARTBEAT_HARD_STALE_SECONDS = float(os.getenv("HEARTBEAT_HARD_STALE_SECONDS", "120"))
 
 
@@ -76,6 +76,7 @@ class Worker:
     healthy: bool = True
     registered_at: float = 0.0
     last_seen: float = 0.0
+    pending_layers: tuple[int, int] | None = None
 
 
 # ── Worker registry ──────────────────────────────────────────────────────────────
@@ -108,6 +109,14 @@ class WorkerRegistry:
                 coverage[layer] += 1
         return coverage
 
+    @staticmethod
+    def _max_layers(model: ModelConfig, vram_gb: float) -> int:
+        """Return the number of layers this worker can host."""
+        if vram_gb <= 0.0:
+            return model.num_layers
+        usable_mb = (vram_gb * 1024) - 512
+        return min(model.num_layers, max(1, int(usable_mb // model.layer_size_mb)))
+
     def _pick_model(self, model_registry: ModelRegistry, vram_gb: float) -> ModelConfig:
         """Pick the model most in need of a worker, taking VRAM-fit into account.
 
@@ -128,12 +137,7 @@ class WorkerRegistry:
             uncovered = sum(1 for c in cov if c == 0)
 
             # Estimate max layers for this worker
-            if vram_gb > 0.0:
-                usable_mb = (vram_gb * 1024) - 512
-                max_layers = max(1, int(usable_mb // model.layer_size_mb))
-            else:
-                max_layers = model.num_layers
-            max_layers = min(max_layers, model.num_layers)
+            max_layers = self._max_layers(model, vram_gb)
 
             # Score how well this worker fits a 2-stage split (closer to half is better)
             target = model.num_layers / 2
@@ -163,16 +167,7 @@ class WorkerRegistry:
             layer size estimation, reserving 512 MB for KV Cache and activation overhead.
         """
         # Determine maximum layers this node can host based on VRAM capacity
-        if vram_gb > 0.0:
-            usable_mb = (vram_gb * 1024) - 512
-            # Each layer size computed dynamically from hidden size / weights
-            max_layers = max(1, int(usable_mb // model.layer_size_mb))
-        else:
-            # CPU fallback assumes unlimited system RAM capacity
-            max_layers = model.num_layers
-
-        # Cap at model's total layer count
-        max_layers = min(max_layers, model.num_layers)
+        max_layers = self._max_layers(model, vram_gb)
 
         cov = self._layer_coverage(model.model_id, model.num_layers)
         min_cov = min(cov)
@@ -296,6 +291,46 @@ class WorkerRegistry:
                 target = max_end + 1
             return pipeline
 
+    async def recompute_model(self, model: ModelConfig) -> Worker | None:
+        """Queue one redundant worker to move if that creates a complete pipeline.
+
+        A worker remains excluded while it reloads.  It becomes healthy again only
+        after its heartbeat acknowledgement confirms the new layer range, so the
+        registry never routes traffic to a worker serving stale model layers.
+        """
+        async with self._lock:
+            workers = self._healthy_workers(model.model_id)
+            coverage = self._layer_coverage(model.model_id, model.num_layers)
+            if min(coverage, default=0) > 0:
+                return None
+
+            best: tuple[int, Worker, tuple[int, int]] | None = None
+            for worker in workers:
+                base = coverage[:]
+                for layer in range(worker.layers[0], worker.layers[1] + 1):
+                    base[layer] -= 1
+                length = self._max_layers(model, worker.vram_gb)
+                for start in range(model.num_layers - length + 1):
+                    layers = (start, start + length - 1)
+                    if layers == worker.layers:
+                        continue
+                    candidate = base[:]
+                    for layer in range(layers[0], layers[1] + 1):
+                        candidate[layer] += 1
+                    if min(candidate) <= 0:
+                        continue
+                    # Prefer the least redundant complete arrangement.
+                    score = sum(candidate)
+                    if best is None or score < best[0]:
+                        best = (score, worker, layers)
+
+            if best is None:
+                return None
+            _, worker, layers = best
+            worker.pending_layers = layers
+            worker.healthy = False
+            return worker
+
     async def evict(self, node_url: str) -> None:
         async with self._lock:
             worker = self._workers.get(node_url.rstrip("/"))
@@ -318,6 +353,7 @@ class WorkerRegistry:
                         "node_url": w.node_url,
                         "model_id": w.model_id,
                         "layers": list(w.layers),
+                        "pending_layers": list(w.pending_layers) if w.pending_layers else None,
                         "healthy": w.healthy,
                         "last_seen": round(time.time() - w.last_seen, 1),
                     }
@@ -341,14 +377,33 @@ class WorkerRegistry:
                 }
             return result
 
-    async def heartbeat(self, node_url: str) -> bool:
+    async def heartbeat(self, node_url: str) -> Worker | None:
         async with self._lock:
             worker = self._workers.get(node_url.rstrip("/"))
             if worker:
                 worker.last_seen = time.time()
-                worker.healthy = True
-                return True
-            return False
+                if worker.pending_layers is None:
+                    worker.healthy = True
+                return worker
+            return None
+
+    async def complete_recompute(
+        self, node_url: str, model_id: str, layers: tuple[int, int]
+    ) -> bool:
+        """Commit a queued assignment after the worker has reloaded it."""
+        async with self._lock:
+            worker = self._workers.get(node_url.rstrip("/"))
+            if (
+                worker is None
+                or worker.model_id != model_id
+                or worker.pending_layers != layers
+            ):
+                return False
+            worker.layers = layers
+            worker.pending_layers = None
+            worker.healthy = True
+            worker.last_seen = time.time()
+            return True
 
     async def evict_stale(
         self, soft_stale_seconds: float, hard_stale_seconds: float
@@ -389,6 +444,7 @@ class WorkerRegistry:
 registry = WorkerRegistry()
 model_registry: ModelRegistry | None = None
 _tokenizers: dict[str, AutoTokenizer] = {}
+_recompute_task: asyncio.Task[None] | None = None
 
 
 async def _get_tokenizer(model_id: str) -> AutoTokenizer:
@@ -398,6 +454,47 @@ async def _get_tokenizer(model_id: str) -> AutoTokenizer:
             AutoTokenizer.from_pretrained, model_id
         )
     return _tokenizers[model_id]
+
+
+async def _recompute_unavailable_models() -> list[dict[str, object]]:
+    """Queue one corrective move for each model currently lacking E2E coverage."""
+    if not model_registry:
+        return []
+    scheduled: list[dict[str, object]] = []
+    for model in model_registry.list_models():
+        moved = await registry.recompute_model(model)
+        if moved:
+            scheduled.append(
+                {
+                    "model_id": model.model_id,
+                    "node_name": moved.node_name,
+                    "layers": list(moved.pending_layers or ()),
+                }
+            )
+    return scheduled
+
+
+def _schedule_recompute(reason: str) -> None:
+    """Run one recompute in the background without delaying topology updates."""
+    global _recompute_task
+    if _recompute_task and not _recompute_task.done():
+        return
+
+    async def _run() -> None:
+        try:
+            scheduled = await _recompute_unavailable_models()
+            if scheduled:
+                print(f"[gateway] Scheduled layer recompute after {reason}: {scheduled}")
+        except Exception as error:
+            print(f"[gateway] Layer recompute failed after {reason}: {error}")
+
+    _recompute_task = asyncio.create_task(_run())
+
+
+async def _evict_and_recompute(node_url: str, reason: str) -> None:
+    """Evict immediately, then heal in the background."""
+    await registry.evict(node_url)
+    _schedule_recompute(reason)
 
 
 # ── Lifespan ─────────────────────────────────────────────────────────────────────
@@ -424,6 +521,7 @@ async def lifespan(_: FastAPI):
             
             if evicted["soft"]:
                 print(f"[gateway] Soft-evicted (paused routing): {evicted['soft']}")
+                _schedule_recompute("stale-worker eviction")
             if evicted["hard"]:
                 print(f"[gateway] Hard-evicted (memory wiped): {evicted['hard']}")
 
@@ -484,6 +582,7 @@ async def register_worker(registration: WorkerRegistration) -> JSONResponse:
     if not model_registry:
         raise HTTPException(status_code=503, detail="Gateway not ready")
     worker = await registry.register(registration, model_registry)
+    _schedule_recompute("registration")
     model = model_registry.resolve(worker.model_id)
     return JSONResponse(
         {
@@ -500,17 +599,69 @@ class HeartbeatRequest(BaseModel):
     node_url: str
 
 
+class RecomputeCompleteRequest(HeartbeatRequest):
+    model_id: str
+    layers: list[int] = Field(min_length=2, max_length=2)
+
+
 @app.post("/heartbeat")
-async def heartbeat(request: HeartbeatRequest) -> dict[str, str]:
-    exists = await registry.heartbeat(request.node_url)
-    if not exists:
+async def heartbeat(request: HeartbeatRequest) -> dict[str, object]:
+    worker = await registry.heartbeat(request.node_url)
+    if not worker:
         raise HTTPException(status_code=404, detail="Worker not registered")
+    if worker.pending_layers is None:
+        return {"status": "ok"}
+    assert model_registry is not None
+    model = model_registry.resolve(worker.model_id)
+    return {
+        "status": "recompute_required",
+        "assignment": {
+            "model_id": worker.model_id,
+            "layers": list(worker.pending_layers),
+            "total_layers": model.num_layers if model else 0,
+            "dtype": model.default_dtype if model else "bfloat16",
+        },
+    }
+
+
+@app.post("/recompute/complete")
+async def recompute_complete(request: RecomputeCompleteRequest) -> dict[str, str]:
+    accepted = await registry.complete_recompute(
+        request.node_url, request.model_id, (request.layers[0], request.layers[1])
+    )
+    if not accepted:
+        raise HTTPException(status_code=409, detail="No matching pending assignment")
     return {"status": "ok"}
+
+
+@app.post("/recompute")
+async def recompute() -> dict[str, object]:
+    """Attempt to restore E2E coverage for every currently unavailable model.
+
+    This is also useful to run after an operator changes node capacity or
+    restores workers with fixed/duplicate ranges.  A scheduled move is delivered
+    through the target worker's next heartbeat.
+    """
+    if not model_registry:
+        raise HTTPException(status_code=503, detail="Model registry not ready")
+
+    scheduled: list[dict[str, object]] = []
+    for model in model_registry.list_models():
+        moved = await registry.recompute_model(model)
+        if moved:
+            scheduled.append(
+                {
+                    "model_id": model.model_id,
+                    "node_name": moved.node_name,
+                    "layers": list(moved.pending_layers or ()),
+                }
+            )
+    return {"status": "scheduled" if scheduled else "no_change", "moves": scheduled}
 
 
 @app.post("/deregister")
 async def deregister(request: HeartbeatRequest) -> dict[str, str]:
-    await registry.evict(request.node_url)
+    await _evict_and_recompute(request.node_url, "deregistration")
     return {"status": "evicted"}
 
 
@@ -600,10 +751,20 @@ async def _stream_completion(
     is_prefill = True
     reroutes = 0
 
+    async def _pipeline_or_recompute() -> list[Worker]:
+        try:
+            return await registry.select_pipeline(model.model_id, model.num_layers)
+        except RuntimeError as error:
+            moved = await registry.recompute_model(model)
+            if moved:
+                raise RuntimeError(
+                    f"{error}. Rebalancing {moved.node_name} to layers "
+                    f"{moved.pending_layers[0]}-{moved.pending_layers[1]}; retry shortly."
+                ) from error
+            raise
+
     try:
-        pipeline = await registry.select_pipeline(
-            model.model_id, model.num_layers
-        )
+        pipeline = await _pipeline_or_recompute()
     except RuntimeError as error:
         yield _sse({"error": {"message": str(error), "type": "server_error"}})
         yield "data: [DONE]\n\n"
@@ -653,7 +814,9 @@ async def _stream_completion(
                     failed_url = error.response.headers.get(
                         "X-Kiwi-Failed-Node"
                     )
-                await registry.evict(failed_url or first.node_url)
+                await _evict_and_recompute(
+                    failed_url or first.node_url, "inference failure"
+                )
                 yield _chunk(
                     request_id,
                     model.model_id,
@@ -671,9 +834,7 @@ async def _stream_completion(
                     )
                     break
                 try:
-                    pipeline = await registry.select_pipeline(
-                        model.model_id, model.num_layers
-                    )
+                    pipeline = await _pipeline_or_recompute()
                 except RuntimeError as no_pipeline:
                     yield _sse(
                         {

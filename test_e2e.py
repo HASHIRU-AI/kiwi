@@ -403,6 +403,41 @@ async def test_model_readiness():
     assert_eq(readiness["org/model-1"]["min_redundancy"], 1, "Model-1 redundancy = 1")
 
 
+# ================================================================================
+#  TEST 11: Recompute duplicate ranges into an E2E pipeline
+# ================================================================================
+
+
+async def test_recompute_duplicate_ranges():
+    print("\n── Test 11: Recompute duplicate ranges ──")
+
+    model = ModelConfig("org/model-1", 10, "bfloat16")
+    wreg = make_worker_reg()
+    now = time.time()
+    # Enough capacity for exactly five layers.  Both nodes were restored with
+    # the same range, so no request can traverse all ten layers initially.
+    vram_gb = (512 + 5 * model.layer_size_mb + 1) / 1024
+    for name in ("w1", "w2"):
+        worker = Worker(
+            name, f"http://{name}:8000", model.model_id, (0, 4), 4, vram_gb,
+            healthy=True, registered_at=now, last_seen=now,
+        )
+        wreg._workers[worker.node_url] = worker
+        wreg._workers[worker.node_name] = worker
+
+    moved = await wreg.recompute_model(model)
+    assert_true(moved is not None, "Duplicate assignment schedules a rebalance")
+    assert_eq(moved.pending_layers, (5, 9), "Rebalance fills the missing tail")
+    assert_true(not moved.healthy, "Moving worker excluded until it reloads")
+
+    completed = await wreg.complete_recompute(
+        moved.node_url, model.model_id, moved.pending_layers
+    )
+    assert_true(completed, "Worker acknowledgement commits the new assignment")
+    pipeline = await wreg.select_pipeline(model.model_id, model.num_layers)
+    assert_eq(len(pipeline), 2, "Recomputed nodes provide one E2E pipeline")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Runner
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -424,6 +459,7 @@ async def main():
         ("Eviction", test_eviction),
         ("Redundancy all layers", test_redundancy_all_layers),
         ("Model readiness", test_model_readiness),
+        ("Recompute duplicate ranges", test_recompute_duplicate_ranges),
     ]
 
     for name, test_fn in tests:
