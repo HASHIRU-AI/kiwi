@@ -21,12 +21,16 @@ from pydantic import BaseModel, Field
 from safetensors.torch import save as safetensors_save
 from transformers import AutoTokenizer
 
+from models import ModelConfig, ModelRegistry, load_model_registry
 
-MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct")
+
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
 MAX_REROUTES = int(os.getenv("MAX_REROUTES", "4"))
 INDEX_FILE = Path(__file__).with_name("index.html")
 HEARTBEAT_STALE_SECONDS = float(os.getenv("HEARTBEAT_STALE_SECONDS", "15"))
+
+
+# ── Pydantic request models ─────────────────────────────────────────────────────
 
 
 class WorkerRegistration(BaseModel):
@@ -34,7 +38,6 @@ class WorkerRegistration(BaseModel):
     node_url: str
     cpu_cores: int = Field(ge=1)
     vram_gb: float = Field(ge=0)
-    pool_hint: Literal["A", "B"] | None = None
 
 
 class ChatMessage(BaseModel):
@@ -50,12 +53,15 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
 
 
+# ── Worker dataclass ─────────────────────────────────────────────────────────────
+
+
 @dataclass
 class Worker:
     node_name: str
     node_url: str
-    stage: Literal["A", "B"]
-    layers: tuple[int, int]
+    model_id: str
+    layers: tuple[int, int]  # inclusive range [first, last]
     cpu_cores: int
     vram_gb: float
     healthy: bool = True
@@ -63,14 +69,155 @@ class Worker:
     last_seen: float = 0.0
 
 
+# ── Worker registry ──────────────────────────────────────────────────────────────
+
+
 class WorkerRegistry:
-    """A deliberately small in-memory DHT-style registry for the local PoC."""
+    """In-memory worker registry with coverage-based model/layer assignment."""
 
     def __init__(self) -> None:
         self._workers: dict[str, Worker] = {}
         self._lock = asyncio.Lock()
 
-    async def register(self, registration: WorkerRegistration) -> Worker:
+    # ── Internal helpers (caller must hold lock) ─────────────────────────────
+
+    def _healthy_workers(self, model_id: str | None = None) -> list[Worker]:
+        """Return de-duplicated healthy workers, optionally filtered by model."""
+        return [
+            w
+            for key, w in self._workers.items()
+            if key == w.node_url
+            and w.healthy
+            and (model_id is None or w.model_id == model_id)
+        ]
+
+    def _layer_coverage(self, model_id: str, num_layers: int) -> list[int]:
+        """Per-layer worker count for a model."""
+        coverage = [0] * num_layers
+        for w in self._healthy_workers(model_id):
+            for layer in range(w.layers[0], w.layers[1] + 1):
+                coverage[layer] += 1
+        return coverage
+
+    def _pick_model(self, model_registry: ModelRegistry, vram_gb: float) -> ModelConfig:
+        """Pick the model most in need of a worker, taking VRAM-fit into account.
+
+        Priority:
+          1. **Unservable models first** (any layer at coverage 0).
+             Among these, prefer the one that fits this worker's VRAM capacity
+             closest to a 2-stage split (max_layers ≈ total_layers / 2).
+          2. **Servable models second** (all layers covered).
+             Among these, prefer the one with lowest minimum redundancy to
+             shore up the thinnest regions.
+        """
+        best: ModelConfig | None = None
+        best_key: tuple = (float("inf"),)
+
+        for model in model_registry.list_models():
+            cov = self._layer_coverage(model.model_id, model.num_layers)
+            min_c = min(cov) if cov else 0
+            uncovered = sum(1 for c in cov if c == 0)
+
+            # Estimate max layers for this worker
+            if vram_gb > 0.0:
+                usable_mb = (vram_gb * 1024) - 512
+                max_layers = max(1, int(usable_mb // model.layer_size_mb))
+            else:
+                max_layers = model.num_layers
+            max_layers = min(max_layers, model.num_layers)
+
+            # Score how well this worker fits a 2-stage split (closer to half is better)
+            target = model.num_layers / 2
+            fit_score = abs(max_layers - target)
+
+            if uncovered > 0:
+                # Tier 0: Unservable.  Sort by fit_score first, then remaining uncovered layers.
+                key: tuple = (0, fit_score, uncovered)
+            else:
+                # Tier 1: Servable.  Sort by min redundancy, then fit_score.
+                avg_c = sum(cov) / len(cov)
+                key = (1, min_c, fit_score, avg_c)
+
+            if key < best_key:
+                best_key = key
+                best = model
+
+        return best or model_registry.default()
+
+    def _pick_layers(self, model: ModelConfig, vram_gb: float) -> tuple[int, int]:
+        """Choose which layers to assign to a new worker.
+
+        VRAM-aware layer allocation:
+          - If the worker is running on CPU (vram_gb == 0.0), it has sufficient
+            system RAM. Capped at full model layers.
+          - If on GPU (vram_gb > 0.0), calculate capacity based on the model's
+            layer size estimation, reserving 512 MB for KV Cache and activation overhead.
+        """
+        # Determine maximum layers this node can host based on VRAM capacity
+        if vram_gb > 0.0:
+            usable_mb = (vram_gb * 1024) - 512
+            # Each layer size computed dynamically from hidden size / weights
+            max_layers = max(1, int(usable_mb // model.layer_size_mb))
+        else:
+            # CPU fallback assumes unlimited system RAM capacity
+            max_layers = model.num_layers
+
+        # Cap at model's total layer count
+        max_layers = min(max_layers, model.num_layers)
+
+        cov = self._layer_coverage(model.model_id, model.num_layers)
+        min_cov = min(cov)
+
+        if min_cov > 0:
+            # ── Phase 2: Redundancy ──
+            # Every layer is covered. Assign the best contiguous chunk of size `max_layers`
+            # that has the lowest total coverage (shore up the thinnest regions).
+            if max_layers >= model.num_layers:
+                return (0, model.num_layers - 1)
+
+            best_start = 0
+            min_score = float("inf")
+
+            # Slide window of size max_layers to find lowest coverage region
+            for start in range(model.num_layers - max_layers + 1):
+                window_cov = cov[start : start + max_layers]
+                score = sum(window_cov)
+                if score < min_score:
+                    min_score = score
+                    best_start = start
+
+            return (best_start, best_start + max_layers - 1)
+
+        # ── Phase 1: Gap-filling ──
+        # Find the longest contiguous run of uncovered (cov == 0) layers.
+        best_start = 0
+        best_length = 0
+        run_start: int | None = None
+        run_length = 0
+
+        for i, c in enumerate(cov):
+            if c == 0:
+                if run_start is None:
+                    run_start = i
+                    run_length = 1
+                else:
+                    run_length += 1
+                if run_length > best_length:
+                    best_length = run_length
+                    best_start = run_start
+            else:
+                run_start = None
+                run_length = 0
+
+        # Cap the gap-filling assignment to what the VRAM capacity can host
+        assigned_length = min(best_length, max_layers)
+        return (best_start, best_start + assigned_length - 1)
+
+    # ── Public API ───────────────────────────────────────────────────────────
+
+    async def register(
+        self, registration: WorkerRegistration, model_registry: ModelRegistry
+    ) -> Worker:
         async with self._lock:
             existing = self._workers.get(registration.node_name)
             if existing:
@@ -82,12 +229,12 @@ class WorkerRegistry:
                 existing.last_seen = time.time()
                 return existing
 
-            stage = self._choose_stage(registration.pool_hint)
-            layers = (0, 11) if stage == "A" else (12, 23)
+            model = self._pick_model(model_registry, registration.vram_gb)
+            layers = self._pick_layers(model, registration.vram_gb)
             worker = Worker(
                 node_name=registration.node_name,
                 node_url=registration.node_url.rstrip("/"),
-                stage=stage,
+                model_id=model.model_id,
                 layers=layers,
                 cpu_cores=registration.cpu_cores,
                 vram_gb=registration.vram_gb,
@@ -99,34 +246,41 @@ class WorkerRegistry:
             self._workers[registration.node_name] = worker
             return worker
 
-    def _choose_stage(self, hint: Literal["A", "B"] | None) -> Literal["A", "B"]:
-        counts = {
-            stage: sum(
-                1
-                for key, worker in self._workers.items()
-                if key == worker.node_url and worker.healthy and worker.stage == stage
-            )
-            for stage in ("A", "B")
-        }
-        if counts["A"] == counts["B"] and hint:
-            return hint
-        return "A" if counts["A"] <= counts["B"] else "B"
+    async def select_pipeline(
+        self, model_id: str, num_layers: int
+    ) -> list[Worker]:
+        """Return an ordered list of workers whose layers cover ``[0, num_layers)``.
 
-    async def select_pair(self) -> tuple[Worker, Worker]:
+        Uses a greedy interval-covering algorithm with random tie-breaking
+        so that multiple healthy workers providing the same range get
+        load-balanced across requests.
+        """
         async with self._lock:
-            stage_a = [
-                worker
-                for key, worker in self._workers.items()
-                if key == worker.node_url and worker.healthy and worker.stage == "A"
-            ]
-            stage_b = [
-                worker
-                for key, worker in self._workers.items()
-                if key == worker.node_url and worker.healthy and worker.stage == "B"
-            ]
-            if not stage_a or not stage_b:
-                raise RuntimeError("No healthy Stage A/Stage B worker pair is registered")
-            return random.choice(stage_a), random.choice(stage_b)
+            candidates = sorted(
+                self._healthy_workers(model_id),
+                key=lambda w: (w.layers[0], -w.layers[1]),
+            )
+            if not candidates:
+                raise RuntimeError(f"No healthy workers for model {model_id}")
+
+            pipeline: list[Worker] = []
+            target = 0
+            i = 0
+            while target < num_layers:
+                eligible: list[Worker] = []
+                while i < len(candidates) and candidates[i].layers[0] <= target:
+                    eligible.append(candidates[i])
+                    i += 1
+                if not eligible:
+                    raise RuntimeError(
+                        f"Layer coverage gap at layer {target} for model {model_id}"
+                    )
+                # Among eligible, prefer the one extending furthest (random among ties).
+                max_end = max(w.layers[1] for w in eligible)
+                best = [w for w in eligible if w.layers[1] == max_end]
+                pipeline.append(random.choice(best))
+                target = max_end + 1
+            return pipeline
 
     async def evict(self, node_url: str) -> None:
         async with self._lock:
@@ -136,18 +290,42 @@ class WorkerRegistry:
 
     async def snapshot(self) -> list[dict[str, object]]:
         async with self._lock:
-            return [
-                {
-                    "node_name": worker.node_name,
-                    "node_url": worker.node_url,
-                    "stage": worker.stage,
-                    "layers": list(worker.layers),
-                    "healthy": worker.healthy,
-                    "last_seen": round(time.time() - worker.last_seen, 1),
+            seen: set[str] = set()
+            result: list[dict[str, object]] = []
+            for key, w in self._workers.items():
+                if key != w.node_url:
+                    continue
+                if w.node_url in seen:
+                    continue
+                seen.add(w.node_url)
+                result.append(
+                    {
+                        "node_name": w.node_name,
+                        "node_url": w.node_url,
+                        "model_id": w.model_id,
+                        "layers": list(w.layers),
+                        "healthy": w.healthy,
+                        "last_seen": round(time.time() - w.last_seen, 1),
+                    }
+                )
+            return result
+
+    async def model_readiness(
+        self, model_registry: ModelRegistry
+    ) -> dict[str, dict[str, object]]:
+        """Per-model coverage report: ready when every layer has ≥ 1 worker."""
+        async with self._lock:
+            result: dict[str, dict[str, object]] = {}
+            for model in model_registry.list_models():
+                cov = self._layer_coverage(model.model_id, model.num_layers)
+                min_cov = min(cov) if cov else 0
+                result[model.model_id] = {
+                    "ready": min_cov > 0,
+                    "min_redundancy": min_cov,
+                    "layers_covered": sum(1 for c in cov if c > 0),
+                    "total_layers": model.num_layers,
                 }
-                for key, worker in self._workers.items()
-                if key == worker.node_url
-            ]
+            return result
 
     async def heartbeat(self, node_url: str) -> None:
         async with self._lock:
@@ -160,23 +338,46 @@ class WorkerRegistry:
         """Mark workers as unhealthy if they haven't sent a heartbeat recently."""
         async with self._lock:
             cutoff = time.time() - stale_seconds
-            evicted = []
+            evicted: list[str] = []
             for key, worker in self._workers.items():
-                if key == worker.node_url and worker.healthy and worker.last_seen < cutoff:
+                if (
+                    key == worker.node_url
+                    and worker.healthy
+                    and worker.last_seen < cutoff
+                ):
                     worker.healthy = False
                     evicted.append(worker.node_name)
             return evicted
 
 
+# ── Globals ──────────────────────────────────────────────────────────────────────
+
+
 registry = WorkerRegistry()
-tokenizer: AutoTokenizer | None = None
+model_registry: ModelRegistry | None = None
+_tokenizers: dict[str, AutoTokenizer] = {}
+
+
+async def _get_tokenizer(model_id: str) -> AutoTokenizer:
+    """Lazy-load and cache tokenizers per model."""
+    if model_id not in _tokenizers:
+        _tokenizers[model_id] = await asyncio.to_thread(
+            AutoTokenizer.from_pretrained, model_id
+        )
+    return _tokenizers[model_id]
+
+
+# ── Lifespan ─────────────────────────────────────────────────────────────────────
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global tokenizer
-    # Tokenization is gateway-only; workers never receive raw prompt text.
-    tokenizer = await asyncio.to_thread(AutoTokenizer.from_pretrained, MODEL_ID)
+    global model_registry
+    model_registry = await load_model_registry()
+    # Pre-load tokenizers for all registered models.
+    for model in model_registry.list_models():
+        await _get_tokenizer(model.model_id)
+        print(f"[gateway] Registered model {model.model_id} ({model.num_layers} layers)")
 
     async def _staleness_loop() -> None:
         """Proactively evict workers that stopped sending heartbeats."""
@@ -194,6 +395,9 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Kiwi Enterprise Compute Swarm", lifespan=lifespan)
 
 
+# ── Routes ───────────────────────────────────────────────────────────────────────
+
+
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(INDEX_FILE)
@@ -201,18 +405,54 @@ async def index() -> FileResponse:
 
 @app.get("/health")
 async def health() -> dict[str, object]:
-    return {"status": "ok", "tokenizer_ready": tokenizer is not None}
+    return {
+        "status": "ok" if model_registry else "initializing",
+        "models_loaded": len(model_registry.list_models()) if model_registry else 0,
+    }
+
+
+@app.get("/v1/models")
+async def list_models() -> dict[str, object]:
+    """OpenAI-compatible model listing with readiness info."""
+    if not model_registry:
+        raise HTTPException(status_code=503, detail="Model registry not ready")
+    readiness = await registry.model_readiness(model_registry)
+    return {
+        "data": [
+            {
+                "id": m.model_id,
+                "aliases": m.aliases,
+                "num_layers": m.num_layers,
+                "default_dtype": m.default_dtype,
+                **(readiness.get(m.model_id, {})),
+            }
+            for m in model_registry.list_models()
+        ]
+    }
 
 
 @app.get("/registry")
 async def registry_view() -> dict[str, object]:
-    return {"workers": await registry.snapshot()}
+    result: dict[str, object] = {"workers": await registry.snapshot()}
+    if model_registry:
+        result["models"] = await registry.model_readiness(model_registry)
+    return result
 
 
 @app.post("/register")
 async def register_worker(registration: WorkerRegistration) -> JSONResponse:
-    worker = await registry.register(registration)
-    return JSONResponse({"stage": worker.stage, "layers": list(worker.layers)})
+    if not model_registry:
+        raise HTTPException(status_code=503, detail="Gateway not ready")
+    worker = await registry.register(registration, model_registry)
+    model = model_registry.resolve(worker.model_id)
+    return JSONResponse(
+        {
+            "model_id": worker.model_id,
+            "layers": list(worker.layers),
+            "total_layers": model.num_layers if model else 0,
+            "dtype": model.default_dtype if model else "bfloat16",
+        }
+    )
 
 
 class HeartbeatRequest(BaseModel):
@@ -232,9 +472,12 @@ async def deregister(request: HeartbeatRequest) -> dict[str, str]:
     return {"status": "evicted"}
 
 
-def _prompt_ids(messages: list[ChatMessage]) -> torch.Tensor:
-    if tokenizer is None:
-        raise HTTPException(status_code=503, detail="Tokenizer is still loading")
+# ── Tokenization & SSE helpers ───────────────────────────────────────────────────
+
+
+def _prompt_ids(
+    tokenizer: AutoTokenizer, messages: list[ChatMessage]
+) -> torch.Tensor:
     rendered_messages = [message.model_dump() for message in messages]
     if getattr(tokenizer, "chat_template", None):
         ids = tokenizer.apply_chat_template(
@@ -243,8 +486,14 @@ def _prompt_ids(messages: list[ChatMessage]) -> torch.Tensor:
             add_generation_prompt=True,
             return_tensors="pt",
         )
-        return ids if isinstance(ids, torch.Tensor) else torch.tensor([ids], dtype=torch.long)
-    text = "\n".join(f"{message.role}: {message.content}" for message in messages) + "\nassistant:"
+        return (
+            ids
+            if isinstance(ids, torch.Tensor)
+            else torch.tensor([ids], dtype=torch.long)
+        )
+    text = (
+        "\n".join(f"{m.role}: {m.content}" for m in messages) + "\nassistant:"
+    )
     return tokenizer(text, return_tensors="pt").input_ids
 
 
@@ -252,29 +501,65 @@ def _sse(payload: dict[str, object]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def _chunk(request_id: str, content: str | None, active_nodes: dict[str, str] | None = None, finish_reason: str | None = None) -> str:
+def _chunk(
+    request_id: str,
+    model_id: str,
+    content: str | None,
+    active_nodes: dict[str, str] | None = None,
+    finish_reason: str | None = None,
+) -> str:
     return _sse(
         {
             "id": f"chatcmpl-{request_id}",
             "object": "chat.completion.chunk",
             "created": int(time.time()),
-            "model": MODEL_ID,
-            "choices": [{"index": 0, "delta": {"content": content} if content else {}, "finish_reason": finish_reason}],
+            "model": model_id,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": content} if content else {},
+                    "finish_reason": finish_reason,
+                }
+            ],
             "active_nodes": active_nodes,
         }
     )
 
 
-async def _stream_completion(request: ChatCompletionRequest) -> AsyncIterator[str]:
-    assert tokenizer is not None
+# ── Streaming completion ─────────────────────────────────────────────────────────
+
+
+async def _stream_completion(
+    request: ChatCompletionRequest,
+) -> AsyncIterator[str]:
+    assert model_registry is not None
+
+    model = model_registry.resolve(request.model)
+    if not model:
+        yield _sse(
+            {
+                "error": {
+                    "message": f"Unknown model: {request.model}",
+                    "type": "invalid_request_error",
+                }
+            }
+        )
+        yield "data: [DONE]\n\n"
+        return
+
+    tokenizer = await _get_tokenizer(model.model_id)
     request_id = uuid.uuid4().hex
-    prompt_ids = _prompt_ids(request.messages).to(dtype=torch.long, device="cpu")
+    prompt_ids = _prompt_ids(tokenizer, request.messages).to(
+        dtype=torch.long, device="cpu"
+    )
     generated_ids: list[int] = []
     is_prefill = True
     reroutes = 0
 
     try:
-        node_a, node_b = await registry.select_pair()
+        pipeline = await registry.select_pipeline(
+            model.model_id, model.num_layers
+        )
     except RuntimeError as error:
         yield _sse({"error": {"message": str(error), "type": "server_error"}})
         yield "data: [DONE]\n\n"
@@ -283,20 +568,34 @@ async def _stream_completion(request: ChatCompletionRequest) -> AsyncIterator[st
     timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         while len(generated_ids) < request.max_tokens:
-            context_ids = torch.cat(
-                [prompt_ids, torch.tensor([generated_ids], dtype=torch.long)], dim=1
-            ) if generated_ids else prompt_ids
-            input_ids = context_ids if is_prefill else torch.tensor([[generated_ids[-1]]], dtype=torch.long)
+            context_ids = (
+                torch.cat(
+                    [prompt_ids, torch.tensor([generated_ids], dtype=torch.long)],
+                    dim=1,
+                )
+                if generated_ids
+                else prompt_ids
+            )
+            input_ids = (
+                context_ids
+                if is_prefill
+                else torch.tensor([[generated_ids[-1]]], dtype=torch.long)
+            )
             body = safetensors_save({"input_ids": input_ids.contiguous()})
 
-            active_nodes = {"A": node_a.node_url, "B": node_b.node_url}
+            first = pipeline[0]
+            remaining_urls = ",".join(w.node_url for w in pipeline[1:])
+            active_nodes = {
+                f"stage_{i}": w.node_url for i, w in enumerate(pipeline)
+            }
+
             try:
                 response = await client.post(
-                    f"{node_a.node_url}/forward",
+                    f"{first.node_url}/forward",
                     headers={
                         "X-Request-ID": request_id,
                         "X-Step": "prefill" if is_prefill else "decode",
-                        "X-Target-B": node_b.node_url,
+                        "X-Pipeline": remaining_urls,
                         "Content-Type": "application/octet-stream",
                     },
                     content=body,
@@ -305,60 +604,116 @@ async def _stream_completion(request: ChatCompletionRequest) -> AsyncIterator[st
                 token_id = int(response.json()["next_token_id"])
             except httpx.HTTPError as error:
                 reroutes += 1
-                # Stage A tells us if its direct P2P hop failed; otherwise A itself is suspect.
                 failed_url = None
                 if isinstance(error, httpx.HTTPStatusError):
-                    failed_url = error.response.headers.get("X-Kiwi-Failed-Node")
-                await registry.evict(failed_url or node_a.node_url)
-                yield _chunk(request_id, "[REROUTING...]", active_nodes=active_nodes)
+                    failed_url = error.response.headers.get(
+                        "X-Kiwi-Failed-Node"
+                    )
+                await registry.evict(failed_url or first.node_url)
+                yield _chunk(
+                    request_id,
+                    model.model_id,
+                    "[REROUTING...]",
+                    active_nodes=active_nodes,
+                )
                 if reroutes > MAX_REROUTES:
-                    yield _sse({"error": {"message": "Retry budget exhausted", "type": "server_error"}})
+                    yield _sse(
+                        {
+                            "error": {
+                                "message": "Retry budget exhausted",
+                                "type": "server_error",
+                            }
+                        }
+                    )
                     break
                 try:
-                    node_a, node_b = await registry.select_pair()
-                    active_nodes = {"A": node_a.node_url, "B": node_b.node_url}
-                except RuntimeError as no_pair:
-                    yield _sse({"error": {"message": str(no_pair), "type": "server_error"}})
+                    pipeline = await registry.select_pipeline(
+                        model.model_id, model.num_layers
+                    )
+                except RuntimeError as no_pipeline:
+                    yield _sse(
+                        {
+                            "error": {
+                                "message": str(no_pipeline),
+                                "type": "server_error",
+                            }
+                        }
+                    )
                     break
-                # Preserve generated_ids; a full prompt+history prefill recreates both local caches.
+                # Full prefill recreates KV caches on the new pipeline.
                 is_prefill = True
                 continue
             except (KeyError, TypeError, ValueError) as error:
-                yield _sse({"error": {"message": f"Invalid worker response: {error}", "type": "server_error"}})
+                yield _sse(
+                    {
+                        "error": {
+                            "message": f"Invalid worker response: {error}",
+                            "type": "server_error",
+                        }
+                    }
+                )
                 break
 
             generated_ids.append(token_id)
             text = tokenizer.decode([token_id], skip_special_tokens=False)
             eos_ids = tokenizer.eos_token_id
-            eos_set = set(eos_ids) if isinstance(eos_ids, list) else {eos_ids}
+            eos_set = (
+                set(eos_ids) if isinstance(eos_ids, list) else {eos_ids}
+            )
             if token_id in eos_set:
                 break
             if text:
-                yield _chunk(request_id, text, active_nodes=active_nodes)
+                yield _chunk(
+                    request_id,
+                    model.model_id,
+                    text,
+                    active_nodes=active_nodes,
+                )
             is_prefill = False
 
-    yield _chunk(request_id, None, "stop")
+    yield _chunk(request_id, model.model_id, None, finish_reason="stop")
     yield "data: [DONE]\n\n"
+
+
+# ── Chat completions endpoint ────────────────────────────────────────────────────
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
-    if tokenizer is None:
-        raise HTTPException(status_code=503, detail="Tokenizer is still loading")
+    if not model_registry:
+        raise HTTPException(status_code=503, detail="Gateway not ready")
     if request.stream:
         return StreamingResponse(
             _stream_completion(request),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-    # Retaining a single route keeps the API useful for clients that probe with stream=false.
+    # Non-streaming fallback.
     pieces: list[str] = []
+    model = model_registry.resolve(request.model) or model_registry.default()
+    model_id = model.model_id if model else "unknown"
     async for event in _stream_completion(request):
         if not event.startswith("data: {"):
             continue
         try:
             payload = json.loads(event.removeprefix("data: ").strip())
-            pieces.append(payload["choices"][0]["delta"].get("content", ""))
+            pieces.append(
+                payload["choices"][0]["delta"].get("content", "")
+            )
         except (KeyError, IndexError, json.JSONDecodeError):
             continue
-    return {"id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion", "model": MODEL_ID, "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(pieces)}, "finish_reason": "stop"}]}
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "model": model_id,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "".join(pieces),
+                },
+                "finish_reason": "stop",
+            }
+        ],
+    }
