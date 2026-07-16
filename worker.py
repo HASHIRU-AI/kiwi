@@ -23,6 +23,10 @@ NODE_URL = os.getenv("NODE_URL", "http://worker:8000").rstrip("/")
 USE_CSR = os.getenv("KIWI_USE_CSR", "false").lower() in ("true", "1", "yes")
 CSR_SPARSITY_RATIO = float(os.getenv("KIWI_CSR_SPARSITY", "0.0"))
 USE_INT8 = os.getenv("KIWI_USE_INT8", "false").lower() in ("true", "1", "yes")
+
+# Lossless compression config
+LOSSLESS_ALGORITHM = os.getenv("KIWI_LOSSLESS", "none").lower()
+
 GPU_MEMORY_RESERVE_MB = float(os.getenv("GPU_MEMORY_RESERVE_MB", "512"))
 
 # ── Populated from gateway assignment ────────────────────────────────────────────
@@ -39,6 +43,57 @@ kv_cache: dict[str, tuple[float, Any]] = {}  # request_id -> (last_accessed, pas
 model_lock = asyncio.Lock()
 KV_CACHE_TTL_SECONDS = float(os.getenv("KV_CACHE_TTL_SECONDS", "60"))
 HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "5"))
+
+
+def _compress_payload(data: bytes, algorithm: str) -> tuple[bytes, dict[str, str]]:
+    """Compress payload using selected lossless algorithm.
+    
+    Returns (compressed_bytes, headers_dict).
+    """
+    if algorithm == "zlib":
+        import zlib
+        return zlib.compress(data), {"X-Content-Encoding": "zlib"}
+    elif algorithm == "gzip":
+        import gzip
+        return gzip.compress(data), {"X-Content-Encoding": "gzip"}
+    elif algorithm == "bz2":
+        import bz2
+        return bz2.compress(data), {"X-Content-Encoding": "bz2"}
+    elif algorithm == "lzma":
+        import lzma
+        return lzma.compress(data), {"X-Content-Encoding": "lzma"}
+    elif algorithm == "zstd":
+        import zstandard as zstd
+        cctx = zstd.ZstdCompressor(level=3)
+        return cctx.compress(data), {"X-Content-Encoding": "zstd"}
+    elif algorithm == "lz4":
+        import lz4.frame
+        return lz4.frame.compress(data), {"X-Content-Encoding": "lz4"}
+    return data, {}
+
+
+def _decompress_payload(data: bytes, encoding: str) -> bytes:
+    """Decompress payload using standard or third-party libraries."""
+    if encoding == "zlib":
+        import zlib
+        return zlib.decompress(data)
+    elif encoding == "gzip":
+        import gzip
+        return gzip.decompress(data)
+    elif encoding == "bz2":
+        import bz2
+        return bz2.decompress(data)
+    elif encoding == "lzma":
+        import lzma
+        return lzma.decompress(data)
+    elif encoding == "zstd":
+        import zstandard as zstd
+        dctx = zstd.ZstdDecompressor()
+        return dctx.decompress(data)
+    elif encoding == "lz4":
+        import lz4.frame
+        return lz4.frame.decompress(data)
+    return data
 
 
 def _dtype() -> torch.dtype:
@@ -403,7 +458,11 @@ async def forward(request: Request):
     next_workers = [u.strip() for u in pipeline_header.split(",") if u.strip()]
 
     try:
-        tensors = safetensors_load(await request.body())
+        body_bytes = await request.body()
+        encoding = request.headers.get("X-Content-Encoding")
+        if encoding:
+            body_bytes = _decompress_payload(body_bytes, encoding)
+        tensors = safetensors_load(body_bytes)
     except Exception as error:
         raise HTTPException(
             status_code=400,
@@ -583,6 +642,13 @@ async def forward(request: Request):
     else:
         binary_hidden = safetensors_save({"hidden_states": result})
 
+    compression_headers = {}
+    if LOSSLESS_ALGORITHM != "none":
+        original_size = len(binary_hidden)
+        binary_hidden, headers = _compress_payload(binary_hidden, LOSSLESS_ALGORITHM)
+        compression_headers.update(headers)
+        print(f"[{NODE_NAME}] [{LOSSLESS_ALGORITHM}] Compressed activations: {original_size} -> {len(binary_hidden)} bytes (ratio: {original_size / max(len(binary_hidden), 1):.2f}x)", flush=True)
+
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(120.0, connect=10.0)
@@ -594,6 +660,7 @@ async def forward(request: Request):
                     "X-Step": step,
                     "X-Pipeline": remaining_pipeline,
                     "Content-Type": "application/octet-stream",
+                    **compression_headers,
                 },
                 content=binary_hidden,
             )

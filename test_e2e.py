@@ -404,6 +404,83 @@ async def test_model_readiness():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  TEST 11: Lossless activation compression and decompression
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_lossless_compression():
+    print("\n── Test 11: Lossless activation compression and decompression ──")
+    import worker
+    from safetensors.torch import save as safetensors_save, load as safetensors_load
+    import torch
+    import unittest.mock as mock
+    from fastapi.testclient import TestClient
+    
+    # 1. Prepare data
+    original_tensor = torch.randn(2, 5, 10).to(worker._dtype())
+    payload = {"hidden_states": original_tensor}
+    serialized = safetensors_save(payload)
+
+    # Determine algorithms to test
+    algorithms = ["zlib", "gzip", "bz2", "lzma"]
+    for extra in ["zstandard", "lz4"]:
+        try:
+            if extra == "zstandard":
+                import zstandard
+                algorithms.append("zstd")
+            elif extra == "lz4":
+                import lz4
+                algorithms.append("lz4")
+        except ImportError:
+            print(f"  ⚠️  Skipping {extra} test as library is not installed")
+            
+    # Mock global variables of worker
+    client = TestClient(worker.app)
+    original_model = worker.model
+    original_first = worker.is_first_stage
+    original_last = worker.is_last_stage
+    
+    worker.model = mock.MagicMock()
+    worker.is_first_stage = False
+    worker.is_last_stage = True
+    
+    mock_logits = torch.randn(1, 10)
+    worker.model.lm_head = lambda x: mock_logits
+
+    for alg in algorithms:
+        print(f"  Testing algorithm: {alg}")
+        
+        # Test helper functions directly
+        compressed_bytes, headers = worker._compress_payload(serialized, alg)
+        decompressed_bytes = worker._decompress_payload(compressed_bytes, headers["X-Content-Encoding"])
+        restored = safetensors_load(decompressed_bytes)
+        assert_true(torch.equal(restored["hidden_states"], original_tensor), f"[{alg}] Direct decompress matches original")
+
+        # Test FastAPI endpoint decompression
+        with mock.patch("worker._run_forward", return_value=100) as mock_forward:
+            post_headers = {
+                "X-Request-ID": f"test-req-{alg}",
+                "X-Step": "decode",
+                "X-Pipeline": "",
+                "Content-Type": "application/octet-stream",
+                **headers,
+            }
+            
+            response = client.post("/forward", headers=post_headers, content=compressed_bytes)
+            assert_eq(response.status_code, 200, f"[{alg}] FastAPI handled post request successfully")
+            assert_eq(response.json(), {"next_token_id": 100}, f"[{alg}] Correct token ID returned")
+            
+            mock_forward.assert_called_once()
+            called_kwargs = mock_forward.call_args[1]
+            assert_true(torch.equal(called_kwargs["hidden_states"], original_tensor), f"[{alg}] Decompressed hidden states matches original")
+
+    # Restore worker globals
+    worker.model = original_model
+    worker.is_first_stage = original_first
+    worker.is_last_stage = original_last
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Runner
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -424,6 +501,7 @@ async def main():
         ("Eviction", test_eviction),
         ("Redundancy all layers", test_redundancy_all_layers),
         ("Model readiness", test_model_readiness),
+        ("Lossless compression", test_lossless_compression),
     ]
 
     for name, test_fn in tests:

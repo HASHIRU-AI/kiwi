@@ -50,7 +50,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     safetensors==0.5.3 \
     transformers==4.48.3 \
     accelerate>=1.2.0 \
-    torch==2.6.0
+    torch==2.6.0 \
+    zstandard==0.23.0 \
+    lz4==4.3.3
 
 COPY worker.py models.py ./
 
