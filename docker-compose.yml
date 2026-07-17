@@ -30,6 +30,7 @@ services:
       target: worker
     image: kiwi-worker:latest
     container_name: kiwi-worker_1-1
+    init: true
     command: uvicorn worker:app --host 0.0.0.0 --port 8000
     environment:
       NODE_NAME: worker_1
@@ -58,6 +59,7 @@ services:
   worker_2:
     image: kiwi-worker:latest
     container_name: kiwi-worker_2-1
+    init: true
     command: uvicorn worker:app --host 0.0.0.0 --port 8000
     environment:
       NODE_NAME: worker_2
@@ -86,6 +88,7 @@ services:
   worker_3:
     image: kiwi-worker:latest
     container_name: kiwi-worker_3-1
+    init: true
     command: uvicorn worker:app --host 0.0.0.0 --port 8000
     environment:
       NODE_NAME: worker_3
@@ -114,6 +117,7 @@ services:
   worker_4:
     image: kiwi-worker:latest
     container_name: kiwi-worker_4-1
+    init: true
     command: uvicorn worker:app --host 0.0.0.0 --port 8000
     environment:
       NODE_NAME: worker_4

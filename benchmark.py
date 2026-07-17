@@ -21,8 +21,10 @@ def run_once():
     
     for line in response.iter_lines():
         line = line.decode("utf-8").strip()
-        if not line or line == "data: [DONE]":
+        if not line:
             continue
+        if line == "data: [DONE]":
+            break
         if line.startswith("data: "):
             try:
                 data = json.loads(line[6:])
