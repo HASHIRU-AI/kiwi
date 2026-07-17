@@ -140,9 +140,10 @@ def run_orchestration(scenarios: List[Scenario], dataset: str = "dummy", limit: 
     os.makedirs(output_dir, exist_ok=True)
     compose_path = "docker-compose.bench.yml"
     
-    for scenario in scenarios:
-        logging.info(f"--- Running Scenario: {scenario.name} ---")
-        generate_compose_file(scenario, compose_path)
+    try:
+        for scenario in scenarios:
+            logging.info(f"--- Running Scenario: {scenario.name} ---")
+            generate_compose_file(scenario, compose_path)
         
         # Build if necessary, though we assume user has images cached
         logging.info("Starting cluster (this will take time for health checks)...")
@@ -194,6 +195,17 @@ def run_orchestration(scenarios: List[Scenario], dataset: str = "dummy", limit: 
             os.remove(compose_path)
             
         logging.info(f"Scenario {scenario.name} complete.\n")
+    except Exception as e:
+        logging.error(f"Orchestration failed: {e}")
+        raise
+    finally:
+        if os.path.exists(compose_path):
+            logging.info("Performing safety cleanup of benchmark cluster...")
+            subprocess.run(["docker-compose", "-f", compose_path, "-p", "kiwibench", "down", "-v", "--remove-orphans"], check=False)
+            try:
+                os.remove(compose_path)
+            except OSError:
+                pass
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kiwi Automated Benchmarking Orchestrator")
