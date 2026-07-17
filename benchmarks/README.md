@@ -64,5 +64,44 @@ metrics = evaluator.evaluate(prompt, base_resp, test_resp)
 print("Semantic Similarity:", metrics["semantic_similarity"])
 ```
 
+## Automated Orchestration
+
+To systematically test the Kiwi distributed inference concept across various layouts, you can use the built-in orchestrator. It acts as both a CLI tool and a library, dynamically generating docker-compose files and applying network latency rules to test the robustness and speedup of optimizations like INT8 and CSR.
+
+### YAML Configuration
+Create a `scenarios.yaml` file to define your test matrix:
+```yaml
+scenarios:
+  - name: "2-node-baseline"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    use_int8: false
+    use_csr: false
+    workers: [1.0, 1.0]
+
+  - name: "2-node-optimized-high-latency"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    use_int8: true
+    use_csr: true
+    csr_sparsity: 0.4
+    network:
+      latency_ms: 100
+      bandwidth_mbit: 100
+    workers: [1.0, 1.0]
+```
+
+### Running the Orchestrator
+```bash
+python -m benchmarks.orchestrator --config benchmarks/scenarios.yaml --limit 3
+```
+This will automatically spin up each cluster configuration, run the benchmarks, teardown, and dump the JSON metrics for each scenario in the `benchmark_results` directory.
+
+### Using as a Library
+```python
+from benchmarks import load_scenarios, run_orchestration
+
+scenarios = load_scenarios("my_custom_scenarios.yaml")
+run_orchestration(scenarios, dataset="dummy", limit=5, output_dir="my_results")
+```
+
 ## Adding New Datasets
 The `datasets.py` module supports a `HuggingFaceDatasetLoader` which can pull standard instruction datasets (like `tatsu-lab/alpaca`) directly from the Hugging Face Hub for automated testing.

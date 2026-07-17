@@ -83,7 +83,15 @@ class TransformersRunner(BaseRunner):
         tokenizer = self._tokenizers[model_id]
         model = self._models[model_id]
         
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        text = ""
+        try:
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            # Fallback for models like gpt2 that don't have a chat template
+            for msg in messages:
+                text += f"{msg['role']}: {msg['content']}\n"
+            text += "assistant: "
+            
         inputs = tokenizer(text, return_tensors="pt").to(model.device)
         
         start_time = time.time()
