@@ -7,6 +7,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
 # 1. Install heavy dependencies (cached long-term)
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install torch==2.6.0 --extra-index-url https://download.pytorch.org/whl/cpu
@@ -19,11 +23,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     httpx==0.28.1 \
     pydantic==2.11.3 \
     safetensors==0.5.3 \
-    transformers==4.48.3
+    transformers==4.48.3 \
+    hivemind>=1.1.10
 
-COPY gateway.py models.py index.html ./
+COPY gateway.py models.py transport.py index.html ./
 
-EXPOSE 8080
+EXPOSE 8080 4001
 CMD ["uvicorn", "gateway:app", "--host", "0.0.0.0", "--port", "8080"]
 
 
@@ -35,9 +40,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HOME=/root/.cache/huggingface \
     DEBIAN_FRONTEND=noninteractive
 
-# Install Python 3.10 and pip
+# Install Python 3.10, pip, and build tools
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3.10 python3-pip && \
+    apt-get install -y --no-install-recommends python3.10 python3-pip build-essential && \
     rm -rf /var/lib/apt/lists/* && \
     ln -sf /usr/bin/python3.10 /usr/bin/python
 
@@ -59,9 +64,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pydantic==2.11.3 \
     safetensors==0.5.3 \
     zstandard==0.23.0 \
-    lz4==4.3.3
+    lz4==4.3.3 \
+    hivemind>=1.1.10
 
-COPY worker.py models.py ./
+COPY worker.py models.py transport.py ./
 
-EXPOSE 8000
+EXPOSE 8000 4001
 CMD ["uvicorn", "worker:app", "--host", "0.0.0.0", "--port", "8000"]
+

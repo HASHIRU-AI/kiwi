@@ -1,0 +1,102 @@
+services:
+  gateway:
+    build:
+      context: .
+      target: gateway
+    image: kiwi-gateway:latest
+    container_name: kiwi_gateway_p2p
+    command: uvicorn gateway:app --host 0.0.0.0 --port 8080
+    ports:
+      - "8080:8080"
+      - "4001:4001"
+    environment:
+      # Serve one model (Qwen 0.5B)
+      KIWI_MODELS: |
+        [
+          {"model_id": "Qwen/Qwen2.5-0.5B-Instruct", "aliases": ["qwen-0.5b", "kiwi-small"], "default_dtype": "bfloat16"}
+        ]
+      REQUEST_TIMEOUT_SECONDS: "120"
+      KIWI_P2P_TRANSPORT: "p2p"
+      KIWI_P2P_PORT: "4001"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')" ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  worker_1:
+    build:
+      context: .
+      target: worker
+    image: kiwi-worker:latest
+    container_name: kiwi-worker_1_p2p
+    init: true
+    command: uvicorn worker:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+      - "4002:4002"
+    environment:
+      NODE_NAME: worker_1
+      NODE_URL: http://worker_1:8000
+      GATEWAY_URL: http://gateway:8080
+      KIWI_P2P_TRANSPORT: "p2p"
+      KIWI_P2P_PORT: "4002"
+      # Replace <GATEWAY_PEER_ID> with the PeerID printed by the gateway container on startup
+      KIWI_RELAY_PEERS: "/dns/gateway/tcp/4001/p2p/12D3KooWQwjXHTYVUQLc68RqBNt61NwDPZgiuFTn2Q2YJfzy679S"
+      KIWI_USE_CSR: "false"
+      KIWI_USE_INT8: "true"
+      KIWI_LOSSLESS: "zstd"
+      GPU_MEMORY_RESERVE_MB: "512"
+      KIWI_VRAM_GB_OVERRIDE: "1.0"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      gateway:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+
+  worker_2:
+    image: kiwi-worker:latest
+    container_name: kiwi-worker_2_p2p
+    init: true
+    command: uvicorn worker:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8001:8000"
+      - "4003:4003"
+    environment:
+      NODE_NAME: worker_2
+      NODE_URL: http://worker_2:8000
+      GATEWAY_URL: http://gateway:8080
+      KIWI_P2P_TRANSPORT: "p2p"
+      KIWI_P2P_PORT: "4003"
+      # Replace <GATEWAY_PEER_ID> with the PeerID printed by the gateway container on startup
+      KIWI_RELAY_PEERS: "/dns/gateway/tcp/4001/p2p/12D3KooWQwjXHTYVUQLc68RqBNt61NwDPZgiuFTn2Q2YJfzy679S"
+      KIWI_USE_CSR: "false"
+      KIWI_USE_INT8: "true"
+      KIWI_LOSSLESS: "zstd"
+      GPU_MEMORY_RESERVE_MB: "512"
+      KIWI_VRAM_GB_OVERRIDE: "1.0"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      gateway:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+
+volumes:
+  hf_cache:

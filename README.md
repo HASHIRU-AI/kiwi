@@ -130,7 +130,12 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+### P2P Networking & Testing Guides
+- **[P2P Networking Guide (`P2P_TESTING.md`)](file:///c:/Users/harsh/OneDrive/Desktop/cs%20projects/kiwi/P2P_TESTING.md)**: Instructions for running and testing `hivemind.p2p` / libp2p networking across single-machine setups (`docker-compose.internet.yml`) or multi-machine clusters over the internet without `ngrok`.
+- **[E2E Testing Guide (`TESTING.md`)](file:///c:/Users/harsh/OneDrive/Desktop/cs%20projects/kiwi/TESTING.md)**: Comprehensive manual and automated verification instructions for multi-model assignment, layer coverage, and fault tolerance.
+
 ---
+
 
 ## Project Structure
 

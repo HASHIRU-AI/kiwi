@@ -2,6 +2,9 @@
 
 This guide outlines how to verify the Kiwi Compute Swarm's features (such as dynamic model registry, layer coverage optimization, dynamic pipeline routing, and VRAM-aware GPU offloading) in both automated and actual Docker environments.
 
+> [!NOTE]
+> For instructions on testing Peer-to-Peer (`hivemind.p2p` / libp2p) connectivity across single-machine setups or multi-machine internet clusters, see [P2P_TESTING.md](file:///c:/Users/harsh/OneDrive/Desktop/cs%20projects/kiwi/P2P_TESTING.md).
+
 ---
 
 ## 1. Prerequisites
