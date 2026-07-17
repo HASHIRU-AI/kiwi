@@ -56,7 +56,7 @@ def generate_compose_file(scenario: Scenario, output_path: str):
                 "image": "kiwi-gateway:latest",
                 "container_name": "kiwi_gateway_bench",
                 "command": "uvicorn gateway:app --host 0.0.0.0 --port 8080",
-                "ports": ["8080:8080"],
+                "ports": ["8081:8080"],
                 "environment": {
                     "KIWI_MODELS": json.dumps([{"model_id": scenario.model, "default_dtype": "bfloat16"}]),
                     "REQUEST_TIMEOUT_SECONDS": "120"
@@ -108,11 +108,22 @@ def generate_compose_file(scenario: Scenario, output_path: str):
     with open(output_path, 'w') as f:
         yaml.dump(compose, f, sort_keys=False)
 
-def apply_network_simulation(scenario: Scenario):
+def apply_network_simulation(scenario: Scenario) -> bool:
     if not scenario.network:
-        return
+        return False
+        
+    network_applied = True
     for i in range(len(scenario.workers)):
         container = f"kiwi_worker_bench_{i+1}"
+        
+        # Check if tc is installed
+        check_cmd = ["docker", "exec", container, "which", "tc"]
+        result = subprocess.run(check_cmd, capture_output=True)
+        if result.returncode != 0:
+            logging.warning(f"tc command not found in {container}. Skipping network simulation.")
+            network_applied = False
+            continue
+
         cmd = ["docker", "exec", container, "tc", "qdisc", "add", "dev", "eth0", "root", "netem"]
         
         if scenario.network.latency_ms:
@@ -122,6 +133,8 @@ def apply_network_simulation(scenario: Scenario):
             
         logging.info(f"Applying network simulation to {container}: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
+        
+    return network_applied
 
 def run_orchestration(scenarios: List[Scenario], dataset: str = "dummy", limit: int = 3, output_dir: str = "benchmark_results"):
     os.makedirs(output_dir, exist_ok=True)
@@ -141,7 +154,7 @@ def run_orchestration(scenarios: List[Scenario], dataset: str = "dummy", limit: 
         logging.info("Waiting 30 seconds for workers to load models...")
         time.sleep(30)
         
-        apply_network_simulation(scenario)
+        network_applied = apply_network_simulation(scenario)
         
         # Run benchmark
         out_file = os.path.join(output_dir, f"{scenario.name}.json")
@@ -153,12 +166,26 @@ def run_orchestration(scenarios: List[Scenario], dataset: str = "dummy", limit: 
             "--dataset", dataset,
             "--limit", str(limit),
             "--use-transformers-baseline",
-            "--test-url", "http://localhost:8080",
+            "--test-url", "http://localhost:8081",
             "--evaluators", "exact_match,performance",
             "--output", out_file
         ]
         
         subprocess.run(bench_cmd, check=False)
+        
+        if os.path.exists(out_file) and scenario.network:
+            try:
+                import json
+                with open(out_file, "r") as f:
+                    results = json.load(f)
+                for res in results:
+                    if "metrics" not in res:
+                        res["metrics"] = {}
+                    res["metrics"]["network_simulation_applied"] = network_applied
+                with open(out_file, "w") as f:
+                    json.dump(results, f, indent=2)
+            except Exception as e:
+                logging.error(f"Failed to inject network metrics: {e}")
         
         logging.info("Tearing down cluster...")
         subprocess.run(["docker-compose", "-f", compose_path, "-p", "kiwibench", "down", "-v", "--remove-orphans"], check=True)
