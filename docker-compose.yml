@@ -36,14 +36,14 @@ services:
       - "8000:8000"
     environment:
       NODE_NAME: worker_1
-      NODE_URL: http://worker_1:8000
-      GATEWAY_URL: http://gateway:8080
+      NODE_URL: https://1a11-108-68-107-178.ngrok-free.app
+      GATEWAY_URL: https://214a-108-68-107-178.ngrok-free.app
       KIWI_USE_CSR: "false"
       KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.40"
       KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
-      KIWI_VRAM_GB_OVERRIDE: "0.8" # Very low VRAM, will split model layers (e.g. 0-6)
+      KIWI_VRAM_GB_OVERRIDE: "1.0" # Very low VRAM, will split model layers (e.g. 0-6)
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
@@ -71,7 +71,7 @@ services:
       KIWI_CSR_SPARSITY: "0.40"
       KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
-      KIWI_VRAM_GB_OVERRIDE: "0.8" # Very low VRAM, will split model layers (e.g. 7-13)
+      KIWI_VRAM_GB_OVERRIDE: "1.0" # Very low VRAM, will split model layers (e.g. 7-13)
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
@@ -99,7 +99,7 @@ services:
       KIWI_CSR_SPARSITY: "0.40"
       KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
-      KIWI_VRAM_GB_OVERRIDE: "0.8" # Very low VRAM, will split model layers (e.g. 14-20)
+      KIWI_VRAM_GB_OVERRIDE: "1.0" # Very low VRAM, will split model layers (e.g. 14-20)
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
@@ -127,7 +127,7 @@ services:
       KIWI_CSR_SPARSITY: "0.40"
       KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
-      KIWI_VRAM_GB_OVERRIDE: "0.8" # Very low VRAM, will split model layers (e.g. 21-23)
+      KIWI_VRAM_GB_OVERRIDE: "1.0" # Very low VRAM, will split model layers (e.g. 21-23)
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
