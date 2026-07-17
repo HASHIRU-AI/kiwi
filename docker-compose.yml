@@ -39,7 +39,7 @@ services:
       KIWI_USE_INT8: "false"
       KIWI_CSR_SPARSITY: "0.40"
       GPU_MEMORY_RESERVE_MB: "512"
-      KIWI_VRAM_GB_OVERRIDE: "1.0" # Small VRAM, will split model layers (e.g. 0-11)
+      KIWI_VRAM_GB_OVERRIDE: "0.8" # Very low VRAM, will split model layers (e.g. 0-6)
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
@@ -65,7 +65,7 @@ services:
       KIWI_USE_INT8: "false"
       KIWI_CSR_SPARSITY: "0.40"
       GPU_MEMORY_RESERVE_MB: "512"
-      KIWI_VRAM_GB_OVERRIDE: "2.6" # Larger VRAM, will fit all model layers (0-23)
+      KIWI_VRAM_GB_OVERRIDE: "0.8" # Very low VRAM, will split model layers (e.g. 7-13)
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
@@ -91,7 +91,7 @@ services:
       KIWI_USE_INT8: "false"
       KIWI_CSR_SPARSITY: "0.40"
       GPU_MEMORY_RESERVE_MB: "512"
-      KIWI_VRAM_GB_OVERRIDE: "1.0" # Small VRAM, will split model layers (e.g. 12-23)
+      KIWI_VRAM_GB_OVERRIDE: "0.8" # Very low VRAM, will split model layers (e.g. 14-20)
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
@@ -117,7 +117,7 @@ services:
       KIWI_USE_INT8: "false"
       KIWI_CSR_SPARSITY: "0.40"
       GPU_MEMORY_RESERVE_MB: "512"
-      KIWI_VRAM_GB_OVERRIDE: "2.6" # Larger VRAM, will fit all model layers (0-23)
+      KIWI_VRAM_GB_OVERRIDE: "0.8" # Very low VRAM, will split model layers (e.g. 21-23)
     volumes:
       - hf_cache:/root/.cache/huggingface
     depends_on:
