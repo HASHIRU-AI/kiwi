@@ -7,7 +7,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Share the host pip cache directory across rebuilds via Mount Cache
+# 1. Install heavy dependencies (cached long-term)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install torch==2.6.0 --extra-index-url https://download.pytorch.org/whl/cpu
+
+# 2. Install light dependencies (frequently updated)
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
     fastapi==0.115.12 \
@@ -15,8 +19,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     httpx==0.28.1 \
     pydantic==2.11.3 \
     safetensors==0.5.3 \
-    transformers==4.48.3 \
-    torch==2.6.0 --extra-index-url https://download.pytorch.org/whl/cpu
+    transformers==4.48.3
 
 COPY gateway.py models.py index.html ./
 
@@ -35,12 +38,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Install Python 3.10 and pip
 RUN apt-get update && \
     apt-get install -y --no-install-recommends python3.10 python3-pip && \
-    ln -sf /usr/bin/python3.10 /usr/bin/python && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* && \
+    ln -sf /usr/bin/python3.10 /usr/bin/python
 
 WORKDIR /app
 
-# Share the host pip cache directory across rebuilds via Mount Cache
+# 1. Install heavy dependencies (cached long-term, over 2GB of disk size)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install \
+    torch==2.6.0 \
+    transformers==4.48.3 \
+    accelerate>=1.2.0
+
+# 2. Install light dependencies (frequently updated or configuration-based)
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
     fastapi==0.115.12 \
@@ -48,9 +58,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     httpx==0.28.1 \
     pydantic==2.11.3 \
     safetensors==0.5.3 \
-    transformers==4.48.3 \
-    accelerate>=1.2.0 \
-    torch==2.6.0 \
     zstandard==0.23.0 \
     lz4==4.3.3
 
