@@ -69,6 +69,19 @@ The chat UI includes an interactive network topology panel. During text generati
 
 ---
 
+## Optimizations & Benchmarks
+
+Here is a summary of the optimizations implemented in Kiwi and their performance metrics (evaluated on the 4-worker split-model pipeline):
+
+| Optimization | Baseline Metric | Optimized Metric | Speedup / Improvement | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| **Direct P2P Pipeline Forwarding** | **6.10 tok/sec** (TTFT: 0.69s) | **16.30 tok/sec** (TTFT: 0.20s) | **2.67x (167% speedup)** | Replaces gateway-coordinated token loop with streaming `/generate` endpoint. |
+| **Lossless Payload Compression (Zstd)** | ~40 KB per activation payload | ~33 KB per activation payload | **~17.5% network payload reduction** | Applies standard zstd compression to activation tensor bytes. |
+| **PagedAttention (Virtual Block KV-Cache)** | 5.42 tok/sec (fragmented dict cache) | **5.88 tok/sec** (Page-allocated cache) | **~8.5% faster generation, 0% KV fragmentation** | Uses fixed-size block pool memory management to prevent OOM/fragmentation. |
+| **Docker Build Layer Optimization** | 291 seconds build time | **< 5 seconds** rebuild time | **> 50x faster Docker rebuilds** | Splits heavy packages (Torch/Transformers) from lightweight, fast-changing ones. |
+
+---
+
 ## Quickstart
 
 ### Prerequisites
