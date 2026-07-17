@@ -432,8 +432,8 @@ def _run_forward(
             return outputs.last_hidden_state.contiguous().cpu()
 
 
-def _serialize_hidden_states(result: torch.Tensor) -> bytes:
-    """Serialize hidden states for P2P transfer with optional CSR/INT8 compression."""
+def _serialize_hidden_states(result: torch.Tensor) -> tuple[bytes, dict[str, str]]:
+    """Serialize and optionally compress hidden states for P2P transfer."""
     if USE_INT8 and USE_CSR:
         shape = list(result.shape)
         hidden_2d = result.view(-1, shape[-1])
@@ -451,11 +451,20 @@ def _serialize_hidden_states(result: torch.Tensor) -> bytes:
                 hidden_2d_sparse = torch.zeros_like(hidden_2d)
         else:
             hidden_2d_sparse = hidden_2d
+            
+        # Compute channel-wise scale for dynamic activation smoothing
+        channel_scale = hidden_2d_sparse.abs().max(dim=0, keepdim=True).values
+        channel_scale = torch.clamp(channel_scale, min=1e-8)
+        
+        # Smooth activations
+        hidden_smooth = hidden_2d_sparse / channel_scale
 
-        max_val = hidden_2d_sparse.abs().max(dim=-1, keepdim=True).values
+        # Per-token scale computed on the smoothed sparse dense matrix
+        max_val = hidden_smooth.abs().max(dim=-1, keepdim=True).values
         scale = torch.clamp(max_val, min=1e-8) / 127.0
-        quantized = (hidden_2d_sparse / scale).round().to(torch.int8)
+        quantized = (hidden_smooth / scale).round().to(torch.int8)
 
+        # Convert to sparse CSR
         t_sparse = quantized.to_sparse_csr()
         crow = t_sparse.crow_indices()
         col = t_sparse.col_indices()
@@ -464,32 +473,37 @@ def _serialize_hidden_states(result: torch.Tensor) -> bytes:
         original_elements = result.numel()
         sparse_elements = quantized_val.numel()
         sparsity_percent = (1.0 - (sparse_elements / max(original_elements, 1))) * 100.0
-        print(
-            f"[{NODE_NAME}] [CSR+INT8] Sparsified & Quantized activations: "
-            f"{original_elements} -> {sparse_elements} non-zero values "
-            f"({sparsity_percent:.2f}% sparse, per-token scales)",
-            flush=True,
-        )
+        print(f"[{NODE_NAME}] [CSR+INT8] Sparsified & Quantized activations: {original_elements} -> {sparse_elements} non-zero values ({sparsity_percent:.2f}% sparse, per-token scales, smoothed)", flush=True)
 
-        return safetensors_save({
+        binary_hidden = safetensors_save({
             "crow_indices": crow,
             "col_indices": col,
             "quantized_values": quantized_val,
             "scale": scale.to(torch.float32),
-            "original_shape": torch.tensor(shape, dtype=torch.long),
+            "channel_scale": channel_scale.to(torch.float32),
+            "original_shape": torch.tensor(shape, dtype=torch.long)
         })
     elif USE_INT8:
-        max_val = result.abs().max(dim=-1, keepdim=True).values
-        scale = torch.clamp(max_val, min=1e-8) / 127.0
-        quantized = (result / scale).round().to(torch.int8)
-        print(
-            f"[{NODE_NAME}] [INT8] Quantized activations: "
-            f"{result.numel()} elements (per-token scales)",
-            flush=True,
-        )
-        return safetensors_save({
-            "quantized_hidden_states": quantized,
-            "scale": scale.to(torch.float32),
+        shape = list(result.shape)
+        # Flatten to 2D: (tokens, channels)
+        hidden_2d = result.view(-1, shape[-1])
+        # Compute channel-wise scale to smooth activation outliers
+        channel_scale = hidden_2d.abs().max(dim=0, keepdim=True).values
+        channel_scale = torch.clamp(channel_scale, min=1e-8)
+        
+        # Smooth activations
+        hidden_smooth = hidden_2d / channel_scale
+        
+        # Quantize smoothed activations per-token/per-row
+        token_scale = hidden_smooth.abs().max(dim=-1, keepdim=True).values
+        token_scale = torch.clamp(token_scale, min=1e-8) / 127.0
+        quantized = (hidden_smooth / token_scale).round().to(torch.int8)
+        
+        print(f"[{NODE_NAME}] [INT8] Quantized activations with channel-wise scales: {result.numel()} elements", flush=True)
+        binary_hidden = safetensors_save({
+            "quantized_hidden_states": quantized.view(shape),
+            "scale": token_scale.view(shape[:-1] + [1]).to(torch.float32),
+            "channel_scale": channel_scale.to(torch.float32)
         })
     elif USE_CSR:
         shape = list(result.shape)
@@ -508,30 +522,35 @@ def _serialize_hidden_states(result: torch.Tensor) -> bytes:
                 hidden_2d_sparse = torch.zeros_like(hidden_2d)
         else:
             hidden_2d_sparse = hidden_2d
-
+            
         t_sparse = hidden_2d_sparse.to_sparse_csr()
         crow = t_sparse.crow_indices()
         col = t_sparse.col_indices()
         val = t_sparse.values()
-
+        
         original_elements = result.numel()
         sparse_elements = val.numel()
         sparsity_percent = (1.0 - (sparse_elements / max(original_elements, 1))) * 100.0
-        print(
-            f"[{NODE_NAME}] [CSR] Compressed activations: "
-            f"{original_elements} -> {sparse_elements} non-zero values "
-            f"({sparsity_percent:.2f}% sparse)",
-            flush=True,
-        )
-
-        return safetensors_save({
+        print(f"[{NODE_NAME}] [CSR] Compressed activations: {original_elements} -> {sparse_elements} non-zero values ({sparsity_percent:.2f}% sparse)", flush=True)
+        
+        binary_hidden = safetensors_save({
             "crow_indices": crow,
             "col_indices": col,
             "values": val,
-            "original_shape": torch.tensor(shape, dtype=torch.long),
+            "original_shape": torch.tensor(shape, dtype=torch.long)
         })
     else:
-        return safetensors_save({"hidden_states": result})
+        binary_hidden = safetensors_save({"hidden_states": result})
+
+    # Apply lossless compression
+    headers = {}
+    if LOSSLESS_ALGORITHM != "none":
+        original_size = len(binary_hidden)
+        binary_hidden, compression_headers = _compress_payload(binary_hidden, LOSSLESS_ALGORITHM)
+        headers.update(compression_headers)
+        print(f"[{NODE_NAME}] [{LOSSLESS_ALGORITHM}] Compressed activations: {original_size} -> {len(binary_hidden)} bytes (ratio: {original_size / max(len(binary_hidden), 1):.2f}x)", flush=True)
+
+    return binary_hidden, headers
 
 
 # ── Forward endpoint ─────────────────────────────────────────────────────────────
@@ -664,120 +683,7 @@ async def forward(request: Request):
     remaining_pipeline = ",".join(next_workers[1:])
 
     # Compress / serialize output before sending it down the pipeline
-    if USE_INT8 and USE_CSR:
-        shape = list(result.shape)
-        hidden_2d = result.view(-1, shape[-1])
-        if CSR_SPARSITY_RATIO > 0.0:
-            k = int(hidden_2d.numel() * (1.0 - CSR_SPARSITY_RATIO))
-            if k > 0:
-                if k < hidden_2d.numel():
-                    flat_abs = torch.abs(hidden_2d).flatten()
-                    threshold = torch.topk(flat_abs, k).values[-1]
-                    mask = torch.abs(hidden_2d) >= threshold
-                    hidden_2d_sparse = hidden_2d * mask
-                else:
-                    hidden_2d_sparse = hidden_2d
-            else:
-                hidden_2d_sparse = torch.zeros_like(hidden_2d)
-        else:
-            hidden_2d_sparse = hidden_2d
-            
-        # Compute channel-wise scale for dynamic activation smoothing
-        channel_scale = hidden_2d_sparse.abs().max(dim=0, keepdim=True).values
-        channel_scale = torch.clamp(channel_scale, min=1e-8)
-        
-        # Smooth activations
-        hidden_smooth = hidden_2d_sparse / channel_scale
-
-        # Per-token scale computed on the smoothed sparse dense matrix
-        max_val = hidden_smooth.abs().max(dim=-1, keepdim=True).values
-        scale = torch.clamp(max_val, min=1e-8) / 127.0
-        quantized = (hidden_smooth / scale).round().to(torch.int8)
-
-        # Convert to sparse CSR
-        t_sparse = quantized.to_sparse_csr()
-        crow = t_sparse.crow_indices()
-        col = t_sparse.col_indices()
-        quantized_val = t_sparse.values()
-
-        original_elements = result.numel()
-        sparse_elements = quantized_val.numel()
-        sparsity_percent = (1.0 - (sparse_elements / max(original_elements, 1))) * 100.0
-        print(f"[{NODE_NAME}] [CSR+INT8] Sparsified & Quantized activations: {original_elements} -> {sparse_elements} non-zero values ({sparsity_percent:.2f}% sparse, per-token scales, smoothed)", flush=True)
-
-        binary_hidden = safetensors_save({
-            "crow_indices": crow,
-            "col_indices": col,
-            "quantized_values": quantized_val,
-            "scale": scale.to(torch.float32),
-            "channel_scale": channel_scale.to(torch.float32),
-            "original_shape": torch.tensor(shape, dtype=torch.long)
-        })
-    elif USE_INT8:
-        shape = list(result.shape)
-        # Flatten to 2D: (tokens, channels)
-        hidden_2d = result.view(-1, shape[-1])
-        # Compute channel-wise scale to smooth activation outliers
-        channel_scale = hidden_2d.abs().max(dim=0, keepdim=True).values
-        channel_scale = torch.clamp(channel_scale, min=1e-8)
-        
-        # Smooth activations
-        hidden_smooth = hidden_2d / channel_scale
-        
-        # Quantize smoothed activations per-token/per-row
-        token_scale = hidden_smooth.abs().max(dim=-1, keepdim=True).values
-        token_scale = torch.clamp(token_scale, min=1e-8) / 127.0
-        quantized = (hidden_smooth / token_scale).round().to(torch.int8)
-        
-        print(f"[{NODE_NAME}] [INT8] Quantized activations with channel-wise scales: {result.numel()} elements", flush=True)
-        binary_hidden = safetensors_save({
-            "quantized_hidden_states": quantized.view(shape),
-            "scale": token_scale.view(shape[:-1] + [1]).to(torch.float32),
-            "channel_scale": channel_scale.to(torch.float32)
-        })
-    elif USE_CSR:
-        shape = list(result.shape)
-        hidden_2d = result.view(-1, shape[-1])
-        if CSR_SPARSITY_RATIO > 0.0:
-            k = int(hidden_2d.numel() * (1.0 - CSR_SPARSITY_RATIO))
-            if k > 0:
-                if k < hidden_2d.numel():
-                    flat_abs = torch.abs(hidden_2d).flatten()
-                    threshold = torch.topk(flat_abs, k).values[-1]
-                    mask = torch.abs(hidden_2d) >= threshold
-                    hidden_2d_sparse = hidden_2d * mask
-                else:
-                    hidden_2d_sparse = hidden_2d
-            else:
-                hidden_2d_sparse = torch.zeros_like(hidden_2d)
-        else:
-            hidden_2d_sparse = hidden_2d
-            
-        t_sparse = hidden_2d_sparse.to_sparse_csr()
-        crow = t_sparse.crow_indices()
-        col = t_sparse.col_indices()
-        val = t_sparse.values()
-        
-        original_elements = result.numel()
-        sparse_elements = val.numel()
-        sparsity_percent = (1.0 - (sparse_elements / max(original_elements, 1))) * 100.0
-        print(f"[{NODE_NAME}] [CSR] Compressed activations: {original_elements} -> {sparse_elements} non-zero values ({sparsity_percent:.2f}% sparse)", flush=True)
-        
-        binary_hidden = safetensors_save({
-            "crow_indices": crow,
-            "col_indices": col,
-            "values": val,
-            "original_shape": torch.tensor(shape, dtype=torch.long)
-        })
-    else:
-        binary_hidden = safetensors_save({"hidden_states": result})
-
-    compression_headers = {}
-    if LOSSLESS_ALGORITHM != "none":
-        original_size = len(binary_hidden)
-        binary_hidden, headers = _compress_payload(binary_hidden, LOSSLESS_ALGORITHM)
-        compression_headers.update(headers)
-        print(f"[{NODE_NAME}] [{LOSSLESS_ALGORITHM}] Compressed activations: {original_size} -> {len(binary_hidden)} bytes (ratio: {original_size / max(len(binary_hidden), 1):.2f}x)", flush=True)
+    binary_hidden, compression_headers = _serialize_hidden_states(result)
 
     try:
         async with httpx.AsyncClient(
@@ -884,7 +790,7 @@ async def generate(request: Request):
                         ) + "\n"
                         return
 
-                    binary_hidden = _serialize_hidden_states(result)
+                    binary_hidden, compression_headers = _serialize_hidden_states(result)
                     next_url = next_workers[0]
                     remaining = ",".join(next_workers[1:])
 
@@ -896,6 +802,7 @@ async def generate(request: Request):
                                 "X-Step": step,
                                 "X-Pipeline": remaining,
                                 "Content-Type": "application/octet-stream",
+                                **compression_headers,
                             },
                             content=binary_hidden,
                         )
