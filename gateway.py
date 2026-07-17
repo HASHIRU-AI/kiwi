@@ -597,123 +597,124 @@ async def _stream_completion(
         dtype=torch.long, device="cpu"
     )
     generated_ids: list[int] = []
-    is_prefill = True
     reroutes = 0
 
-    try:
-        pipeline = await registry.select_pipeline(
-            model.model_id, model.num_layers
-        )
-    except RuntimeError as error:
-        yield _sse({"error": {"message": str(error), "type": "server_error"}})
-        yield "data: [DONE]\n\n"
-        return
+    # Build EOS token set for the worker to detect end-of-sequence
+    eos_ids = tokenizer.eos_token_id
+    eos_set = set(eos_ids) if isinstance(eos_ids, list) else {eos_ids}
+    eos_header = ",".join(str(e) for e in eos_set)
 
-    timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=10.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        while len(generated_ids) < request.max_tokens:
-            context_ids = (
-                torch.cat(
-                    [prompt_ids, torch.tensor([generated_ids], dtype=torch.long)],
-                    dim=1,
-                )
-                if generated_ids
-                else prompt_ids
+    while True:  # Outer retry loop for rerouting
+        try:
+            pipeline = await registry.select_pipeline(
+                model.model_id, model.num_layers
             )
-            input_ids = (
-                context_ids
-                if is_prefill
-                else torch.tensor([[generated_ids[-1]]], dtype=torch.long)
+        except RuntimeError as error:
+            yield _sse({"error": {"message": str(error), "type": "server_error"}})
+            yield "data: [DONE]\n\n"
+            return
+
+        first = pipeline[0]
+        remaining_urls = ",".join(w.node_url for w in pipeline[1:])
+        active_nodes = {
+            f"stage_{i}": w.node_url for i, w in enumerate(pipeline)
+        }
+
+        # Build full context: original prompt + any previously generated tokens
+        if generated_ids:
+            context_ids = torch.cat(
+                [prompt_ids, torch.tensor([generated_ids], dtype=torch.long)],
+                dim=1,
             )
-            body = safetensors_save({"input_ids": input_ids.contiguous()})
+        else:
+            context_ids = prompt_ids
 
-            first = pipeline[0]
-            remaining_urls = ",".join(w.node_url for w in pipeline[1:])
-            active_nodes = {
-                f"stage_{i}": w.node_url for i, w in enumerate(pipeline)
-            }
+        body = safetensors_save({"input_ids": context_ids.contiguous()})
+        remaining_tokens = request.max_tokens - len(generated_ids)
 
-            try:
-                response = await client.post(
-                    f"{first.node_url}/forward",
+        timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=10.0)
+        stream_ok = True
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream(
+                    "POST",
+                    f"{first.node_url}/generate",
                     headers={
                         "X-Request-ID": request_id,
-                        "X-Step": "prefill" if is_prefill else "decode",
                         "X-Pipeline": remaining_urls,
+                        "X-Max-Tokens": str(remaining_tokens),
+                        "X-Eos-Token-Ids": eos_header,
                         "Content-Type": "application/octet-stream",
                     },
                     content=body,
-                )
-                response.raise_for_status()
-                token_id = int(response.json()["next_token_id"])
-            except httpx.HTTPError as error:
-                reroutes += 1
-                failed_url = None
-                if isinstance(error, httpx.HTTPStatusError):
-                    failed_url = error.response.headers.get(
-                        "X-Kiwi-Failed-Node"
-                    )
-                await registry.evict(failed_url or first.node_url)
-                yield _chunk(
-                    request_id,
-                    model.model_id,
-                    "[REROUTING...]",
-                    active_nodes=active_nodes,
-                )
-                if reroutes > MAX_REROUTES:
-                    yield _sse(
-                        {
-                            "error": {
-                                "message": "Retry budget exhausted",
-                                "type": "server_error",
-                            }
-                        }
-                    )
-                    break
-                try:
-                    pipeline = await registry.select_pipeline(
-                        model.model_id, model.num_layers
-                    )
-                except RuntimeError as no_pipeline:
-                    yield _sse(
-                        {
-                            "error": {
-                                "message": str(no_pipeline),
-                                "type": "server_error",
-                            }
-                        }
-                    )
-                    break
-                # Full prefill recreates KV caches on the new pipeline.
-                is_prefill = True
-                continue
-            except (KeyError, TypeError, ValueError) as error:
-                yield _sse(
-                    {
-                        "error": {
-                            "message": f"Invalid worker response: {error}",
-                            "type": "server_error",
-                        }
-                    }
-                )
-                break
+                ) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
 
-            generated_ids.append(token_id)
-            text = tokenizer.decode([token_id], skip_special_tokens=False)
-            eos_ids = tokenizer.eos_token_id
-            eos_set = (
-                set(eos_ids) if isinstance(eos_ids, list) else {eos_ids}
+                        if "error" in data:
+                            # Worker-reported pipeline failure
+                            failed_node = data.get("failed_node")
+                            await registry.evict(
+                                failed_node or first.node_url
+                            )
+                            stream_ok = False
+                            break
+
+                        token_id = data.get("token_id")
+                        if token_id is None:
+                            continue
+
+                        generated_ids.append(token_id)
+
+                        if token_id in eos_set:
+                            break
+
+                        text = tokenizer.decode(
+                            [token_id], skip_special_tokens=False
+                        )
+                        if text:
+                            yield _chunk(
+                                request_id,
+                                model.model_id,
+                                text,
+                                active_nodes=active_nodes,
+                            )
+
+        except httpx.HTTPError:
+            await registry.evict(first.node_url)
+            stream_ok = False
+
+        if stream_ok:
+            break
+
+        # Rerouting: evict failed node, rebuild pipeline, retry with full context
+        reroutes += 1
+        if reroutes > MAX_REROUTES:
+            yield _sse(
+                {
+                    "error": {
+                        "message": "Retry budget exhausted",
+                        "type": "server_error",
+                    }
+                }
             )
-            if token_id in eos_set:
-                break
-            if text:
-                yield _chunk(
-                    request_id,
-                    model.model_id,
-                    text,
-                    active_nodes=active_nodes,
-                )
-            is_prefill = False
+            break
+
+        yield _chunk(
+            request_id,
+            model.model_id,
+            "[REROUTING...]",
+            active_nodes=active_nodes,
+        )
+        # Loop continues: will rebuild pipeline and send full context as prefill
 
     yield _chunk(request_id, model.model_id, None, finish_reason="stop")
     yield "data: [DONE]\n\n"
