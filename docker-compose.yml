@@ -36,8 +36,9 @@ services:
       NODE_URL: http://worker_1:8000
       GATEWAY_URL: http://gateway:8080
       KIWI_USE_CSR: "false"
-      KIWI_USE_INT8: "false"
+      KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.40"
+      KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.8" # Very low VRAM, will split model layers (e.g. 0-6)
     volumes:
@@ -53,6 +54,7 @@ services:
               count: 1
               capabilities: [ gpu ]
 
+
   worker_2:
     image: kiwi-worker:latest
     container_name: kiwi-worker_2-1
@@ -62,8 +64,9 @@ services:
       NODE_URL: http://worker_2:8000
       GATEWAY_URL: http://gateway:8080
       KIWI_USE_CSR: "false"
-      KIWI_USE_INT8: "false"
+      KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.40"
+      KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.8" # Very low VRAM, will split model layers (e.g. 7-13)
     volumes:
@@ -79,6 +82,7 @@ services:
               count: 1
               capabilities: [ gpu ]
 
+
   worker_3:
     image: kiwi-worker:latest
     container_name: kiwi-worker_3-1
@@ -88,8 +92,9 @@ services:
       NODE_URL: http://worker_3:8000
       GATEWAY_URL: http://gateway:8080
       KIWI_USE_CSR: "false"
-      KIWI_USE_INT8: "false"
+      KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.40"
+      KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.8" # Very low VRAM, will split model layers (e.g. 14-20)
     volumes:
@@ -105,6 +110,7 @@ services:
               count: 1
               capabilities: [ gpu ]
 
+
   worker_4:
     image: kiwi-worker:latest
     container_name: kiwi-worker_4-1
@@ -114,8 +120,9 @@ services:
       NODE_URL: http://worker_4:8000
       GATEWAY_URL: http://gateway:8080
       KIWI_USE_CSR: "false"
-      KIWI_USE_INT8: "false"
+      KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.40"
+      KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.8" # Very low VRAM, will split model layers (e.g. 21-23)
     volumes:
@@ -130,6 +137,7 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [ gpu ]
+
 
 volumes:
   hf_cache:
