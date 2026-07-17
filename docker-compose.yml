@@ -36,7 +36,7 @@ services:
       NODE_URL: http://worker_1:8000
       GATEWAY_URL: http://gateway:8080
       KIWI_USE_CSR: "false"
-      KIWI_USE_INT8: "false"
+      KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.40"
       KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
@@ -64,7 +64,7 @@ services:
       NODE_URL: http://worker_2:8000
       GATEWAY_URL: http://gateway:8080
       KIWI_USE_CSR: "false"
-      KIWI_USE_INT8: "false"
+      KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.40"
       KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
@@ -92,7 +92,7 @@ services:
       NODE_URL: http://worker_3:8000
       GATEWAY_URL: http://gateway:8080
       KIWI_USE_CSR: "false"
-      KIWI_USE_INT8: "false"
+      KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.40"
       KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
@@ -120,7 +120,7 @@ services:
       NODE_URL: http://worker_4:8000
       GATEWAY_URL: http://gateway:8080
       KIWI_USE_CSR: "false"
-      KIWI_USE_INT8: "false"
+      KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.40"
       KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"

@@ -481,6 +481,104 @@ def test_lossless_compression():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  TEST 12: SmoothQuant-style INT8 Quantization
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_smoothquant_quantization():
+    print("\n── Test 12: SmoothQuant-style INT8 Quantization ──")
+    import worker
+    from safetensors.torch import save as safetensors_save, load as safetensors_load
+    import torch
+    import unittest.mock as mock
+    from fastapi.testclient import TestClient
+
+    # 1. Simulate a tensor with severe activation outliers
+    # batch=1, seq=3, channels=8
+    # We make channel index 2 contain large outliers (e.g. 80.0), while other channels are small (e.g., around 1.0)
+    original = torch.tensor([
+        [1.2, 0.9, 82.0, 1.1, 0.8, 1.5, 0.7, 1.1],
+        [0.8, 1.1, 80.0, 0.9, 1.2, 0.7, 1.3, 0.9],
+        [1.1, 0.7, 85.0, 1.3, 0.9, 1.1, 0.8, 1.2]
+    ]).to(worker._dtype())
+
+    # --- Standard INT8 Quantization (without SmoothQuant) ---
+    max_val = original.abs().max(dim=-1, keepdim=True).values
+    scale_std = torch.clamp(max_val, min=1e-8) / 127.0
+    quantized_std = (original / scale_std).round().to(torch.int8)
+    dequantized_std = quantized_std.float() * scale_std
+
+    # --- SmoothQuant-style INT8 Quantization ---
+    # Compute channel-wise scale
+    channel_scale = original.abs().max(dim=0, keepdim=True).values
+    channel_scale = torch.clamp(channel_scale, min=1e-8)
+    
+    # Smooth activations
+    smooth = original / channel_scale
+    
+    # Quantize smoothed activations per-token/per-row
+    token_scale = smooth.abs().max(dim=-1, keepdim=True).values
+    token_scale = torch.clamp(token_scale, min=1e-8) / 127.0
+    quantized_sq = (smooth / token_scale).round().to(torch.int8)
+    dequantized_sq = ((quantized_sq.float() * token_scale) * channel_scale).to(worker._dtype())
+
+    # Compute absolute error for non-outlier channels (all channels except index 2)
+    non_outliers_mask = torch.tensor([True, True, False, True, True, True, True, True])
+    
+    error_std = (original - dequantized_std).abs()[:, non_outliers_mask].mean().item()
+    error_sq = (original - dequantized_sq).abs()[:, non_outliers_mask].mean().item()
+    
+    print(f"  Average standard INT8 error on normal channels: {error_std:.4f}")
+    print(f"  Average SmoothQuant INT8 error on normal channels: {error_sq:.4f}")
+    
+    assert_true(error_sq < error_std / 5, "SmoothQuant INT8 error is significantly lower (at least 5x better) than standard INT8 on normal channels")
+
+    # 2. Test FastAPI dequantization endpoints using TestClient
+    client = TestClient(worker.app)
+    original_model = worker.model
+    original_first = worker.is_first_stage
+    original_last = worker.is_last_stage
+    
+    worker.model = mock.MagicMock()
+    worker.is_first_stage = False
+    worker.is_last_stage = True
+    
+    mock_logits = torch.randn(1, 10)
+    worker.model.lm_head = lambda x: mock_logits
+
+    # Save SmoothQuant payload
+    payload = {
+        "quantized_hidden_states": quantized_sq.unsqueeze(0), # Add batch dim
+        "scale": token_scale.unsqueeze(0).to(torch.float32),
+        "channel_scale": channel_scale.to(torch.float32)
+    }
+    serialized = safetensors_save(payload)
+
+    with mock.patch("worker._run_forward", return_value=99) as mock_forward:
+        headers = {
+            "X-Request-ID": "sq-test-req",
+            "X-Step": "decode",
+            "X-Pipeline": "",
+            "Content-Type": "application/octet-stream",
+        }
+        response = client.post("/forward", headers=headers, content=serialized)
+        assert_eq(response.status_code, 200, "FastAPI endpoint handled SmoothQuant payload successfully")
+        assert_eq(response.json(), {"next_token_id": 99}, "FastAPI endpoint returned correct token ID")
+        
+        mock_forward.assert_called_once()
+        called_kwargs = mock_forward.call_args[1]
+        
+        # Verify that dequantized tensor passed to model matches dequantized_sq
+        called_hidden = called_kwargs["hidden_states"].squeeze(0)
+        assert_true(torch.allclose(called_hidden.float(), dequantized_sq.float(), atol=1e-3), "Dequantized hidden states match SmoothQuant reconstructed output")
+
+    # Restore worker globals
+    worker.model = original_model
+    worker.is_first_stage = original_first
+    worker.is_last_stage = original_last
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Runner
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -502,6 +600,7 @@ async def main():
         ("Redundancy all layers", test_redundancy_all_layers),
         ("Model readiness", test_model_readiness),
         ("Lossless compression", test_lossless_compression),
+        ("SmoothQuant INT8 Quantization", test_smoothquant_quantization),
     ]
 
     for name, test_fn in tests:
