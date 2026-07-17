@@ -33,7 +33,7 @@ MAX_REROUTES = int(os.getenv("MAX_REROUTES", "4"))
 INDEX_FILE = Path(__file__).with_name("index.html")
 
 # ── 2-Stage Eviction Thresholds ──
-HEARTBEAT_SOFT_STALE_SECONDS = float(os.getenv("HEARTBEAT_SOFT_STALE_SECONDS", "8"))
+HEARTBEAT_SOFT_STALE_SECONDS = float(os.getenv("HEARTBEAT_SOFT_STALE_SECONDS", "15"))
 HEARTBEAT_HARD_STALE_SECONDS = float(os.getenv("HEARTBEAT_HARD_STALE_SECONDS", "120"))
 
 
@@ -76,7 +76,6 @@ class Worker:
     healthy: bool = True
     registered_at: float = 0.0
     last_seen: float = 0.0
-    pending_layers: tuple[int, int] | None = None
 
 
 # ── Worker registry ──────────────────────────────────────────────────────────────
@@ -109,14 +108,6 @@ class WorkerRegistry:
                 coverage[layer] += 1
         return coverage
 
-    @staticmethod
-    def _max_layers(model: ModelConfig, vram_gb: float) -> int:
-        """Return the number of layers this worker can host."""
-        if vram_gb <= 0.0:
-            return model.num_layers
-        usable_mb = (vram_gb * 1024) - 512
-        return min(model.num_layers, max(1, int(usable_mb // model.layer_size_mb)))
-
     def _pick_model(self, model_registry: ModelRegistry, vram_gb: float) -> ModelConfig:
         """Pick the model most in need of a worker, taking VRAM-fit into account.
 
@@ -137,7 +128,12 @@ class WorkerRegistry:
             uncovered = sum(1 for c in cov if c == 0)
 
             # Estimate max layers for this worker
-            max_layers = self._max_layers(model, vram_gb)
+            if vram_gb > 0.0:
+                usable_mb = (vram_gb * 1024) - 512
+                max_layers = max(1, int(usable_mb // model.layer_size_mb))
+            else:
+                max_layers = model.num_layers
+            max_layers = min(max_layers, model.num_layers)
 
             # Score how well this worker fits a 2-stage split (closer to half is better)
             target = model.num_layers / 2
@@ -167,7 +163,16 @@ class WorkerRegistry:
             layer size estimation, reserving 512 MB for KV Cache and activation overhead.
         """
         # Determine maximum layers this node can host based on VRAM capacity
-        max_layers = self._max_layers(model, vram_gb)
+        if vram_gb > 0.0:
+            usable_mb = (vram_gb * 1024) - 512
+            # Each layer size computed dynamically from hidden size / weights
+            max_layers = max(1, int(usable_mb // model.layer_size_mb))
+        else:
+            # CPU fallback assumes unlimited system RAM capacity
+            max_layers = model.num_layers
+
+        # Cap at model's total layer count
+        max_layers = min(max_layers, model.num_layers)
 
         cov = self._layer_coverage(model.model_id, model.num_layers)
         min_cov = min(cov)
@@ -291,46 +296,6 @@ class WorkerRegistry:
                 target = max_end + 1
             return pipeline
 
-    async def recompute_model(self, model: ModelConfig) -> Worker | None:
-        """Queue one redundant worker to move if that creates a complete pipeline.
-
-        A worker remains excluded while it reloads.  It becomes healthy again only
-        after its heartbeat acknowledgement confirms the new layer range, so the
-        registry never routes traffic to a worker serving stale model layers.
-        """
-        async with self._lock:
-            workers = self._healthy_workers(model.model_id)
-            coverage = self._layer_coverage(model.model_id, model.num_layers)
-            if min(coverage, default=0) > 0:
-                return None
-
-            best: tuple[int, Worker, tuple[int, int]] | None = None
-            for worker in workers:
-                base = coverage[:]
-                for layer in range(worker.layers[0], worker.layers[1] + 1):
-                    base[layer] -= 1
-                length = self._max_layers(model, worker.vram_gb)
-                for start in range(model.num_layers - length + 1):
-                    layers = (start, start + length - 1)
-                    if layers == worker.layers:
-                        continue
-                    candidate = base[:]
-                    for layer in range(layers[0], layers[1] + 1):
-                        candidate[layer] += 1
-                    if min(candidate) <= 0:
-                        continue
-                    # Prefer the least redundant complete arrangement.
-                    score = sum(candidate)
-                    if best is None or score < best[0]:
-                        best = (score, worker, layers)
-
-            if best is None:
-                return None
-            _, worker, layers = best
-            worker.pending_layers = layers
-            worker.healthy = False
-            return worker
-
     async def evict(self, node_url: str) -> None:
         async with self._lock:
             worker = self._workers.get(node_url.rstrip("/"))
@@ -353,7 +318,6 @@ class WorkerRegistry:
                         "node_url": w.node_url,
                         "model_id": w.model_id,
                         "layers": list(w.layers),
-                        "pending_layers": list(w.pending_layers) if w.pending_layers else None,
                         "healthy": w.healthy,
                         "last_seen": round(time.time() - w.last_seen, 1),
                     }
@@ -377,33 +341,14 @@ class WorkerRegistry:
                 }
             return result
 
-    async def heartbeat(self, node_url: str) -> Worker | None:
+    async def heartbeat(self, node_url: str) -> bool:
         async with self._lock:
             worker = self._workers.get(node_url.rstrip("/"))
             if worker:
                 worker.last_seen = time.time()
-                if worker.pending_layers is None:
-                    worker.healthy = True
-                return worker
-            return None
-
-    async def complete_recompute(
-        self, node_url: str, model_id: str, layers: tuple[int, int]
-    ) -> bool:
-        """Commit a queued assignment after the worker has reloaded it."""
-        async with self._lock:
-            worker = self._workers.get(node_url.rstrip("/"))
-            if (
-                worker is None
-                or worker.model_id != model_id
-                or worker.pending_layers != layers
-            ):
-                return False
-            worker.layers = layers
-            worker.pending_layers = None
-            worker.healthy = True
-            worker.last_seen = time.time()
-            return True
+                worker.healthy = True
+                return True
+            return False
 
     async def evict_stale(
         self, soft_stale_seconds: float, hard_stale_seconds: float
@@ -444,7 +389,6 @@ class WorkerRegistry:
 registry = WorkerRegistry()
 model_registry: ModelRegistry | None = None
 _tokenizers: dict[str, AutoTokenizer] = {}
-_recompute_task: asyncio.Task[None] | None = None
 
 
 async def _get_tokenizer(model_id: str) -> AutoTokenizer:
@@ -454,47 +398,6 @@ async def _get_tokenizer(model_id: str) -> AutoTokenizer:
             AutoTokenizer.from_pretrained, model_id
         )
     return _tokenizers[model_id]
-
-
-async def _recompute_unavailable_models() -> list[dict[str, object]]:
-    """Queue one corrective move for each model currently lacking E2E coverage."""
-    if not model_registry:
-        return []
-    scheduled: list[dict[str, object]] = []
-    for model in model_registry.list_models():
-        moved = await registry.recompute_model(model)
-        if moved:
-            scheduled.append(
-                {
-                    "model_id": model.model_id,
-                    "node_name": moved.node_name,
-                    "layers": list(moved.pending_layers or ()),
-                }
-            )
-    return scheduled
-
-
-def _schedule_recompute(reason: str) -> None:
-    """Run one recompute in the background without delaying topology updates."""
-    global _recompute_task
-    if _recompute_task and not _recompute_task.done():
-        return
-
-    async def _run() -> None:
-        try:
-            scheduled = await _recompute_unavailable_models()
-            if scheduled:
-                print(f"[gateway] Scheduled layer recompute after {reason}: {scheduled}")
-        except Exception as error:
-            print(f"[gateway] Layer recompute failed after {reason}: {error}")
-
-    _recompute_task = asyncio.create_task(_run())
-
-
-async def _evict_and_recompute(node_url: str, reason: str) -> None:
-    """Evict immediately, then heal in the background."""
-    await registry.evict(node_url)
-    _schedule_recompute(reason)
 
 
 # ── Lifespan ─────────────────────────────────────────────────────────────────────
@@ -521,7 +424,6 @@ async def lifespan(_: FastAPI):
             
             if evicted["soft"]:
                 print(f"[gateway] Soft-evicted (paused routing): {evicted['soft']}")
-                _schedule_recompute("stale-worker eviction")
             if evicted["hard"]:
                 print(f"[gateway] Hard-evicted (memory wiped): {evicted['hard']}")
 
@@ -582,7 +484,6 @@ async def register_worker(registration: WorkerRegistration) -> JSONResponse:
     if not model_registry:
         raise HTTPException(status_code=503, detail="Gateway not ready")
     worker = await registry.register(registration, model_registry)
-    _schedule_recompute("registration")
     model = model_registry.resolve(worker.model_id)
     return JSONResponse(
         {
@@ -599,69 +500,17 @@ class HeartbeatRequest(BaseModel):
     node_url: str
 
 
-class RecomputeCompleteRequest(HeartbeatRequest):
-    model_id: str
-    layers: list[int] = Field(min_length=2, max_length=2)
-
-
 @app.post("/heartbeat")
-async def heartbeat(request: HeartbeatRequest) -> dict[str, object]:
-    worker = await registry.heartbeat(request.node_url)
-    if not worker:
+async def heartbeat(request: HeartbeatRequest) -> dict[str, str]:
+    exists = await registry.heartbeat(request.node_url)
+    if not exists:
         raise HTTPException(status_code=404, detail="Worker not registered")
-    if worker.pending_layers is None:
-        return {"status": "ok"}
-    assert model_registry is not None
-    model = model_registry.resolve(worker.model_id)
-    return {
-        "status": "recompute_required",
-        "assignment": {
-            "model_id": worker.model_id,
-            "layers": list(worker.pending_layers),
-            "total_layers": model.num_layers if model else 0,
-            "dtype": model.default_dtype if model else "bfloat16",
-        },
-    }
-
-
-@app.post("/recompute/complete")
-async def recompute_complete(request: RecomputeCompleteRequest) -> dict[str, str]:
-    accepted = await registry.complete_recompute(
-        request.node_url, request.model_id, (request.layers[0], request.layers[1])
-    )
-    if not accepted:
-        raise HTTPException(status_code=409, detail="No matching pending assignment")
     return {"status": "ok"}
-
-
-@app.post("/recompute")
-async def recompute() -> dict[str, object]:
-    """Attempt to restore E2E coverage for every currently unavailable model.
-
-    This is also useful to run after an operator changes node capacity or
-    restores workers with fixed/duplicate ranges.  A scheduled move is delivered
-    through the target worker's next heartbeat.
-    """
-    if not model_registry:
-        raise HTTPException(status_code=503, detail="Model registry not ready")
-
-    scheduled: list[dict[str, object]] = []
-    for model in model_registry.list_models():
-        moved = await registry.recompute_model(model)
-        if moved:
-            scheduled.append(
-                {
-                    "model_id": model.model_id,
-                    "node_name": moved.node_name,
-                    "layers": list(moved.pending_layers or ()),
-                }
-            )
-    return {"status": "scheduled" if scheduled else "no_change", "moves": scheduled}
 
 
 @app.post("/deregister")
 async def deregister(request: HeartbeatRequest) -> dict[str, str]:
-    await _evict_and_recompute(request.node_url, "deregistration")
+    await registry.evict(request.node_url)
     return {"status": "evicted"}
 
 
@@ -748,133 +597,124 @@ async def _stream_completion(
         dtype=torch.long, device="cpu"
     )
     generated_ids: list[int] = []
-    is_prefill = True
     reroutes = 0
 
-    async def _pipeline_or_recompute() -> list[Worker]:
+    # Build EOS token set for the worker to detect end-of-sequence
+    eos_ids = tokenizer.eos_token_id
+    eos_set = set(eos_ids) if isinstance(eos_ids, list) else {eos_ids}
+    eos_header = ",".join(str(e) for e in eos_set)
+
+    while True:  # Outer retry loop for rerouting
         try:
-            return await registry.select_pipeline(model.model_id, model.num_layers)
+            pipeline = await registry.select_pipeline(
+                model.model_id, model.num_layers
+            )
         except RuntimeError as error:
-            moved = await registry.recompute_model(model)
-            if moved:
-                raise RuntimeError(
-                    f"{error}. Rebalancing {moved.node_name} to layers "
-                    f"{moved.pending_layers[0]}-{moved.pending_layers[1]}; retry shortly."
-                ) from error
-            raise
+            yield _sse({"error": {"message": str(error), "type": "server_error"}})
+            yield "data: [DONE]\n\n"
+            return
 
-    try:
-        pipeline = await _pipeline_or_recompute()
-    except RuntimeError as error:
-        yield _sse({"error": {"message": str(error), "type": "server_error"}})
-        yield "data: [DONE]\n\n"
-        return
+        first = pipeline[0]
+        remaining_urls = ",".join(w.node_url for w in pipeline[1:])
+        active_nodes = {
+            f"stage_{i}": w.node_url for i, w in enumerate(pipeline)
+        }
 
-    timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=10.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        while len(generated_ids) < request.max_tokens:
-            context_ids = (
-                torch.cat(
-                    [prompt_ids, torch.tensor([generated_ids], dtype=torch.long)],
-                    dim=1,
-                )
-                if generated_ids
-                else prompt_ids
+        # Build full context: original prompt + any previously generated tokens
+        if generated_ids:
+            context_ids = torch.cat(
+                [prompt_ids, torch.tensor([generated_ids], dtype=torch.long)],
+                dim=1,
             )
-            input_ids = (
-                context_ids
-                if is_prefill
-                else torch.tensor([[generated_ids[-1]]], dtype=torch.long)
-            )
-            body = safetensors_save({"input_ids": input_ids.contiguous()})
+        else:
+            context_ids = prompt_ids
 
-            first = pipeline[0]
-            remaining_urls = ",".join(w.node_url for w in pipeline[1:])
-            active_nodes = {
-                f"stage_{i}": w.node_url for i, w in enumerate(pipeline)
-            }
+        body = safetensors_save({"input_ids": context_ids.contiguous()})
+        remaining_tokens = request.max_tokens - len(generated_ids)
 
-            try:
-                response = await client.post(
-                    f"{first.node_url}/forward",
+        timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=10.0)
+        stream_ok = True
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream(
+                    "POST",
+                    f"{first.node_url}/generate",
                     headers={
                         "X-Request-ID": request_id,
-                        "X-Step": "prefill" if is_prefill else "decode",
                         "X-Pipeline": remaining_urls,
+                        "X-Max-Tokens": str(remaining_tokens),
+                        "X-Eos-Token-Ids": eos_header,
                         "Content-Type": "application/octet-stream",
                     },
                     content=body,
-                )
-                response.raise_for_status()
-                token_id = int(response.json()["next_token_id"])
-            except httpx.HTTPError as error:
-                reroutes += 1
-                failed_url = None
-                if isinstance(error, httpx.HTTPStatusError):
-                    failed_url = error.response.headers.get(
-                        "X-Kiwi-Failed-Node"
-                    )
-                await _evict_and_recompute(
-                    failed_url or first.node_url, "inference failure"
-                )
-                yield _chunk(
-                    request_id,
-                    model.model_id,
-                    "[REROUTING...]",
-                    active_nodes=active_nodes,
-                )
-                if reroutes > MAX_REROUTES:
-                    yield _sse(
-                        {
-                            "error": {
-                                "message": "Retry budget exhausted",
-                                "type": "server_error",
-                            }
-                        }
-                    )
-                    break
-                try:
-                    pipeline = await _pipeline_or_recompute()
-                except RuntimeError as no_pipeline:
-                    yield _sse(
-                        {
-                            "error": {
-                                "message": str(no_pipeline),
-                                "type": "server_error",
-                            }
-                        }
-                    )
-                    break
-                # Full prefill recreates KV caches on the new pipeline.
-                is_prefill = True
-                continue
-            except (KeyError, TypeError, ValueError) as error:
-                yield _sse(
-                    {
-                        "error": {
-                            "message": f"Invalid worker response: {error}",
-                            "type": "server_error",
-                        }
-                    }
-                )
-                break
+                ) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
 
-            generated_ids.append(token_id)
-            text = tokenizer.decode([token_id], skip_special_tokens=False)
-            eos_ids = tokenizer.eos_token_id
-            eos_set = (
-                set(eos_ids) if isinstance(eos_ids, list) else {eos_ids}
+                        if "error" in data:
+                            # Worker-reported pipeline failure
+                            failed_node = data.get("failed_node")
+                            await registry.evict(
+                                failed_node or first.node_url
+                            )
+                            stream_ok = False
+                            break
+
+                        token_id = data.get("token_id")
+                        if token_id is None:
+                            continue
+
+                        generated_ids.append(token_id)
+
+                        if token_id in eos_set:
+                            break
+
+                        text = tokenizer.decode(
+                            [token_id], skip_special_tokens=False
+                        )
+                        if text:
+                            yield _chunk(
+                                request_id,
+                                model.model_id,
+                                text,
+                                active_nodes=active_nodes,
+                            )
+
+        except httpx.HTTPError:
+            await registry.evict(first.node_url)
+            stream_ok = False
+
+        if stream_ok:
+            break
+
+        # Rerouting: evict failed node, rebuild pipeline, retry with full context
+        reroutes += 1
+        if reroutes > MAX_REROUTES:
+            yield _sse(
+                {
+                    "error": {
+                        "message": "Retry budget exhausted",
+                        "type": "server_error",
+                    }
+                }
             )
-            if token_id in eos_set:
-                break
-            if text:
-                yield _chunk(
-                    request_id,
-                    model.model_id,
-                    text,
-                    active_nodes=active_nodes,
-                )
-            is_prefill = False
+            break
+
+        yield _chunk(
+            request_id,
+            model.model_id,
+            "[REROUTING...]",
+            active_nodes=active_nodes,
+        )
+        # Loop continues: will rebuild pipeline and send full context as prefill
 
     yield _chunk(request_id, model.model_id, None, finish_reason="stop")
     yield "data: [DONE]\n\n"

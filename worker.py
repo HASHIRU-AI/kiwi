@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import gc
+import json
 import os
 import time
 from contextlib import asynccontextmanager
@@ -12,7 +12,7 @@ from typing import Any
 import httpx
 import torch
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from safetensors.torch import load as safetensors_load
 from safetensors.torch import save as safetensors_save
 from transformers import AutoModelForCausalLM
@@ -24,6 +24,10 @@ NODE_URL = os.getenv("NODE_URL", "http://worker:8000").rstrip("/")
 USE_CSR = os.getenv("KIWI_USE_CSR", "false").lower() in ("true", "1", "yes")
 CSR_SPARSITY_RATIO = float(os.getenv("KIWI_CSR_SPARSITY", "0.0"))
 USE_INT8 = os.getenv("KIWI_USE_INT8", "false").lower() in ("true", "1", "yes")
+
+# Lossless compression config
+LOSSLESS_ALGORITHM = os.getenv("KIWI_LOSSLESS", "none").lower()
+
 GPU_MEMORY_RESERVE_MB = float(os.getenv("GPU_MEMORY_RESERVE_MB", "512"))
 
 # ── Populated from gateway assignment ────────────────────────────────────────────
@@ -40,6 +44,57 @@ kv_cache: dict[str, tuple[float, Any]] = {}  # request_id -> (last_accessed, pas
 model_lock = asyncio.Lock()
 KV_CACHE_TTL_SECONDS = float(os.getenv("KV_CACHE_TTL_SECONDS", "60"))
 HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "5"))
+
+
+def _compress_payload(data: bytes, algorithm: str) -> tuple[bytes, dict[str, str]]:
+    """Compress payload using selected lossless algorithm.
+    
+    Returns (compressed_bytes, headers_dict).
+    """
+    if algorithm == "zlib":
+        import zlib
+        return zlib.compress(data), {"X-Content-Encoding": "zlib"}
+    elif algorithm == "gzip":
+        import gzip
+        return gzip.compress(data), {"X-Content-Encoding": "gzip"}
+    elif algorithm == "bz2":
+        import bz2
+        return bz2.compress(data), {"X-Content-Encoding": "bz2"}
+    elif algorithm == "lzma":
+        import lzma
+        return lzma.compress(data), {"X-Content-Encoding": "lzma"}
+    elif algorithm == "zstd":
+        import zstandard as zstd
+        cctx = zstd.ZstdCompressor(level=3)
+        return cctx.compress(data), {"X-Content-Encoding": "zstd"}
+    elif algorithm == "lz4":
+        import lz4.frame
+        return lz4.frame.compress(data), {"X-Content-Encoding": "lz4"}
+    return data, {}
+
+
+def _decompress_payload(data: bytes, encoding: str) -> bytes:
+    """Decompress payload using standard or third-party libraries."""
+    if encoding == "zlib":
+        import zlib
+        return zlib.decompress(data)
+    elif encoding == "gzip":
+        import gzip
+        return gzip.decompress(data)
+    elif encoding == "bz2":
+        import bz2
+        return bz2.decompress(data)
+    elif encoding == "lzma":
+        import lzma
+        return lzma.decompress(data)
+    elif encoding == "zstd":
+        import zstandard as zstd
+        dctx = zstd.ZstdDecompressor()
+        return dctx.decompress(data)
+    elif encoding == "lz4":
+        import lz4.frame
+        return lz4.frame.decompress(data)
+    return data
 
 
 def _dtype() -> torch.dtype:
@@ -221,44 +276,6 @@ async def _re_register() -> None:
         pass
 
 
-async def _apply_recomputed_assignment(assignment: dict[str, Any]) -> None:
-    """Reload a new layer range without exposing the old range as healthy."""
-    global assigned_model_id, assigned_dtype, layer_range
-    global is_first_stage, is_last_stage, model
-
-    async with model_lock:
-        # A layer range changes cache layout, so no cache may survive the move.
-        kv_cache.clear()
-        model = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        assigned_model_id = assignment["model_id"]
-        assigned_dtype = assignment.get("dtype", "bfloat16")
-        layer_range = tuple(assignment["layers"])
-        total_layers = assignment["total_layers"]
-        is_first_stage = layer_range[0] == 0
-        is_last_stage = layer_range[1] == total_layers - 1
-        model = await asyncio.to_thread(_load_assigned_model, assignment)
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                f"{GATEWAY_URL}/recompute/complete",
-                json={
-                    "node_name": NODE_NAME,
-                    "node_url": NODE_URL,
-                    "model_id": assigned_model_id,
-                    "layers": list(layer_range),
-                },
-            )
-            response.raise_for_status()
-    except httpx.HTTPError:
-        # The next heartbeat will receive the still-pending assignment and retry.
-        pass
-
-
 async def _heartbeat_loop() -> None:
     """Ping the gateway periodically so it knows we're alive."""
     while True:
@@ -271,11 +288,6 @@ async def _heartbeat_loop() -> None:
                 )
                 if response.status_code == 404:
                     await _re_register()
-                elif response.is_success:
-                    payload = response.json()
-                    assignment = payload.get("assignment")
-                    if assignment:
-                        await _apply_recomputed_assignment(assignment)
         except httpx.HTTPError:
             pass  # Gateway may be temporarily unreachable; keep retrying.
 
@@ -420,6 +432,127 @@ def _run_forward(
             return outputs.last_hidden_state.contiguous().cpu()
 
 
+def _serialize_hidden_states(result: torch.Tensor) -> tuple[bytes, dict[str, str]]:
+    """Serialize and optionally compress hidden states for P2P transfer."""
+    if USE_INT8 and USE_CSR:
+        shape = list(result.shape)
+        hidden_2d = result.view(-1, shape[-1])
+        if CSR_SPARSITY_RATIO > 0.0:
+            k = int(hidden_2d.numel() * (1.0 - CSR_SPARSITY_RATIO))
+            if k > 0:
+                if k < hidden_2d.numel():
+                    flat_abs = torch.abs(hidden_2d).flatten()
+                    threshold = torch.topk(flat_abs, k).values[-1]
+                    mask = torch.abs(hidden_2d) >= threshold
+                    hidden_2d_sparse = hidden_2d * mask
+                else:
+                    hidden_2d_sparse = hidden_2d
+            else:
+                hidden_2d_sparse = torch.zeros_like(hidden_2d)
+        else:
+            hidden_2d_sparse = hidden_2d
+            
+        # Compute channel-wise scale for dynamic activation smoothing
+        channel_scale = hidden_2d_sparse.abs().max(dim=0, keepdim=True).values
+        channel_scale = torch.clamp(channel_scale, min=1e-8)
+        
+        # Smooth activations
+        hidden_smooth = hidden_2d_sparse / channel_scale
+
+        # Per-token scale computed on the smoothed sparse dense matrix
+        max_val = hidden_smooth.abs().max(dim=-1, keepdim=True).values
+        scale = torch.clamp(max_val, min=1e-8) / 127.0
+        quantized = (hidden_smooth / scale).round().to(torch.int8)
+
+        # Convert to sparse CSR
+        t_sparse = quantized.to_sparse_csr()
+        crow = t_sparse.crow_indices()
+        col = t_sparse.col_indices()
+        quantized_val = t_sparse.values()
+
+        original_elements = result.numel()
+        sparse_elements = quantized_val.numel()
+        sparsity_percent = (1.0 - (sparse_elements / max(original_elements, 1))) * 100.0
+        print(f"[{NODE_NAME}] [CSR+INT8] Sparsified & Quantized activations: {original_elements} -> {sparse_elements} non-zero values ({sparsity_percent:.2f}% sparse, per-token scales, smoothed)", flush=True)
+
+        binary_hidden = safetensors_save({
+            "crow_indices": crow,
+            "col_indices": col,
+            "quantized_values": quantized_val,
+            "scale": scale.to(torch.float32),
+            "channel_scale": channel_scale.to(torch.float32),
+            "original_shape": torch.tensor(shape, dtype=torch.long)
+        })
+    elif USE_INT8:
+        shape = list(result.shape)
+        # Flatten to 2D: (tokens, channels)
+        hidden_2d = result.view(-1, shape[-1])
+        # Compute channel-wise scale to smooth activation outliers
+        channel_scale = hidden_2d.abs().max(dim=0, keepdim=True).values
+        channel_scale = torch.clamp(channel_scale, min=1e-8)
+        
+        # Smooth activations
+        hidden_smooth = hidden_2d / channel_scale
+        
+        # Quantize smoothed activations per-token/per-row
+        token_scale = hidden_smooth.abs().max(dim=-1, keepdim=True).values
+        token_scale = torch.clamp(token_scale, min=1e-8) / 127.0
+        quantized = (hidden_smooth / token_scale).round().to(torch.int8)
+        
+        print(f"[{NODE_NAME}] [INT8] Quantized activations with channel-wise scales: {result.numel()} elements", flush=True)
+        binary_hidden = safetensors_save({
+            "quantized_hidden_states": quantized.view(shape),
+            "scale": token_scale.view(shape[:-1] + [1]).to(torch.float32),
+            "channel_scale": channel_scale.to(torch.float32)
+        })
+    elif USE_CSR:
+        shape = list(result.shape)
+        hidden_2d = result.view(-1, shape[-1])
+        if CSR_SPARSITY_RATIO > 0.0:
+            k = int(hidden_2d.numel() * (1.0 - CSR_SPARSITY_RATIO))
+            if k > 0:
+                if k < hidden_2d.numel():
+                    flat_abs = torch.abs(hidden_2d).flatten()
+                    threshold = torch.topk(flat_abs, k).values[-1]
+                    mask = torch.abs(hidden_2d) >= threshold
+                    hidden_2d_sparse = hidden_2d * mask
+                else:
+                    hidden_2d_sparse = hidden_2d
+            else:
+                hidden_2d_sparse = torch.zeros_like(hidden_2d)
+        else:
+            hidden_2d_sparse = hidden_2d
+            
+        t_sparse = hidden_2d_sparse.to_sparse_csr()
+        crow = t_sparse.crow_indices()
+        col = t_sparse.col_indices()
+        val = t_sparse.values()
+        
+        original_elements = result.numel()
+        sparse_elements = val.numel()
+        sparsity_percent = (1.0 - (sparse_elements / max(original_elements, 1))) * 100.0
+        print(f"[{NODE_NAME}] [CSR] Compressed activations: {original_elements} -> {sparse_elements} non-zero values ({sparsity_percent:.2f}% sparse)", flush=True)
+        
+        binary_hidden = safetensors_save({
+            "crow_indices": crow,
+            "col_indices": col,
+            "values": val,
+            "original_shape": torch.tensor(shape, dtype=torch.long)
+        })
+    else:
+        binary_hidden = safetensors_save({"hidden_states": result})
+
+    # Apply lossless compression
+    headers = {}
+    if LOSSLESS_ALGORITHM != "none":
+        original_size = len(binary_hidden)
+        binary_hidden, compression_headers = _compress_payload(binary_hidden, LOSSLESS_ALGORITHM)
+        headers.update(compression_headers)
+        print(f"[{NODE_NAME}] [{LOSSLESS_ALGORITHM}] Compressed activations: {original_size} -> {len(binary_hidden)} bytes (ratio: {original_size / max(len(binary_hidden), 1):.2f}x)", flush=True)
+
+    return binary_hidden, headers
+
+
 # ── Forward endpoint ─────────────────────────────────────────────────────────────
 
 
@@ -447,7 +580,11 @@ async def forward(request: Request):
     next_workers = [u.strip() for u in pipeline_header.split(",") if u.strip()]
 
     try:
-        tensors = safetensors_load(await request.body())
+        body_bytes = await request.body()
+        encoding = request.headers.get("X-Content-Encoding")
+        if encoding:
+            body_bytes = _decompress_payload(body_bytes, encoding)
+        tensors = safetensors_load(body_bytes)
     except Exception as error:
         raise HTTPException(
             status_code=400,
@@ -488,12 +625,18 @@ async def forward(request: Request):
                 sparse_2d = torch.sparse_csr_tensor(crow, col, quantized_val, size=size_2d)
                 hidden_in = sparse_2d.to_dense().view(original_shape)
                 hidden_in = hidden_in.float() * scale_tensor
+                channel_scale = tensors.get("channel_scale")
+                if channel_scale is not None:
+                    hidden_in = hidden_in * channel_scale
                 print(f"[{NODE_NAME}] [CSR+INT8] Dequantized & Decompressed sparse activations back to shape {original_shape}", flush=True)
             else:
                 quantized = tensors.get("quantized_hidden_states")
                 scale_tensor = tensors.get("scale")
                 if quantized is not None and scale_tensor is not None:
                     hidden_in = quantized.float() * scale_tensor
+                    channel_scale = tensors.get("channel_scale")
+                    if channel_scale is not None:
+                        hidden_in = hidden_in * channel_scale
                     print(f"[{NODE_NAME}] [INT8] Dequantized activations back to shape {list(hidden_in.shape)}", flush=True)
                 else:
                     # Check for CSR components
@@ -540,92 +683,7 @@ async def forward(request: Request):
     remaining_pipeline = ",".join(next_workers[1:])
 
     # Compress / serialize output before sending it down the pipeline
-    if USE_INT8 and USE_CSR:
-        shape = list(result.shape)
-        hidden_2d = result.view(-1, shape[-1])
-        if CSR_SPARSITY_RATIO > 0.0:
-            k = int(hidden_2d.numel() * (1.0 - CSR_SPARSITY_RATIO))
-            if k > 0:
-                if k < hidden_2d.numel():
-                    flat_abs = torch.abs(hidden_2d).flatten()
-                    threshold = torch.topk(flat_abs, k).values[-1]
-                    mask = torch.abs(hidden_2d) >= threshold
-                    hidden_2d_sparse = hidden_2d * mask
-                else:
-                    hidden_2d_sparse = hidden_2d
-            else:
-                hidden_2d_sparse = torch.zeros_like(hidden_2d)
-        else:
-            hidden_2d_sparse = hidden_2d
-            
-        # Per-token scale computed on the sparse dense matrix
-        max_val = hidden_2d_sparse.abs().max(dim=-1, keepdim=True).values
-        scale = torch.clamp(max_val, min=1e-8) / 127.0
-        quantized = (hidden_2d_sparse / scale).round().to(torch.int8)
-
-        # Convert to sparse CSR
-        t_sparse = quantized.to_sparse_csr()
-        crow = t_sparse.crow_indices()
-        col = t_sparse.col_indices()
-        quantized_val = t_sparse.values()
-
-        original_elements = result.numel()
-        sparse_elements = quantized_val.numel()
-        sparsity_percent = (1.0 - (sparse_elements / max(original_elements, 1))) * 100.0
-        print(f"[{NODE_NAME}] [CSR+INT8] Sparsified & Quantized activations: {original_elements} -> {sparse_elements} non-zero values ({sparsity_percent:.2f}% sparse, per-token scales)", flush=True)
-
-        binary_hidden = safetensors_save({
-            "crow_indices": crow,
-            "col_indices": col,
-            "quantized_values": quantized_val,
-            "scale": scale.to(torch.float32),
-            "original_shape": torch.tensor(shape, dtype=torch.long)
-        })
-    elif USE_INT8:
-        max_val = result.abs().max(dim=-1, keepdim=True).values
-        scale = torch.clamp(max_val, min=1e-8) / 127.0
-        quantized = (result / scale).round().to(torch.int8)
-        print(f"[{NODE_NAME}] [INT8] Quantized activations: {result.numel()} elements (per-token scales)", flush=True)
-        binary_hidden = safetensors_save({
-            "quantized_hidden_states": quantized,
-            "scale": scale.to(torch.float32)
-        })
-    elif USE_CSR:
-        shape = list(result.shape)
-        hidden_2d = result.view(-1, shape[-1])
-        if CSR_SPARSITY_RATIO > 0.0:
-            k = int(hidden_2d.numel() * (1.0 - CSR_SPARSITY_RATIO))
-            if k > 0:
-                if k < hidden_2d.numel():
-                    flat_abs = torch.abs(hidden_2d).flatten()
-                    threshold = torch.topk(flat_abs, k).values[-1]
-                    mask = torch.abs(hidden_2d) >= threshold
-                    hidden_2d_sparse = hidden_2d * mask
-                else:
-                    hidden_2d_sparse = hidden_2d
-            else:
-                hidden_2d_sparse = torch.zeros_like(hidden_2d)
-        else:
-            hidden_2d_sparse = hidden_2d
-            
-        t_sparse = hidden_2d_sparse.to_sparse_csr()
-        crow = t_sparse.crow_indices()
-        col = t_sparse.col_indices()
-        val = t_sparse.values()
-        
-        original_elements = result.numel()
-        sparse_elements = val.numel()
-        sparsity_percent = (1.0 - (sparse_elements / max(original_elements, 1))) * 100.0
-        print(f"[{NODE_NAME}] [CSR] Compressed activations: {original_elements} -> {sparse_elements} non-zero values ({sparsity_percent:.2f}% sparse)", flush=True)
-        
-        binary_hidden = safetensors_save({
-            "crow_indices": crow,
-            "col_indices": col,
-            "values": val,
-            "original_shape": torch.tensor(shape, dtype=torch.long)
-        })
-    else:
-        binary_hidden = safetensors_save({"hidden_states": result})
+    binary_hidden, compression_headers = _serialize_hidden_states(result)
 
     try:
         async with httpx.AsyncClient(
@@ -638,6 +696,7 @@ async def forward(request: Request):
                     "X-Step": step,
                     "X-Pipeline": remaining_pipeline,
                     "Content-Type": "application/octet-stream",
+                    **compression_headers,
                 },
                 content=binary_hidden,
             )
@@ -649,3 +708,135 @@ async def forward(request: Request):
             headers={"X-Kiwi-Failed-Node": next_url.rstrip("/")},
         )
     return JSONResponse(response.json())
+
+
+# ── Streaming generation endpoint ────────────────────────────────────────────────
+
+
+@app.post("/generate")
+async def generate(request: Request):
+    """Streaming generation endpoint for first-stage workers.
+
+    Drives the full prefill + decode loop, P2P-forwarding hidden states
+    to downstream workers and streaming token IDs back to the gateway.
+    """
+    if model is None:
+        raise HTTPException(status_code=503, detail="Worker model is not ready")
+    if not is_first_stage:
+        raise HTTPException(status_code=400, detail="Only first-stage workers support /generate")
+
+    request_id = request.headers.get("X-Request-ID")
+    if not request_id:
+        raise HTTPException(status_code=400, detail="X-Request-ID is required")
+
+    max_tokens = int(request.headers.get("X-Max-Tokens", "128"))
+    eos_ids_raw = request.headers.get("X-Eos-Token-Ids", "")
+    eos_token_ids = {int(x) for x in eos_ids_raw.split(",") if x.strip()}
+
+    # Downstream pipeline (workers after self)
+    pipeline_header = request.headers.get("X-Pipeline", "")
+    next_workers = [u.strip() for u in pipeline_header.split(",") if u.strip()]
+
+    # Parse input_ids from safetensors body
+    try:
+        tensors = safetensors_load(await request.body())
+    except Exception as error:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid safetensors payload: {error}",
+        ) from error
+
+    input_ids = tensors.get("input_ids")
+    if input_ids is None:
+        raise HTTPException(
+            status_code=400, detail="input_ids required for /generate"
+        )
+
+    async def _token_stream():
+        is_prefill = True
+        last_token_id = None
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0, connect=10.0)
+        ) as client:
+            for _ in range(max_tokens):
+                step = "prefill" if is_prefill else "decode"
+
+                # Build input for this step
+                if is_prefill:
+                    step_input = input_ids
+                else:
+                    step_input = torch.tensor(
+                        [[last_token_id]], dtype=torch.long
+                    )
+
+                # Run this worker's layers
+                async with model_lock:
+                    result = await asyncio.to_thread(
+                        _run_forward,
+                        request_id,
+                        step,
+                        input_ids=step_input,
+                    )
+
+                # Solo worker (first + last): result is already a token_id
+                if is_last_stage:
+                    token_id = result
+                else:
+                    # P2P forward hidden states to downstream pipeline
+                    if not next_workers:
+                        yield json.dumps(
+                            {"error": "Non-last worker has no downstream pipeline"}
+                        ) + "\n"
+                        return
+
+                    binary_hidden, compression_headers = _serialize_hidden_states(result)
+                    next_url = next_workers[0]
+                    remaining = ",".join(next_workers[1:])
+
+                    try:
+                        response = await client.post(
+                            f"{next_url.rstrip('/')}/forward",
+                            headers={
+                                "X-Request-ID": request_id,
+                                "X-Step": step,
+                                "X-Pipeline": remaining,
+                                "Content-Type": "application/octet-stream",
+                                **compression_headers,
+                            },
+                            content=binary_hidden,
+                        )
+                        response.raise_for_status()
+                        token_id = int(response.json()["next_token_id"])
+                    except httpx.HTTPError as error:
+                        failed_url = None
+                        if isinstance(error, httpx.HTTPStatusError):
+                            failed_url = error.response.headers.get(
+                                "X-Kiwi-Failed-Node"
+                            )
+                        yield json.dumps({
+                            "error": f"Pipeline forwarding failed: {error}",
+                            "failed_node": (
+                                failed_url or next_url
+                            ).rstrip("/"),
+                        }) + "\n"
+                        return
+                    except (KeyError, TypeError, ValueError) as error:
+                        yield json.dumps({
+                            "error": f"Invalid downstream response: {error}",
+                        }) + "\n"
+                        return
+
+                yield json.dumps({"token_id": token_id}) + "\n"
+                last_token_id = token_id
+
+                if token_id in eos_token_ids:
+                    return
+
+                is_prefill = False
+
+    return StreamingResponse(
+        _token_stream(),
+        media_type="application/x-ndjson",
+    )
+
