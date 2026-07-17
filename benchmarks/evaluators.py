@@ -27,6 +27,8 @@ class PerformanceEvaluator(Evaluator):
         return {
             "baseline_latency_sec": baseline_result.get("latency_sec", 0),
             "test_latency_sec": test_result.get("latency_sec", 0),
+            "baseline_ttft_sec": baseline_result.get("ttft_sec", 0),
+            "test_ttft_sec": test_result.get("ttft_sec", 0),
             "baseline_tokens_per_sec": b_tps,
             "test_tokens_per_sec": t_tps,
             "speedup_x": speedup

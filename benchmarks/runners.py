@@ -18,40 +18,51 @@ class OpenAIRunner(BaseRunner):
         
     def generate(self, model_id: str, messages: List[Dict[str, str]], max_tokens: int = 128, temperature: float = 0.0) -> Dict[str, Any]:
         url = f"{self.base_url}/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {self.api_key}"}
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         payload = {
             "model": model_id,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "stream": False
+            "stream": True
         }
         
+        import json
         start_time = time.time()
+        ttft = None
+        token_count = 0
+        text_pieces = []
+        
         with httpx.Client(timeout=120.0) as client:
-            response = client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            
-            end_time = time.time()
-            latency = end_time - start_time
-            
-            text = ""
-            if "choices" in data and len(data["choices"]) > 0:
-                if "message" in data["choices"][0]:
-                    text = data["choices"][0]["message"].get("content", "")
-                elif "delta" in data["choices"][0]:
-                    text = data["choices"][0]["delta"].get("content", "")
-            
-            # Simple heuristic: ~4 characters per token
-            tokens = len(text) / 4.0
-            
-            return {
-                "text": text,
-                "latency_sec": latency,
-                "tokens_generated": tokens,
-                "tokens_per_sec": tokens / latency if latency > 0 else 0
-            }
+            with client.stream("POST", url, headers=headers, json=payload) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    line = line.strip()
+                    if not line or line == "data: [DONE]":
+                        continue
+                    if line.startswith("data: "):
+                        try:
+                            data = json.loads(line[6:])
+                            content = data["choices"][0]["delta"].get("content", "")
+                            if content:
+                                if ttft is None:
+                                    ttft = time.time() - start_time
+                                token_count += 1
+                                text_pieces.append(content)
+                        except Exception:
+                            pass
+                            
+        end_time = time.time()
+        latency = end_time - start_time
+        text = "".join(text_pieces)
+        
+        return {
+            "text": text,
+            "latency_sec": latency,
+            "ttft_sec": ttft if ttft is not None else latency,
+            "tokens_generated": token_count,
+            "tokens_per_sec": token_count / latency if latency > 0 else 0
+        }
 
 class TransformersRunner(BaseRunner):
     """
@@ -94,25 +105,44 @@ class TransformersRunner(BaseRunner):
             
         inputs = tokenizer(text, return_tensors="pt").to(model.device)
         
+        from transformers import TextIteratorStreamer
+        from threading import Thread
+        
+        streamer = TextIteratorStreamer(tokenizer, skip_special_tokens=True, skip_prompt=True)
+        generation_kwargs = dict(
+            **inputs,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            do_sample=(temperature > 0.0),
+            pad_token_id=tokenizer.eos_token_id,
+            streamer=streamer
+        )
+        
+        ttft = None
+        token_count = 0
+        text_pieces = []
+        
         start_time = time.time()
-        with torch.inference_mode():
-            outputs = model.generate(
-                **inputs, 
-                max_new_tokens=max_tokens, 
-                temperature=temperature,
-                do_sample=(temperature > 0.0),
-                pad_token_id=tokenizer.eos_token_id
-            )
+        thread = Thread(target=model.generate, kwargs=generation_kwargs)
+        thread.start()
+        
+        for new_text in streamer:
+            if new_text:
+                if ttft is None:
+                    ttft = time.time() - start_time
+                token_count += 1
+                text_pieces.append(new_text)
+                
+        thread.join()
         end_time = time.time()
         latency = end_time - start_time
             
-        generated_ids = outputs[0][inputs.input_ids.shape[-1]:]
-        generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        tokens_generated = len(generated_ids)
+        generated_text = "".join(text_pieces)
         
         return {
             "text": generated_text,
             "latency_sec": latency,
-            "tokens_generated": tokens_generated,
-            "tokens_per_sec": tokens_generated / latency if latency > 0 else 0
+            "ttft_sec": ttft if ttft is not None else latency,
+            "tokens_generated": token_count,
+            "tokens_per_sec": token_count / latency if latency > 0 else 0
         }

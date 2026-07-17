@@ -189,6 +189,10 @@ def run_orchestration(scenarios: List[Scenario], dataset: str = "dummy", limit: 
         
         logging.info("Tearing down cluster...")
         subprocess.run(["docker-compose", "-f", compose_path, "-p", "kiwibench", "down", "-v", "--remove-orphans"], check=True)
+        
+        if os.path.exists(compose_path):
+            os.remove(compose_path)
+            
         logging.info(f"Scenario {scenario.name} complete.\n")
 
 if __name__ == "__main__":
