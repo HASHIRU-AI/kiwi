@@ -1053,4 +1053,3 @@ async def generate(request: Request):
         _token_stream(),
         media_type="application/x-ndjson",
     )
-

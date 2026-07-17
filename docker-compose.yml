@@ -32,6 +32,8 @@ services:
     container_name: kiwi-worker_1-1
     init: true
     command: uvicorn worker:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
     environment:
       NODE_NAME: worker_1
       NODE_URL: http://worker_1:8000
@@ -54,7 +56,6 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [ gpu ]
-
 
   worker_2:
     image: kiwi-worker:latest
@@ -84,7 +85,6 @@ services:
               count: 1
               capabilities: [ gpu ]
 
-
   worker_3:
     image: kiwi-worker:latest
     container_name: kiwi-worker_3-1
@@ -113,7 +113,6 @@ services:
               count: 1
               capabilities: [ gpu ]
 
-
   worker_4:
     image: kiwi-worker:latest
     container_name: kiwi-worker_4-1
@@ -141,7 +140,6 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [ gpu ]
-
 
 volumes:
   hf_cache:

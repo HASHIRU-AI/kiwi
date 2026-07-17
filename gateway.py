@@ -320,6 +320,8 @@ class WorkerRegistry:
                         "layers": list(w.layers),
                         "healthy": w.healthy,
                         "last_seen": round(time.time() - w.last_seen, 1),
+                        "cpu_cores": w.cpu_cores,
+                        "vram_gb": w.vram_gb,
                     }
                 )
             return result

@@ -1,0 +1,11 @@
+.git
+.gitignore
+.agents
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.vscode
+.idea
+*.log
