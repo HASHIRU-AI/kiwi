@@ -36,8 +36,8 @@ services:
       - "8000:8000"
     environment:
       NODE_NAME: worker_1
-      NODE_URL: https://1a11-108-68-107-178.ngrok-free.app
-      GATEWAY_URL: https://214a-108-68-107-178.ngrok-free.app
+      NODE_URL: http://worker_1:8000
+      GATEWAY_URL: http://gateway:8080
       KIWI_USE_CSR: "false"
       KIWI_USE_INT8: "true"
       KIWI_CSR_SPARSITY: "0.40"
