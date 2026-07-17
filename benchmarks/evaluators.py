@@ -16,6 +16,22 @@ class ExactMatchEvaluator(Evaluator):
             "test_len": len(test_response)
         }
 
+class PerformanceEvaluator(Evaluator):
+    """Compares latency and tokens/sec between baseline and test to show speedup and implied bandwidth saving."""
+    def evaluate(self, prompt: str, baseline_result: Dict[str, Any], test_result: Dict[str, Any]) -> Dict[str, Any]:
+        b_tps = baseline_result.get("tokens_per_sec", 0)
+        t_tps = test_result.get("tokens_per_sec", 0)
+        
+        speedup = (t_tps / b_tps) if b_tps > 0 else 0
+        
+        return {
+            "baseline_latency_sec": baseline_result.get("latency_sec", 0),
+            "test_latency_sec": test_result.get("latency_sec", 0),
+            "baseline_tokens_per_sec": b_tps,
+            "test_tokens_per_sec": t_tps,
+            "speedup_x": speedup
+        }
+
 class SemanticSimilarityEvaluator(Evaluator):
     """Uses a sentence transformer model to compute the cosine similarity between the two responses."""
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
@@ -58,7 +74,8 @@ class LLMJudgeEvaluator(Evaluator):
         ]
         
         try:
-            judge_output = self.runner.generate(self.judge_model_id, messages, max_tokens=256, temperature=0.0)
+            judge_output_dict = self.runner.generate(self.judge_model_id, messages, max_tokens=256, temperature=0.0)
+            judge_output = judge_output_dict["text"]
             
             # Clean up potential markdown formatting in output
             if judge_output.startswith("```json"):

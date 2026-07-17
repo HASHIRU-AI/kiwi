@@ -21,6 +21,11 @@ This tool focuses on quality (performative output) rather than speed. It include
 **How it works:** It uses a strong external LLM (e.g., GPT-4 via OpenAI API) to grade the test response. The judge LLM is provided the original prompt, the baseline response, and the test response. It returns a score from 1 to 10 evaluating how well the test response compares to the baseline, along with reasoning.
 **When to use:** Use this for complex, open-ended conversational evaluations (similar to MT-Bench or AlpacaEval). This catches edge cases where the semantic similarity might be high but the actual generated facts are slightly corrupted or hallucinatory due to severe quantization.
 
+### 4. Performance Evaluator (`PerformanceEvaluator`)
+**What it rates:** Throughput (tokens/sec) and overall generation speedup.
+**How it works:** Tracks the time spent processing the generation request on both the baseline and test systems, then calculates `tokens_generated / latency`. It also outputs a `speedup_x` multiplier. 
+**When to use:** Use this combined with quality metrics to answer "Does the `USE_INT8` and `USE_CSR` bandwidth saving actually translate to a higher token throughput, and at what cost to quality?"
+
 ## Usage
 
 You can use the library programmatically or via the CLI.

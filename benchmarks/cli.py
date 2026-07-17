@@ -14,7 +14,7 @@ def main():
     parser.add_argument("--test-url", type=str, default="http://localhost:8080", help="URL for the Kiwi gateway or test endpoint")
     parser.add_argument("--baseline-url", type=str, default=None, help="URL for the baseline endpoint (if not using local Transformers)")
     parser.add_argument("--use-transformers-baseline", action="store_true", help="Use local Transformers model as baseline")
-    parser.add_argument("--evaluators", type=str, default="exact_match", help="Comma-separated list of evaluators: exact_match,semantic,llm_judge")
+    parser.add_argument("--evaluators", type=str, default="exact_match,performance", help="Comma-separated list of evaluators: exact_match,semantic,llm_judge,performance")
     parser.add_argument("--judge-api-key", type=str, default=os.getenv("OPENAI_API_KEY", ""), help="API Key for LLM Judge")
     parser.add_argument("--output", type=str, default="benchmark_results.json", help="Output JSON file for results")
     
@@ -46,6 +46,9 @@ def main():
         if not args.judge_api_key:
             print("Warning: llm_judge requested but no --judge-api-key or OPENAI_API_KEY provided.")
         evaluators.append(("LLM Judge", LLMJudgeEvaluator(api_key=args.judge_api_key)))
+    if "performance" in eval_names:
+        from .evaluators import PerformanceEvaluator
+        evaluators.append(("Performance", PerformanceEvaluator()))
 
     # Load Dataset
     print(f"Loading dataset '{args.dataset}' (limit: {args.limit})...")
@@ -62,24 +65,31 @@ def main():
         # Generate baseline
         print("  Generating baseline response...")
         try:
-            baseline_response = baseline_runner.generate(args.model, messages)
+            baseline_result = baseline_runner.generate(args.model, messages)
+            baseline_response = baseline_result["text"]
         except Exception as e:
             print(f"  Failed baseline generation: {e}")
+            baseline_result = {}
             baseline_response = ""
 
         # Generate test
         print("  Generating test response...")
         try:
-            test_response = test_runner.generate(args.model, messages)
+            test_result = test_runner.generate(args.model, messages)
+            test_response = test_result["text"]
         except Exception as e:
             print(f"  Failed test generation: {e}")
+            test_result = {}
             test_response = ""
 
         # Evaluate
         eval_metrics = {}
         for name, evaluator in evaluators:
             print(f"  Running evaluator: {name}...")
-            metrics = evaluator.evaluate(prompt, baseline_response, test_response)
+            if name == "Performance":
+                metrics = evaluator.evaluate(prompt, baseline_result, test_result)
+            else:
+                metrics = evaluator.evaluate(prompt, baseline_response, test_response)
             eval_metrics.update(metrics)
 
         result_item = {

@@ -1,6 +1,6 @@
 from .runners import OpenAIRunner, TransformersRunner
 from .datasets import get_dataset
-from .evaluators import ExactMatchEvaluator, SemanticSimilarityEvaluator, LLMJudgeEvaluator
+from .evaluators import ExactMatchEvaluator, SemanticSimilarityEvaluator, LLMJudgeEvaluator, PerformanceEvaluator
 
 __all__ = [
     "OpenAIRunner",
@@ -8,5 +8,6 @@ __all__ = [
     "get_dataset",
     "ExactMatchEvaluator",
     "SemanticSimilarityEvaluator",
-    "LLMJudgeEvaluator"
+    "LLMJudgeEvaluator",
+    "PerformanceEvaluator"
 ]

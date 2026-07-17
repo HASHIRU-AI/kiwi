@@ -1,10 +1,10 @@
 import httpx
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import time
 
 class BaseRunner:
     """Base class for executing inference requests."""
-    def generate(self, model_id: str, messages: List[Dict[str, str]], max_tokens: int = 128, temperature: float = 0.0) -> str:
+    def generate(self, model_id: str, messages: List[Dict[str, str]], max_tokens: int = 128, temperature: float = 0.0) -> Dict[str, Any]:
         raise NotImplementedError
 
 class OpenAIRunner(BaseRunner):
@@ -16,7 +16,7 @@ class OpenAIRunner(BaseRunner):
         self.base_url = base_url.rstrip('/')
         self.api_key = api_key
         
-    def generate(self, model_id: str, messages: List[Dict[str, str]], max_tokens: int = 128, temperature: float = 0.0) -> str:
+    def generate(self, model_id: str, messages: List[Dict[str, str]], max_tokens: int = 128, temperature: float = 0.0) -> Dict[str, Any]:
         url = f"{self.base_url}/v1/chat/completions"
         headers = {"Authorization": f"Bearer {self.api_key}"}
         payload = {
@@ -27,16 +27,31 @@ class OpenAIRunner(BaseRunner):
             "stream": False
         }
         
+        start_time = time.time()
         with httpx.Client(timeout=120.0) as client:
             response = client.post(url, headers=headers, json=payload)
             response.raise_for_status()
             data = response.json()
+            
+            end_time = time.time()
+            latency = end_time - start_time
+            
+            text = ""
             if "choices" in data and len(data["choices"]) > 0:
                 if "message" in data["choices"][0]:
-                    return data["choices"][0]["message"].get("content", "")
+                    text = data["choices"][0]["message"].get("content", "")
                 elif "delta" in data["choices"][0]:
-                    return data["choices"][0]["delta"].get("content", "")
-            return ""
+                    text = data["choices"][0]["delta"].get("content", "")
+            
+            # Simple heuristic: ~4 characters per token
+            tokens = len(text) / 4.0
+            
+            return {
+                "text": text,
+                "latency_sec": latency,
+                "tokens_generated": tokens,
+                "tokens_per_sec": tokens / latency if latency > 0 else 0
+            }
 
 class TransformersRunner(BaseRunner):
     """
@@ -61,15 +76,17 @@ class TransformersRunner(BaseRunner):
             )
             self._models[model_id].eval()
             
-    def generate(self, model_id: str, messages: List[Dict[str, str]], max_tokens: int = 128, temperature: float = 0.0) -> str:
+    def generate(self, model_id: str, messages: List[Dict[str, str]], max_tokens: int = 128, temperature: float = 0.0) -> Dict[str, Any]:
         self._load(model_id)
         import torch
+        import time
         tokenizer = self._tokenizers[model_id]
         model = self._models[model_id]
         
         text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = tokenizer(text, return_tensors="pt").to(model.device)
         
+        start_time = time.time()
         with torch.inference_mode():
             outputs = model.generate(
                 **inputs, 
@@ -78,6 +95,16 @@ class TransformersRunner(BaseRunner):
                 do_sample=(temperature > 0.0),
                 pad_token_id=tokenizer.eos_token_id
             )
+        end_time = time.time()
+        latency = end_time - start_time
             
         generated_ids = outputs[0][inputs.input_ids.shape[-1]:]
-        return tokenizer.decode(generated_ids, skip_special_tokens=True)
+        generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        tokens_generated = len(generated_ids)
+        
+        return {
+            "text": generated_text,
+            "latency_sec": latency,
+            "tokens_generated": tokens_generated,
+            "tokens_per_sec": tokens_generated / latency if latency > 0 else 0
+        }
