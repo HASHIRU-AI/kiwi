@@ -219,6 +219,27 @@ KV_CACHE_TTL_SECONDS = float(os.getenv("KV_CACHE_TTL_SECONDS", "60"))
 HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "5"))
 
 
+_zstd_compressor: Any = None
+_zstd_decompressor: Any = None
+
+
+def _get_zstd_compressor() -> Any:
+    global _zstd_compressor
+    if _zstd_compressor is None:
+        import zstandard as zstd
+        level = int(os.getenv("KIWI_ZSTD_LEVEL", "1"))
+        _zstd_compressor = zstd.ZstdCompressor(level=level)
+    return _zstd_compressor
+
+
+def _get_zstd_decompressor() -> Any:
+    global _zstd_decompressor
+    if _zstd_decompressor is None:
+        import zstandard as zstd
+        _zstd_decompressor = zstd.ZstdDecompressor()
+    return _zstd_decompressor
+
+
 def _compress_payload(data: bytes, algorithm: str) -> tuple[bytes, dict[str, str]]:
     """Compress payload using selected lossless algorithm.
     
@@ -237,8 +258,7 @@ def _compress_payload(data: bytes, algorithm: str) -> tuple[bytes, dict[str, str
         import lzma
         return lzma.compress(data), {"X-Content-Encoding": "lzma"}
     elif algorithm == "zstd":
-        import zstandard as zstd
-        cctx = zstd.ZstdCompressor(level=3)
+        cctx = _get_zstd_compressor()
         return cctx.compress(data), {"X-Content-Encoding": "zstd"}
     elif algorithm == "lz4":
         import lz4.frame
@@ -261,8 +281,7 @@ def _decompress_payload(data: bytes, encoding: str) -> bytes:
         import lzma
         return lzma.decompress(data)
     elif encoding == "zstd":
-        import zstandard as zstd
-        dctx = zstd.ZstdDecompressor()
+        dctx = _get_zstd_decompressor()
         return dctx.decompress(data)
     elif encoding == "lz4":
         import lz4.frame
