@@ -1,0 +1,32 @@
+scenarios:
+  - name: "2-node-baseline"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    use_int8: false
+    use_csr: false
+    workers: [1.0, 1.0]
+
+  - name: "2-node-optimized"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    use_int8: true
+    use_csr: true
+    csr_sparsity: 0.4
+    workers: [1.0, 1.0]
+
+  - name: "2-node-high-latency"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    use_int8: false
+    use_csr: false
+    network:
+      latency_ms: 100
+      bandwidth_mbit: 100
+    workers: [1.0, 1.0]
+
+  - name: "2-node-optimized-high-latency"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    use_int8: true
+    use_csr: true
+    csr_sparsity: 0.4
+    network:
+      latency_ms: 100
+      bandwidth_mbit: 100
+    workers: [1.0, 1.0]
