@@ -46,6 +46,13 @@ services:
     depends_on:
       gateway:
         condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
 
 
   worker_2:
@@ -67,6 +74,13 @@ services:
     depends_on:
       gateway:
         condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
 
 
   worker_3:
@@ -88,6 +102,13 @@ services:
     depends_on:
       gateway:
         condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
 
 
   worker_4:
@@ -109,6 +130,13 @@ services:
     depends_on:
       gateway:
         condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
 
 
 volumes:
