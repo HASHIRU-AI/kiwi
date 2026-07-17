@@ -26,6 +26,178 @@ CSR_SPARSITY_RATIO = float(os.getenv("KIWI_CSR_SPARSITY", "0.0"))
 USE_INT8 = os.getenv("KIWI_USE_INT8", "false").lower() in ("true", "1", "yes")
 GPU_MEMORY_RESERVE_MB = float(os.getenv("GPU_MEMORY_RESERVE_MB", "512"))
 
+from transformers.cache_utils import Cache
+
+# ── PagedAttention Cache Management ──────────────────────────────────────────────
+
+class PagedCacheManager:
+    """Manages a pre-allocated pool of physical KV Cache blocks to prevent memory fragmentation."""
+    def __init__(self, num_blocks: int, block_size: int, num_layers: int, num_heads: int, head_dim: int, device: str, dtype: torch.dtype):
+        self.num_blocks = num_blocks
+        self.block_size = block_size
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.device = device
+        self.dtype = dtype
+
+        # Allocate global key & value pools
+        # Shape: [num_layers, num_blocks, num_heads, block_size, head_dim]
+        self.k_pool = torch.zeros(
+            (num_layers, num_blocks, num_heads, block_size, head_dim),
+            device=device,
+            dtype=dtype
+        )
+        self.v_pool = torch.zeros(
+            (num_layers, num_blocks, num_heads, block_size, head_dim),
+            device=device,
+            dtype=dtype
+        )
+        self.free_blocks = list(range(num_blocks))
+        self.request_blocks: dict[str, list[int]] = {}
+
+    def allocate_blocks_for_request(self, request_id: str, num_tokens: int) -> list[int]:
+        num_required_blocks = (num_tokens + self.block_size - 1) // self.block_size
+        if request_id not in self.request_blocks:
+            self.request_blocks[request_id] = []
+        current_blocks = self.request_blocks[request_id]
+        blocks_needed = num_required_blocks - len(current_blocks)
+        if blocks_needed > 0:
+            if len(self.free_blocks) < blocks_needed:
+                raise RuntimeError("Out of KV Cache Memory (no free blocks left in PagedAttention pool)")
+            new_blocks = [self.free_blocks.pop(0) for _ in range(blocks_needed)]
+            current_blocks.extend(new_blocks)
+        return current_blocks
+
+    def free_blocks_for_request(self, request_id: str):
+        if request_id in self.request_blocks:
+            self.free_blocks.extend(self.request_blocks[request_id])
+            del self.request_blocks[request_id]
+
+class PagedCache(Cache):
+    """Subclass of transformers Cache that maps logical KV coordinates to physical block pool slots."""
+    def __init__(self, request_id: str, cache_manager: PagedCacheManager):
+        super().__init__()
+        self.request_id = request_id
+        self.cache_manager = cache_manager
+        self.logical_to_physical: list[int] = []
+        self._seen_tokens = 0
+        self.layers_seen = 0
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        return self._seen_tokens
+
+    def get_max_cache_shape(self) -> None:
+        return None
+
+    def __len__(self):
+        return self.layers_seen
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        incoming_len = key_states.shape[-2]
+        if layer_idx == 0:
+            start_pos = self._seen_tokens
+            self.logical_to_physical = self.cache_manager.allocate_blocks_for_request(
+                self.request_id, start_pos + incoming_len
+            )
+            self._seen_tokens += incoming_len
+        else:
+            start_pos = self._seen_tokens - incoming_len
+
+        if layer_idx >= self.layers_seen:
+            self.layers_seen = layer_idx + 1
+
+        # Write to global physical pool
+        for i in range(incoming_len):
+            pos = start_pos + i
+            logical_idx = pos // self.cache_manager.block_size
+            offset = pos % self.cache_manager.block_size
+            p_block_id = self.logical_to_physical[logical_idx]
+
+            self.cache_manager.k_pool[layer_idx, p_block_id, :, offset, :] = key_states[0, :, i, :]
+            self.cache_manager.v_pool[layer_idx, p_block_id, :, offset, :] = value_states[0, :, i, :]
+
+        # Reconstruct contiguous tensor slice up to current seq length
+        total_seq_len = start_pos + incoming_len
+        out_k = torch.empty(
+            (1, self.cache_manager.num_heads, total_seq_len, self.cache_manager.head_dim),
+            device=key_states.device,
+            dtype=key_states.dtype
+        )
+        out_v = torch.empty(
+            (1, self.cache_manager.num_heads, total_seq_len, self.cache_manager.head_dim),
+            device=value_states.device,
+            dtype=value_states.dtype
+        )
+
+        for logical_idx, p_block_id in enumerate(self.logical_to_physical):
+            start_idx = logical_idx * self.cache_manager.block_size
+            end_idx = min(start_idx + self.cache_manager.block_size, total_seq_len)
+            chunk_size = end_idx - start_idx
+
+            out_k[0, :, start_idx:end_idx, :] = self.cache_manager.k_pool[
+                layer_idx, p_block_id, :, :chunk_size, :
+            ]
+            out_v[0, :, start_idx:end_idx, :] = self.cache_manager.v_pool[
+                layer_idx, p_block_id, :, :chunk_size, :
+            ]
+
+        return out_k, out_v
+
+    def __getitem__(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if layer_idx >= self.layers_seen:
+            raise KeyError(f"Cache only has {self.layers_seen} layers")
+        total_seq_len = self._seen_tokens
+        out_k = torch.empty(
+            (1, self.cache_manager.num_heads, total_seq_len, self.cache_manager.head_dim),
+            device=self.cache_manager.device,
+            dtype=self.cache_manager.dtype
+        )
+        out_v = torch.empty(
+            (1, self.cache_manager.num_heads, total_seq_len, self.cache_manager.head_dim),
+            device=self.cache_manager.device,
+            dtype=self.cache_manager.dtype
+        )
+        for logical_idx, p_block_id in enumerate(self.logical_to_physical):
+            start_idx = logical_idx * self.cache_manager.block_size
+            end_idx = min(start_idx + self.cache_manager.block_size, total_seq_len)
+            chunk_size = end_idx - start_idx
+            out_k[0, :, start_idx:end_idx, :] = self.cache_manager.k_pool[
+                layer_idx, p_block_id, :, :chunk_size, :
+            ]
+            out_v[0, :, start_idx:end_idx, :] = self.cache_manager.v_pool[
+                layer_idx, p_block_id, :, :chunk_size, :
+            ]
+        return out_k, out_v
+
+    def __iter__(self):
+        for layer_idx in range(self.layers_seen):
+            yield self[layer_idx]
+
+    def crop(self, max_length: int):
+        if max_length < 0:
+            max_length = self.get_seq_length() - abs(max_length)
+        if self.get_seq_length() <= max_length:
+            return
+        self._seen_tokens = max_length
+        num_required_blocks = (max_length + self.cache_manager.block_size - 1) // self.cache_manager.block_size
+        while len(self.logical_to_physical) > num_required_blocks:
+            freed_block = self.logical_to_physical.pop()
+            self.cache_manager.free_blocks.append(freed_block)
+
+    def __del__(self):
+        try:
+            self.cache_manager.free_blocks_for_request(self.request_id)
+        except Exception:
+            pass
+
+
 # ── Populated from gateway assignment ────────────────────────────────────────────
 
 assigned_model_id: str | None = None
@@ -35,11 +207,13 @@ is_first_stage: bool = False
 is_last_stage: bool = False
 model: Any | None = None
 inference_device: str = "cpu"
+paged_cache_manager: PagedCacheManager | None = None
 
 kv_cache: dict[str, tuple[float, Any]] = {}  # request_id -> (last_accessed, past_key_values)
 model_lock = asyncio.Lock()
 KV_CACHE_TTL_SECONDS = float(os.getenv("KV_CACHE_TTL_SECONDS", "60"))
 HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "5"))
+
 
 
 def _dtype() -> torch.dtype:
@@ -200,6 +374,32 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
             f"[{NODE_NAME}] {model_id} layers {first_layer}-{last_layer} "
             f"({position}) on {device_label}"
         )
+
+    # ── PagedAttention Initialization ──
+    global paged_cache_manager
+    config = loaded_model.config
+    num_heads = getattr(config, "num_key_value_heads", getattr(config, "num_attention_heads", 8))
+    head_dim = getattr(config, "hidden_size", 1024) // getattr(config, "num_attention_heads", 32)
+    
+    paged_cache_manager = PagedCacheManager(
+        num_blocks=int(os.getenv("KIWI_NUM_BLOCKS", "2048")),
+        block_size=int(os.getenv("KIWI_BLOCK_SIZE", "16")),
+        num_layers=num_assigned,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        device=inference_device,
+        dtype=_dtype()
+    )
+    print(
+        f"[{NODE_NAME}] Initialized PagedAttention Cache Manager: "
+        f"num_blocks={paged_cache_manager.num_blocks}, "
+        f"block_size={paged_cache_manager.block_size}, "
+        f"num_layers={num_assigned}, "
+        f"num_heads={num_heads}, "
+        f"head_dim={head_dim}, "
+        f"device={inference_device}"
+    )
+
     return loaded_model
 
 
@@ -244,7 +444,12 @@ async def _cache_eviction_loop() -> None:
         cutoff = time.time() - KV_CACHE_TTL_SECONDS
         stale = [k for k, (ts, _) in kv_cache.items() if ts < cutoff]
         for k in stale:
-            del kv_cache[k]
+            _, old_cache = kv_cache.pop(k, (None, None))
+            if old_cache is not None and hasattr(old_cache, "request_id"):
+                try:
+                    paged_cache_manager.free_blocks_for_request(old_cache.request_id)
+                except Exception:
+                    pass
 
 
 async def _deregister() -> None:
@@ -328,12 +533,22 @@ def _to_device(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to(inference_device)
 
 
-def _cache_for(request_id: str, step: str) -> Any | None:
+def _cache_for(request_id: str, step: str) -> Any:
     if step == "prefill":
-        kv_cache.pop(request_id, None)
-        return None
+        # Free old request cache if it exists to reclaim blocks
+        if request_id in kv_cache:
+            _, old_cache = kv_cache.pop(request_id)
+            if hasattr(old_cache, "request_id"):
+                try:
+                    paged_cache_manager.free_blocks_for_request(old_cache.request_id)
+                except Exception:
+                    pass
+        return PagedCache(request_id, paged_cache_manager)
+
     entry = kv_cache.get(request_id)
-    return entry[1] if entry else None
+    if entry:
+        return entry[1]
+    raise RuntimeError(f"Cache not found for request {request_id} in decode step")
 
 
 def _run_forward(
