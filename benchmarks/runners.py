@@ -56,10 +56,14 @@ class OpenAIRunner(BaseRunner):
         latency = end_time - start_time
         text = "".join(text_pieces)
         
+        ttft_val = ttft if ttft is not None else latency
+        tpot_val = (latency - ttft_val) / (token_count - 1) if token_count > 1 else 0
+        
         return {
             "text": text,
             "latency_sec": latency,
-            "ttft_sec": ttft if ttft is not None else latency,
+            "ttft_sec": ttft_val,
+            "tpot_sec": tpot_val,
             "tokens_generated": token_count,
             "tokens_per_sec": token_count / latency if latency > 0 else 0
         }
@@ -139,10 +143,14 @@ class TransformersRunner(BaseRunner):
             
         generated_text = "".join(text_pieces)
         
+        ttft_val = ttft if ttft is not None else latency
+        tpot_val = (latency - ttft_val) / (token_count - 1) if token_count > 1 else 0
+        
         return {
             "text": generated_text,
             "latency_sec": latency,
-            "ttft_sec": ttft if ttft is not None else latency,
+            "ttft_sec": ttft_val,
+            "tpot_sec": tpot_val,
             "tokens_generated": token_count,
             "tokens_per_sec": token_count / latency if latency > 0 else 0
         }
