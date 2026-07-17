@@ -100,28 +100,31 @@ Verify that the input and output tensors are correctly routed during forward req
 
 ---
 
-## 6. Automated Unit & Integration Tests
+## 6. Benchmarking Throughput and Latency
 
-The project includes an automated test suite `test_e2e.py` validating the core routing and registry classes.
+To measure performance metrics (tokens/second, TTFT), the project includes a `benchmark.py` script.
 
-### 6.1 Running the Suite
-You can execute it locally on your machine using Python:
+### 6.1 Running the Benchmark
+You can execute the benchmark locally:
 ```bash
-python test_e2e.py
+python benchmark.py
 ```
 
-### 6.2 Coverage Areas
-The automated suite tests 10 critical scenarios without launching full docker containers:
-1. **ModelRegistry basics**: Aliases and default model resolution.
-2. **User scenario**: Verification of worst-coverage model mapping.
-3. **Gap filling**: Contiguous segment mapping on partial coverage.
-4. **Pipeline selection**: Building sequential stages and choosing solo nodes.
-5. **Pipeline gap error**: Failures when gaps exist.
-6. **Closest-to-ready priority**: Model registry allocation ordering.
-7. **Re-registration**: Overwriting existing node states dynamically.
-8. **Eviction**: Removing nodes and recalculating registry metrics.
-9. **Redundancy all layers**: Making sure solo nodes are assigned during redundancy.
-10. **Model readiness**: Testing readiness and redundancy counters.
+This will run a warmup request followed by 3 iterations of generating 128 tokens, printing the time taken, TTFT, and tokens/second for each iteration, and outputting an overall summary:
+
+```text
+Warming up...
+Running benchmark (3 iterations)...
+  Iteration 1: 128 tokens in 7.30s (17.54 tok/sec, TTFT: 0.31s)
+  Iteration 2: 128 tokens in 7.61s (16.82 tok/sec, TTFT: 0.15s)
+  Iteration 3: 128 tokens in 8.81s (14.52 tok/sec, TTFT: 0.13s)
+Summary: Avg 16.30 tok/sec, Avg TTFT: 0.20s
+```
+
+### 6.2 Benchmarking Solo vs. Split Pipelines
+You can test the performance of the solo worker vs. the multi-node split pipeline:
+1. **Solo Worker Path**: Run the benchmark while `worker_2` (layers 0-23) is running.
+2. **Split Pipeline Path**: Stop `worker_2` via `docker stop kiwi-worker_2-1` to force the router to select the split pipeline (`worker_1` layers 0-11 → `worker_4` layers 12-23), then run the benchmark again.
 
 ---
 

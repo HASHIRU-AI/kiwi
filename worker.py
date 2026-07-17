@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from contextlib import asynccontextmanager
@@ -11,7 +12,7 @@ from typing import Any
 import httpx
 import torch
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from safetensors.torch import load as safetensors_load
 from safetensors.torch import save as safetensors_save
 from transformers import AutoModelForCausalLM
@@ -431,6 +432,108 @@ def _run_forward(
             return outputs.last_hidden_state.contiguous().cpu()
 
 
+def _serialize_hidden_states(result: torch.Tensor) -> bytes:
+    """Serialize hidden states for P2P transfer with optional CSR/INT8 compression."""
+    if USE_INT8 and USE_CSR:
+        shape = list(result.shape)
+        hidden_2d = result.view(-1, shape[-1])
+        if CSR_SPARSITY_RATIO > 0.0:
+            k = int(hidden_2d.numel() * (1.0 - CSR_SPARSITY_RATIO))
+            if k > 0:
+                if k < hidden_2d.numel():
+                    flat_abs = torch.abs(hidden_2d).flatten()
+                    threshold = torch.topk(flat_abs, k).values[-1]
+                    mask = torch.abs(hidden_2d) >= threshold
+                    hidden_2d_sparse = hidden_2d * mask
+                else:
+                    hidden_2d_sparse = hidden_2d
+            else:
+                hidden_2d_sparse = torch.zeros_like(hidden_2d)
+        else:
+            hidden_2d_sparse = hidden_2d
+
+        max_val = hidden_2d_sparse.abs().max(dim=-1, keepdim=True).values
+        scale = torch.clamp(max_val, min=1e-8) / 127.0
+        quantized = (hidden_2d_sparse / scale).round().to(torch.int8)
+
+        t_sparse = quantized.to_sparse_csr()
+        crow = t_sparse.crow_indices()
+        col = t_sparse.col_indices()
+        quantized_val = t_sparse.values()
+
+        original_elements = result.numel()
+        sparse_elements = quantized_val.numel()
+        sparsity_percent = (1.0 - (sparse_elements / max(original_elements, 1))) * 100.0
+        print(
+            f"[{NODE_NAME}] [CSR+INT8] Sparsified & Quantized activations: "
+            f"{original_elements} -> {sparse_elements} non-zero values "
+            f"({sparsity_percent:.2f}% sparse, per-token scales)",
+            flush=True,
+        )
+
+        return safetensors_save({
+            "crow_indices": crow,
+            "col_indices": col,
+            "quantized_values": quantized_val,
+            "scale": scale.to(torch.float32),
+            "original_shape": torch.tensor(shape, dtype=torch.long),
+        })
+    elif USE_INT8:
+        max_val = result.abs().max(dim=-1, keepdim=True).values
+        scale = torch.clamp(max_val, min=1e-8) / 127.0
+        quantized = (result / scale).round().to(torch.int8)
+        print(
+            f"[{NODE_NAME}] [INT8] Quantized activations: "
+            f"{result.numel()} elements (per-token scales)",
+            flush=True,
+        )
+        return safetensors_save({
+            "quantized_hidden_states": quantized,
+            "scale": scale.to(torch.float32),
+        })
+    elif USE_CSR:
+        shape = list(result.shape)
+        hidden_2d = result.view(-1, shape[-1])
+        if CSR_SPARSITY_RATIO > 0.0:
+            k = int(hidden_2d.numel() * (1.0 - CSR_SPARSITY_RATIO))
+            if k > 0:
+                if k < hidden_2d.numel():
+                    flat_abs = torch.abs(hidden_2d).flatten()
+                    threshold = torch.topk(flat_abs, k).values[-1]
+                    mask = torch.abs(hidden_2d) >= threshold
+                    hidden_2d_sparse = hidden_2d * mask
+                else:
+                    hidden_2d_sparse = hidden_2d
+            else:
+                hidden_2d_sparse = torch.zeros_like(hidden_2d)
+        else:
+            hidden_2d_sparse = hidden_2d
+
+        t_sparse = hidden_2d_sparse.to_sparse_csr()
+        crow = t_sparse.crow_indices()
+        col = t_sparse.col_indices()
+        val = t_sparse.values()
+
+        original_elements = result.numel()
+        sparse_elements = val.numel()
+        sparsity_percent = (1.0 - (sparse_elements / max(original_elements, 1))) * 100.0
+        print(
+            f"[{NODE_NAME}] [CSR] Compressed activations: "
+            f"{original_elements} -> {sparse_elements} non-zero values "
+            f"({sparsity_percent:.2f}% sparse)",
+            flush=True,
+        )
+
+        return safetensors_save({
+            "crow_indices": crow,
+            "col_indices": col,
+            "values": val,
+            "original_shape": torch.tensor(shape, dtype=torch.long),
+        })
+    else:
+        return safetensors_save({"hidden_states": result})
+
+
 # ── Forward endpoint ─────────────────────────────────────────────────────────────
 
 
@@ -699,3 +802,134 @@ async def forward(request: Request):
             headers={"X-Kiwi-Failed-Node": next_url.rstrip("/")},
         )
     return JSONResponse(response.json())
+
+
+# ── Streaming generation endpoint ────────────────────────────────────────────────
+
+
+@app.post("/generate")
+async def generate(request: Request):
+    """Streaming generation endpoint for first-stage workers.
+
+    Drives the full prefill + decode loop, P2P-forwarding hidden states
+    to downstream workers and streaming token IDs back to the gateway.
+    """
+    if model is None:
+        raise HTTPException(status_code=503, detail="Worker model is not ready")
+    if not is_first_stage:
+        raise HTTPException(status_code=400, detail="Only first-stage workers support /generate")
+
+    request_id = request.headers.get("X-Request-ID")
+    if not request_id:
+        raise HTTPException(status_code=400, detail="X-Request-ID is required")
+
+    max_tokens = int(request.headers.get("X-Max-Tokens", "128"))
+    eos_ids_raw = request.headers.get("X-Eos-Token-Ids", "")
+    eos_token_ids = {int(x) for x in eos_ids_raw.split(",") if x.strip()}
+
+    # Downstream pipeline (workers after self)
+    pipeline_header = request.headers.get("X-Pipeline", "")
+    next_workers = [u.strip() for u in pipeline_header.split(",") if u.strip()]
+
+    # Parse input_ids from safetensors body
+    try:
+        tensors = safetensors_load(await request.body())
+    except Exception as error:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid safetensors payload: {error}",
+        ) from error
+
+    input_ids = tensors.get("input_ids")
+    if input_ids is None:
+        raise HTTPException(
+            status_code=400, detail="input_ids required for /generate"
+        )
+
+    async def _token_stream():
+        is_prefill = True
+        last_token_id = None
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0, connect=10.0)
+        ) as client:
+            for _ in range(max_tokens):
+                step = "prefill" if is_prefill else "decode"
+
+                # Build input for this step
+                if is_prefill:
+                    step_input = input_ids
+                else:
+                    step_input = torch.tensor(
+                        [[last_token_id]], dtype=torch.long
+                    )
+
+                # Run this worker's layers
+                async with model_lock:
+                    result = await asyncio.to_thread(
+                        _run_forward,
+                        request_id,
+                        step,
+                        input_ids=step_input,
+                    )
+
+                # Solo worker (first + last): result is already a token_id
+                if is_last_stage:
+                    token_id = result
+                else:
+                    # P2P forward hidden states to downstream pipeline
+                    if not next_workers:
+                        yield json.dumps(
+                            {"error": "Non-last worker has no downstream pipeline"}
+                        ) + "\n"
+                        return
+
+                    binary_hidden = _serialize_hidden_states(result)
+                    next_url = next_workers[0]
+                    remaining = ",".join(next_workers[1:])
+
+                    try:
+                        response = await client.post(
+                            f"{next_url.rstrip('/')}/forward",
+                            headers={
+                                "X-Request-ID": request_id,
+                                "X-Step": step,
+                                "X-Pipeline": remaining,
+                                "Content-Type": "application/octet-stream",
+                            },
+                            content=binary_hidden,
+                        )
+                        response.raise_for_status()
+                        token_id = int(response.json()["next_token_id"])
+                    except httpx.HTTPError as error:
+                        failed_url = None
+                        if isinstance(error, httpx.HTTPStatusError):
+                            failed_url = error.response.headers.get(
+                                "X-Kiwi-Failed-Node"
+                            )
+                        yield json.dumps({
+                            "error": f"Pipeline forwarding failed: {error}",
+                            "failed_node": (
+                                failed_url or next_url
+                            ).rstrip("/"),
+                        }) + "\n"
+                        return
+                    except (KeyError, TypeError, ValueError) as error:
+                        yield json.dumps({
+                            "error": f"Invalid downstream response: {error}",
+                        }) + "\n"
+                        return
+
+                yield json.dumps({"token_id": token_id}) + "\n"
+                last_token_id = token_id
+
+                if token_id in eos_token_ids:
+                    return
+
+                is_prefill = False
+
+    return StreamingResponse(
+        _token_stream(),
+        media_type="application/x-ndjson",
+    )
+
