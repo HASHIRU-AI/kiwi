@@ -425,6 +425,7 @@ async def lifespan(_: FastAPI):
         transport_type=P2P_TRANSPORT,
         initial_peers=[],  # Gateway acts as the swarm bootstrap/relay point
         listen_port=P2P_PORT,
+        relay_mode=True,
     )
     await transport.start()
     if hasattr(transport, "get_peer_id") and transport.get_peer_id():
