@@ -9,7 +9,7 @@ import random
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator, Literal
 
@@ -80,6 +80,7 @@ class Worker:
     vram_gb: float
     peer_id: str = ""
     p2p_port: int = 4001
+    visible_maddrs: list[str] = field(default_factory=list)
     healthy: bool = True
     registered_at: float = 0.0
     last_seen: float = 0.0
@@ -243,12 +244,12 @@ class WorkerRegistry:
             existing = self._workers.get(registration.node_name)
             
             if existing:
-                # Node is still in memory (soft restart / IP change)
                 existing.node_url = registration.node_url
                 existing.peer_id = registration.peer_id or ""
                 existing.p2p_port = registration.p2p_port
                 existing.cpu_cores = registration.cpu_cores
                 existing.vram_gb = registration.vram_gb
+                existing.visible_maddrs = registration.visible_maddrs  # <--- UPDATE THIS
                 existing.healthy = True
                 existing.registered_at = time.time()
                 existing.last_seen = time.time()
@@ -256,7 +257,6 @@ class WorkerRegistry:
                     self._workers[existing.peer_id] = existing
                 return existing
 
-            # Node is brand new or was hard-evicted. 
             if registration.model_id and registration.layers:
                 model_id = registration.model_id
                 layers = (registration.layers[0], registration.layers[-1])
@@ -274,6 +274,7 @@ class WorkerRegistry:
                 vram_gb=registration.vram_gb,
                 peer_id=registration.peer_id or "",
                 p2p_port=registration.p2p_port,
+                visible_maddrs=registration.visible_maddrs,  # <--- PASS THIS
                 registered_at=time.time(),
                 last_seen=time.time(),
             )
@@ -337,6 +338,8 @@ class WorkerRegistry:
                         "node_name": w.node_name,
                         "node_url": w.node_url,
                         "peer_id": w.peer_id,
+                        "p2p_port": w.p2p_port,
+                        "visible_maddrs": w.visible_maddrs,  # <--- EXPOSE IN SNAPSHOT
                         "model_id": w.model_id,
                         "layers": list(w.layers),
                         "healthy": w.healthy,

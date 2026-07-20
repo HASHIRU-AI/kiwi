@@ -440,9 +440,8 @@ async def _register() -> dict[str, Any]:
     visible_maddrs = []
     
     if transport and P2P_TRANSPORT == "p2p" and hasattr(transport, "_p2p"):
-        peer_id = await transport.get_address()
         try:
-            # Let libp2p figure out our real internet addresses
+            peer_id = await transport.get_address()
             maddrs = await transport._p2p.get_visible_maddrs()
             visible_maddrs = [str(m) for m in maddrs]
         except Exception:
@@ -556,12 +555,15 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
 
 async def _re_register() -> None:
     _, vram_gb = _detect_device()
-    
     peer_id = ""
-    if P2P_TRANSPORT == "p2p" and transport is not None:
+    visible_maddrs = []
+    
+    if P2P_TRANSPORT == "p2p" and transport is not None and hasattr(transport, "_p2p"):
         try:
             peer_id = await transport.get_address()
-            # Dynamic re-discovery of new gateway bootstrap peers
+            maddrs = await transport._p2p.get_visible_maddrs()
+            visible_maddrs = [str(m) for m in maddrs]
+            
             new_bootstrap_peers = await _discover_bootstrap_peers()
             for peer in new_bootstrap_peers:
                 try:
@@ -580,6 +582,7 @@ async def _re_register() -> None:
         "vram_gb": vram_gb,
         "model_id": assigned_model_id,
         "layers": list(layer_range) if layer_range else None,
+        "visible_maddrs": visible_maddrs,  # <--- SEND HERE
     }
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
