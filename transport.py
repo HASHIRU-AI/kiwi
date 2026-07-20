@@ -295,8 +295,8 @@ class P2PTransport(KiwiTransport):
                 with suppress(Exception):
                     await writer.wait_closed()
 
-        max_attempts = 5
-        backoff = 0.1
+        max_attempts = 6
+        backoff = 0.5
         for attempt in range(1, max_attempts + 1):
             try:
                 return await asyncio.wait_for(_call(), timeout=timeout)
@@ -305,10 +305,10 @@ class P2PTransport(KiwiTransport):
                     logger.error(f"[P2PTransport] send_forward to {target} failed after {max_attempts} attempts: {e}")
                     raise
                 logger.warning(
-                    f"[P2PTransport] Attempt {attempt} failed forwarding to {target}: {e}. Retrying in {backoff}s..."
+                    f"[P2PTransport] Attempt {attempt} failed forwarding to {target}: {e}. Retrying in {backoff:.1f}s..."
                 )
                 await asyncio.sleep(backoff)
-                backoff *= 2
+                backoff = min(backoff * 1.5, 2.0)
 
     async def send_generate(
         self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 60.0
@@ -327,8 +327,8 @@ class P2PTransport(KiwiTransport):
             + payload
         )
 
-        max_attempts = 5
-        backoff = 0.1
+        max_attempts = 6
+        backoff = 0.5
         reader, writer = None, None
         for attempt in range(1, max_attempts + 1):
             try:
@@ -347,10 +347,10 @@ class P2PTransport(KiwiTransport):
                     logger.error(f"[P2PTransport] send_generate to {target} failed to establish stream after {max_attempts} attempts: {e}")
                     raise
                 logger.warning(
-                    f"[P2PTransport] Attempt {attempt} failed to establish generate stream to {target}: {e}. Retrying in {backoff}s..."
+                    f"[P2PTransport] Attempt {attempt} failed to establish generate stream to {target}: {e}. Retrying in {backoff:.1f}s..."
                 )
                 await asyncio.sleep(backoff)
-                backoff *= 2
+                backoff = min(backoff * 1.5, 2.0)
 
         try:
             while not reader.at_eof():

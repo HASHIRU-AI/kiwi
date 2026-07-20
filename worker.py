@@ -596,7 +596,7 @@ async def _heartbeat_loop() -> None:
                 latency_ms = (time.perf_counter() - start_time) * 1000.0
                 if response.status_code == 404:
                     await _re_register()
-        except httpx.HTTPError:
+        except Exception:
             pass  # Gateway may be temporarily unreachable; keep retrying.
 
 
@@ -647,6 +647,13 @@ async def lifespan(_: FastAPI):
     transport.set_generate_handler(_execute_generate_pipeline)
 
     assignment = await _register()
+    if P2P_TRANSPORT == "p2p" and transport is not None:
+        try:
+            for peer in await _discover_bootstrap_peers():
+                with suppress(Exception):
+                    await transport._p2p.connect_to_peer(peer)
+        except Exception:
+            pass
     assigned_model_id = assignment["model_id"]
     assigned_dtype = assignment.get("dtype", "bfloat16")
     layer_range = tuple(assignment["layers"])

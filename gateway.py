@@ -577,7 +577,30 @@ async def p2p_bootstrap() -> dict[str, object]:
             
         if public_maddr not in visible_maddrs:
             visible_maddrs.append(public_maddr)
-            
+
+    try:
+        snapshot = await registry.snapshot()
+        for w in snapshot:
+            if not w.peer_id or not w.node_url:
+                continue
+            parsed = urlparse(w.node_url)
+            whost = parsed.hostname
+            if not whost:
+                continue
+            try:
+                wip = ipaddress.ip_address(whost)
+                w_maddr = f"/ip6/{whost}/tcp/{w.p2p_port}/p2p/{w.peer_id}" if wip.version == 6 else f"/ip4/{whost}/tcp/{w.p2p_port}/p2p/{w.peer_id}"
+            except ValueError:
+                w_maddr = f"/dns/{whost}/tcp/{w.p2p_port}/p2p/{w.peer_id}"
+            if w_maddr not in visible_maddrs:
+                visible_maddrs.append(w_maddr)
+            if public_host:
+                relay_maddr = f"/ip4/{public_host}/tcp/{public_port}/p2p/{peer_id}/p2p-circuit/p2p/{w.peer_id}"
+                if relay_maddr not in visible_maddrs:
+                    visible_maddrs.append(relay_maddr)
+    except Exception:
+        pass
+
     return {
         "peer_id": peer_id,
         "p2p_port": P2P_PORT,
