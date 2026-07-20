@@ -4,7 +4,7 @@ services:
       context: .
       target: gateway
     image: kiwi-gateway:latest
-    container_name: kiwi-gateway-p2p
+    container_name: kiwi_gateway_p2p
     command: uvicorn gateway:app --host 0.0.0.0 --port 8080
     ports:
       - "8080:8080"
@@ -35,20 +35,20 @@ services:
       retries: 5
       start_period: 20s
 
-  worker-1:
+  worker_1:
     build:
       context: .
       target: worker
     image: kiwi-worker:latest
-    container_name: kiwi-worker-1-p2p
+    container_name: harshil_worker_1_p2p
     init: true
     command: uvicorn worker:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
       - "4002:4002"
     environment:
-      NODE_NAME: worker-1
-      NODE_URL: http://worker-1:8000
+      NODE_NAME: lambda_worker_1
+      NODE_URL: http://lambda_worker_1:8000
       GATEWAY_URL: http://gateway:8080
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4002"
@@ -75,17 +75,17 @@ services:
               count: 1
               capabilities: [ gpu ]
 
-  worker-2:
+  worker_2:
     image: kiwi-worker:latest
-    container_name: kiwi-worker-2-p2p
+    container_name: harshil_worker_2_p2p
     init: true
     command: uvicorn worker:app --host 0.0.0.0 --port 8000
     ports:
       - "8001:8000"
       - "4003:4003"
     environment:
-      NODE_NAME: worker-2
-      NODE_URL: http://worker-2:8000
+      NODE_NAME: lambda_worker_2
+      NODE_URL: http://lambda_worker_2:8000
       GATEWAY_URL: http://gateway:8080
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4003"

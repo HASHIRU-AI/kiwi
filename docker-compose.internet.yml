@@ -18,7 +18,7 @@ services:
       REQUEST_TIMEOUT_SECONDS: "120"
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4001"
-      KIWI_P2P_PUBLIC_HOST: ""
+      KIWI_P2P_PUBLIC_HOST: "4.tcp.us-cal-1.ngrok.io:26494"
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./gateway.py:/app/gateway.py
@@ -31,20 +31,20 @@ services:
       retries: 12
       start_period: 20s
 
-  worker-1:
+  worker_1:
     build:
       context: .
       target: worker
     image: kiwi-worker:latest
-    container_name: kiwi-worker-1-p2p
+    container_name: kiwi-worker_1_p2p
     init: true
     command: uvicorn worker:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
       - "4002:4002"
     environment:
-      NODE_NAME: worker-1
-      NODE_URL: http://worker-1:8000
+      NODE_NAME: worker_1
+      NODE_URL: http://worker_1:8000
       GATEWAY_URL: http://gateway:8080
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4002"
@@ -71,17 +71,17 @@ services:
               count: 1
               capabilities: [ gpu ]
 
-  worker-2:
+  worker_2:
     image: kiwi-worker:latest
-    container_name: kiwi-worker-2-p2p
+    container_name: kiwi-worker_2_p2p
     init: true
     command: uvicorn worker:app --host 0.0.0.0 --port 8000
     ports:
       - "8001:8000"
       - "4003:4003"
     environment:
-      NODE_NAME: worker-2
-      NODE_URL: http://worker-2:8000
+      NODE_NAME: worker_2
+      NODE_URL: http://worker_2:8000
       GATEWAY_URL: http://gateway:8080
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4003"

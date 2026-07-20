@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import os
 import random
@@ -13,7 +12,6 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Literal
-from urllib.parse import urlparse
 
 import httpx
 import torch
@@ -359,7 +357,6 @@ class WorkerRegistry:
                         "node_name": w.node_name,
                         "node_url": w.node_url,
                         "peer_id": w.peer_id,
-                        "p2p_port": w.p2p_port,
                         "model_id": w.model_id,
                         "layers": list(w.layers),
                         "healthy": w.healthy,
@@ -580,45 +577,11 @@ async def p2p_bootstrap() -> dict[str, object]:
             
         if public_maddr not in visible_maddrs:
             visible_maddrs.append(public_maddr)
-
-    debug_info = {"snapshot_len": 0, "processed": [], "errors": []}
-    try:
-        snapshot = await registry.snapshot()
-        debug_info["snapshot_len"] = len(snapshot)
-        for w in snapshot:
-            try:
-                w_peer_id = w.get("peer_id", "") if isinstance(w, dict) else getattr(w, "peer_id", "")
-                w_node_url = w.get("node_url", "") if isinstance(w, dict) else getattr(w, "node_url", "")
-                w_p2p_port = w.get("p2p_port", 4001) if isinstance(w, dict) else getattr(w, "p2p_port", 4001)
-                debug_info["processed"].append({"w_peer_id": w_peer_id, "w_node_url": w_node_url, "w_p2p_port": w_p2p_port})
-                if not w_peer_id or not w_node_url:
-                    continue
-                parsed = urlparse(w_node_url)
-                whost = parsed.hostname
-                if not whost:
-                    continue
-                try:
-                    wip = ipaddress.ip_address(whost)
-                    w_maddr = f"/ip6/{whost}/tcp/{w_p2p_port}/p2p/{w_peer_id}" if wip.version == 6 else f"/ip4/{whost}/tcp/{w_p2p_port}/p2p/{w_peer_id}"
-                except ValueError:
-                    w_maddr = f"/dns/{whost}/tcp/{w_p2p_port}/p2p/{w_peer_id}"
-                if w_maddr not in visible_maddrs:
-                    visible_maddrs.append(w_maddr)
-                if public_host:
-                    relay_maddr = f"/ip4/{public_host}/tcp/{public_port}/p2p/{peer_id}/p2p-circuit/p2p/{w_peer_id}"
-                    if relay_maddr not in visible_maddrs:
-                        visible_maddrs.append(relay_maddr)
-            except Exception as e_inner:
-                debug_info["errors"].append(f"inner: {e_inner}")
-    except Exception as exc:
-        debug_info["errors"].append(f"outer: {exc}")
-        print(f"[Gateway] Error during p2p_bootstrap worker discovery: {exc}", flush=True)
-
+            
     return {
         "peer_id": peer_id,
         "p2p_port": P2P_PORT,
         "visible_maddrs": visible_maddrs,
-        "debug": debug_info,
     }
 
 
@@ -669,11 +632,8 @@ async def _connect_to_worker_p2p(worker: Worker, p2p_port: int) -> None:
     
         print(f"[Gateway] Explicitly connecting to worker P2P address: {maddr}", flush=True)
         try:
-            connected = await transport.connect_to_peer(maddr)
-            if connected:
-                print(f"[Gateway] Successfully connected to worker {worker.node_name} via P2P", flush=True)
-            else:
-                print(f"[Gateway] Failed to explicitly connect to worker {worker.node_name} via P2P", flush=True)
+            await transport._p2p._client.connect(PeerID.from_base58(worker.peer_id), [Multiaddr(maddr)])
+            print(f"[Gateway] Successfully connected to worker {worker.node_name} via P2P", flush=True)
         except Exception as exc:
             print(f"[Gateway] Failed to explicitly connect to worker {worker.node_name} via P2P: {exc}", flush=True)
     except Exception as exc:

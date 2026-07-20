@@ -44,10 +44,6 @@ class KiwiTransport(ABC):
         P2P mode: returns libp2p PeerID (e.g. 'QmXyz...')
         """
 
-    async def connect_to_peer(self, maddr_str: str) -> bool:
-        """Explicitly connect or register a peer address into the transport pool."""
-        return True
-
     @abstractmethod
     async def send_forward(
         self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 30.0
@@ -96,9 +92,6 @@ class HttpTransport(KiwiTransport):
     async def get_address(self) -> str:
         return self._node_url
 
-    async def connect_to_peer(self, maddr_str: str) -> bool:
-        return True
-
     async def send_forward(
         self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 30.0
     ) -> bytes:
@@ -135,47 +128,21 @@ class HttpTransport(KiwiTransport):
         self._generate_handler = handler
 
 
-async def _write_stream_chunked(writer: asyncio.StreamWriter, data: bytes, chunk_size: int = 16384) -> None:
-    """Write data in chunks with writer.drain() and micro-pacing to prevent libp2p/Yamux flow-control window overflows across oceanic circuit relays."""
-    total_len = len(data)
-    chunks_count = (total_len + chunk_size - 1) // chunk_size if total_len > 0 else 1
-    if total_len > chunk_size:
-        logger.info(f"[P2PTransport] [ChunkedWrite] Starting multi-chunk stream of {total_len:,} bytes across {chunks_count} chunks (chunk_size={chunk_size:,}B)...")
-
-    for idx, i in enumerate(range(0, total_len, chunk_size), 1):
-        chunk = data[i : i + chunk_size]
-        writer.write(chunk)
+async def _write_stream_chunked(writer: asyncio.StreamWriter, data: bytes, chunk_size: int = 32768) -> None:
+    """Write data in chunks with writer.drain() to prevent libp2p circuit relay window buffer overflows."""
+    for i in range(0, len(data), chunk_size):
+        writer.write(data[i : i + chunk_size])
         await writer.drain()
-        if total_len > 32768:
-            await asyncio.sleep(0.005)  # 5ms micro-pacing gives Yamux window ACKs time to traverse trans-oceanic relays
-        if total_len > chunk_size and (idx == 1 or idx == chunks_count or idx % 5 == 0):
-            logger.info(f"[P2PTransport] [ChunkedWrite] Drained chunk {idx}/{chunks_count} ({len(chunk):,}B)...")
-
-    if total_len > chunk_size:
-        logger.info(f"[P2PTransport] [ChunkedWrite] Successfully streamed all {total_len:,} bytes across {chunks_count} chunks!")
 
 
-async def _read_stream_chunked(reader: asyncio.StreamReader, total_len: int, chunk_size: int = 16384) -> bytes:
-    """Read total_len bytes flexibly in chunks to prevent libp2p stream buffer starvation / timeouts."""
-    chunks_expected = (total_len + chunk_size - 1) // chunk_size if total_len > 0 else 1
-    if total_len > chunk_size:
-        logger.info(f"[P2PTransport] [ChunkedRead] Starting multi-chunk read of {total_len:,} bytes expecting ~{chunks_expected} chunks (chunk_size={chunk_size:,}B)...")
-
+async def _read_stream_chunked(reader: asyncio.StreamReader, total_len: int, chunk_size: int = 32768) -> bytes:
+    """Read total_len bytes in chunks to prevent libp2p stream buffer starvation / timeouts."""
     buffer = bytearray()
     remaining = total_len
-    chunks_read = 0
     while remaining > 0:
-        chunk = await reader.read(min(remaining, chunk_size))
-        if not chunk:
-            raise asyncio.exceptions.IncompleteReadError(bytes(buffer), total_len)
+        chunk = await reader.readexactly(min(remaining, chunk_size))
         buffer.extend(chunk)
         remaining -= len(chunk)
-        chunks_read += 1
-        if total_len > chunk_size and (chunks_read == 1 or remaining == 0 or chunks_read % 10 == 0):
-            logger.info(f"[P2PTransport] [ChunkedRead] Read chunk {chunks_read} ({len(chunk):,}B), remaining: {remaining:,}B")
-
-    if total_len > chunk_size:
-        logger.info(f"[P2PTransport] [ChunkedRead] Successfully completed read of all {total_len:,} bytes across {chunks_read} chunks!")
     return bytes(buffer)
 
 
@@ -205,7 +172,6 @@ class P2PTransport(KiwiTransport):
         self._peer_id = ""
         self._forward_handler: Callable | None = None
         self._generate_handler: Callable | None = None
-        self.known_peer_maddrs: dict[str, set[str]] = {}
 
     async def start(self) -> None:
         try:
@@ -226,7 +192,6 @@ class P2PTransport(KiwiTransport):
             use_auto_relay=True,
             dht_mode="server",
             force_reachability="public" if self.relay_mode else "private",
-            startup_timeout=180.0,
         )
         self._peer_id = self._p2p.peer_id.to_base58()
         logger.info(f"[P2PTransport] P2P node started! PeerID: {self._peer_id}")
@@ -248,41 +213,6 @@ class P2PTransport(KiwiTransport):
 
     async def get_address(self) -> str:
         return self._peer_id
-
-    async def connect_to_peer(self, maddr_str: str) -> bool:
-        """Explicitly connect to a peer given its multiaddress string."""
-        if self._p2p is None or "/p2p/" not in maddr_str:
-            return False
-        try:
-            from hivemind.p2p.p2p_daemon_bindings.p2pclient import PeerID, Multiaddr
-            peer_id_str = maddr_str.split("/p2p/")[-1].split("/")[0]
-            if peer_id_str == self._peer_id:
-                return True
-            if peer_id_str not in self.known_peer_maddrs:
-                self.known_peer_maddrs[peer_id_str] = set()
-            self.known_peer_maddrs[peer_id_str].add(maddr_str)
-
-            # Strip target /p2p/<peer_id> from direct TCP addresses so go-libp2p protobuf parser doesn't throw length errors,
-            # but PRESERVE it for /p2p-circuit/ relay addresses since go-libp2p requires the target ID after /p2p-circuit to route across the relay.
-            if "/p2p-circuit/" in maddr_str or maddr_str.endswith("/p2p-circuit"):
-                clean_maddr_str = maddr_str
-            else:
-                clean_maddr_str = "/p2p/".join(maddr_str.split("/p2p/")[:-1]) if "/p2p/" in maddr_str else maddr_str
-            # Sanitize underscores in DNS hostnames to hyphens (avoids IDNA codepoint rejection)
-            if "/dns/" in clean_maddr_str:
-                parts = clean_maddr_str.split("/")
-                for idx, p in enumerate(parts):
-                    if idx > 0 and parts[idx - 1] == "dns":
-                        parts[idx] = p.replace("_", "-")
-                clean_maddr_str = "/".join(parts)
-
-            peer_id = PeerID.from_base58(peer_id_str)
-            maddr = Multiaddr(clean_maddr_str)
-            await self._p2p._client.connect(peer_id, [maddr])
-            return True
-        except Exception as exc:
-            logger.debug(f"[P2PTransport] Could not explicitly connect to {maddr_str}: {exc}")
-            return False
 
     async def _handle_forward_stream(
         self, stream_info: Any, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -365,8 +295,8 @@ class P2PTransport(KiwiTransport):
                 with suppress(Exception):
                     await writer.wait_closed()
 
-        max_attempts = 6
-        backoff = 0.5
+        max_attempts = 5
+        backoff = 0.1
         for attempt in range(1, max_attempts + 1):
             try:
                 return await asyncio.wait_for(_call(), timeout=timeout)
@@ -375,13 +305,10 @@ class P2PTransport(KiwiTransport):
                     logger.error(f"[P2PTransport] send_forward to {target} failed after {max_attempts} attempts: {e}")
                     raise
                 logger.warning(
-                    f"[P2PTransport] Attempt {attempt} failed forwarding to {target}: {e}. Retrying in {backoff:.1f}s..."
+                    f"[P2PTransport] Attempt {attempt} failed forwarding to {target}: {e}. Retrying in {backoff}s..."
                 )
-                for maddr_str in self.known_peer_maddrs.get(target, set()):
-                    with suppress(Exception):
-                        await self.connect_to_peer(maddr_str)
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 1.5, 2.0)
+                backoff *= 2
 
     async def send_generate(
         self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 60.0
@@ -400,8 +327,8 @@ class P2PTransport(KiwiTransport):
             + payload
         )
 
-        max_attempts = 6
-        backoff = 0.5
+        max_attempts = 5
+        backoff = 0.1
         reader, writer = None, None
         for attempt in range(1, max_attempts + 1):
             try:
@@ -420,13 +347,10 @@ class P2PTransport(KiwiTransport):
                     logger.error(f"[P2PTransport] send_generate to {target} failed to establish stream after {max_attempts} attempts: {e}")
                     raise
                 logger.warning(
-                    f"[P2PTransport] Attempt {attempt} failed to establish generate stream to {target}: {e}. Retrying in {backoff:.1f}s..."
+                    f"[P2PTransport] Attempt {attempt} failed to establish generate stream to {target}: {e}. Retrying in {backoff}s..."
                 )
-                for maddr_str in self.known_peer_maddrs.get(target, set()):
-                    with suppress(Exception):
-                        await self.connect_to_peer(maddr_str)
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 1.5, 2.0)
+                backoff *= 2
 
         try:
             while not reader.at_eof():
