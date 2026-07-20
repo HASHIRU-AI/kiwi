@@ -18,7 +18,7 @@ services:
       REQUEST_TIMEOUT_SECONDS: "120"
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4001"
-      KIWI_P2P_PUBLIC_HOST: "4.tcp.us-cal-1.ngrok.io:26494"
+      KIWI_P2P_PUBLIC_HOST: "http://gateway:4001"
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./gateway.py:/app/gateway.py
