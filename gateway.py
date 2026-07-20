@@ -22,18 +22,23 @@ from safetensors.torch import save as safetensors_save
 from transformers import AutoTokenizer
 
 from models import ModelConfig, ModelRegistry, load_model_registry
+from transport import KiwiTransport, create_transport
+
+from hivemind.p2p.p2p_daemon_bindings import PeerID
+from hivemind.utils.multiaddr.multiaddr import Multiaddr
 
 
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
 MAX_REROUTES = int(os.getenv("MAX_REROUTES", "4"))
 INDEX_FILE = Path(__file__).with_name("index.html")
 
-REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
-MAX_REROUTES = int(os.getenv("MAX_REROUTES", "4"))
-INDEX_FILE = Path(__file__).with_name("index.html")
+# ── Transport configuration ──
+P2P_TRANSPORT = os.getenv("KIWI_P2P_TRANSPORT", "http").lower()
+P2P_PORT = int(os.getenv("KIWI_P2P_PORT", "4001"))
+transport: KiwiTransport | None = None
 
 # ── 2-Stage Eviction Thresholds ──
-HEARTBEAT_SOFT_STALE_SECONDS = float(os.getenv("HEARTBEAT_SOFT_STALE_SECONDS", "15"))
+HEARTBEAT_SOFT_STALE_SECONDS = float(os.getenv("HEARTBEAT_SOFT_STALE_SECONDS", "30"))
 HEARTBEAT_HARD_STALE_SECONDS = float(os.getenv("HEARTBEAT_HARD_STALE_SECONDS", "120"))
 
 
@@ -43,6 +48,8 @@ HEARTBEAT_HARD_STALE_SECONDS = float(os.getenv("HEARTBEAT_HARD_STALE_SECONDS", "
 class WorkerRegistration(BaseModel):
     node_name: str
     node_url: str
+    peer_id: str = ""
+    p2p_port: int = 4001
     cpu_cores: int = Field(ge=1)
     vram_gb: float = Field(ge=0)
     model_id: str | None = None
@@ -73,9 +80,16 @@ class Worker:
     layers: tuple[int, int]  # inclusive range [first, last]
     cpu_cores: int
     vram_gb: float
+    peer_id: str = ""
+    p2p_port: int = 4001
     healthy: bool = True
     registered_at: float = 0.0
     last_seen: float = 0.0
+    latency_ms: float = 0.0
+
+
+def _worker_address(w: Worker) -> str:
+    return w.peer_id if w.peer_id and P2P_TRANSPORT == "p2p" else w.node_url
 
 
 # ── Worker registry ──────────────────────────────────────────────────────────────
@@ -88,6 +102,19 @@ class WorkerRegistry:
         self._workers: dict[str, Worker] = {}
         self._lock = asyncio.Lock()
 
+    def _find_worker(self, identifier: str) -> Worker | None:
+        """Find a worker by node_name, node_url, or peer_id."""
+        if not identifier:
+            return None
+        cleaned = identifier.rstrip("/")
+        worker = self._workers.get(cleaned) or self._workers.get(identifier)
+        if worker:
+            return worker
+        for w in self._workers.values():
+            if cleaned in (w.node_name, w.node_url.rstrip("/"), w.peer_id):
+                return w
+        return None
+
     # ── Internal helpers (caller must hold lock) ─────────────────────────────
 
     def _healthy_workers(self, model_id: str | None = None) -> list[Worker]:
@@ -95,7 +122,7 @@ class WorkerRegistry:
         return [
             w
             for key, w in self._workers.items()
-            if key == w.node_url
+            if key == w.node_name
             and w.healthy
             and (model_id is None or w.model_id == model_id)
         ]
@@ -232,19 +259,29 @@ class WorkerRegistry:
             
             if existing:
                 # Node is still in memory (soft restart / IP change)
-                existing.node_url = registration.node_url
+                existing.node_url = registration.node_url.rstrip("/")
+                existing.peer_id = registration.peer_id or ""
+                existing.p2p_port = registration.p2p_port
                 existing.cpu_cores = registration.cpu_cores
                 existing.vram_gb = registration.vram_gb
                 existing.healthy = True
                 existing.registered_at = time.time()
                 existing.last_seen = time.time()
+                self._workers[existing.node_name] = existing
+                if existing.peer_id:
+                    self._workers[existing.peer_id] = existing
+                if existing.node_url:
+                    self._workers[existing.node_url] = existing
                 return existing
 
             # Node is brand new or was hard-evicted. 
-            # Force a fresh layer assignment based on current swarm bottlenecks.
-            model = self._pick_model(model_registry, registration.vram_gb)
-            model_id = model.model_id
-            layers = self._pick_layers(model, registration.vram_gb)
+            if registration.model_id and registration.layers:
+                model_id = registration.model_id
+                layers = (registration.layers[0], registration.layers[-1])
+            else:
+                model = self._pick_model(model_registry, registration.vram_gb)
+                model_id = model.model_id
+                layers = self._pick_layers(model, registration.vram_gb)
 
             worker = Worker(
                 node_name=registration.node_name,
@@ -253,11 +290,16 @@ class WorkerRegistry:
                 layers=layers,
                 cpu_cores=registration.cpu_cores,
                 vram_gb=registration.vram_gb,
+                peer_id=registration.peer_id or "",
+                p2p_port=registration.p2p_port,
                 registered_at=time.time(),
                 last_seen=time.time(),
             )
-            self._workers[worker.node_url] = worker
-            self._workers[registration.node_name] = worker
+            self._workers[worker.node_name] = worker
+            if worker.peer_id:
+                self._workers[worker.peer_id] = worker
+            if worker.node_url:
+                self._workers[worker.node_url] = worker
             return worker
 
     async def select_pipeline(
@@ -296,9 +338,9 @@ class WorkerRegistry:
                 target = max_end + 1
             return pipeline
 
-    async def evict(self, node_url: str) -> None:
+    async def evict(self, node_name: str) -> None:
         async with self._lock:
-            worker = self._workers.get(node_url.rstrip("/"))
+            worker = self._find_worker(node_name)
             if worker:
                 worker.healthy = False
 
@@ -307,21 +349,21 @@ class WorkerRegistry:
             seen: set[str] = set()
             result: list[dict[str, object]] = []
             for key, w in self._workers.items():
-                if key != w.node_url:
+                if w.node_name in seen:
                     continue
-                if w.node_url in seen:
-                    continue
-                seen.add(w.node_url)
+                seen.add(w.node_name)
                 result.append(
                     {
                         "node_name": w.node_name,
                         "node_url": w.node_url,
+                        "peer_id": w.peer_id,
                         "model_id": w.model_id,
                         "layers": list(w.layers),
                         "healthy": w.healthy,
                         "last_seen": round(time.time() - w.last_seen, 1),
                         "cpu_cores": w.cpu_cores,
                         "vram_gb": w.vram_gb,
+                        "latency_ms": round(w.latency_ms, 1),
                     }
                 )
             return result
@@ -343,12 +385,13 @@ class WorkerRegistry:
                 }
             return result
 
-    async def heartbeat(self, node_url: str) -> bool:
+    async def heartbeat(self, node_name: str, latency_ms: float = 0.0) -> bool:
         async with self._lock:
-            worker = self._workers.get(node_url.rstrip("/"))
+            worker = self._find_worker(node_name)
             if worker:
                 worker.last_seen = time.time()
                 worker.healthy = True
+                worker.latency_ms = latency_ms
                 return True
             return False
 
@@ -369,13 +412,13 @@ class WorkerRegistry:
                 # Check Stage 2: Hard Eviction first
                 if worker.last_seen < hard_cutoff:
                     keys_to_delete.append(key)
-                    if key == worker.node_url:
+                    if key == worker.node_name:
                         hard_evicted.append(worker.node_name)
                         
                 # Check Stage 1: Soft Eviction second
                 elif worker.healthy and worker.last_seen < soft_cutoff:
                     worker.healthy = False
-                    if key == worker.node_url:
+                    if key == worker.node_name:
                         soft_evicted.append(worker.node_name)
             
             # Execute hard deletions
@@ -407,7 +450,17 @@ async def _get_tokenizer(model_id: str) -> AutoTokenizer:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global model_registry
+    global model_registry, transport
+    transport = create_transport(
+        transport_type=P2P_TRANSPORT,
+        initial_peers=[],  # Gateway acts as the swarm bootstrap/relay point
+        listen_port=P2P_PORT,
+        relay_mode=True,
+    )
+    await transport.start()
+    if hasattr(transport, "get_peer_id") and transport.get_peer_id():
+        print(f"[gateway] P2P node started! PeerID: {transport.get_peer_id()}", flush=True)
+
     model_registry = await load_model_registry()
     for model in model_registry.list_models():
         await _get_tokenizer(model.model_id)
@@ -432,6 +485,8 @@ async def lifespan(_: FastAPI):
     staleness_task = asyncio.create_task(_staleness_loop())
     yield
     staleness_task.cancel()
+    if transport is not None:
+        await transport.stop()
 
 
 app = FastAPI(title="Kiwi Enterprise Compute Swarm", lifespan=lifespan)
@@ -450,6 +505,83 @@ async def health() -> dict[str, object]:
     return {
         "status": "ok" if model_registry else "initializing",
         "models_loaded": len(model_registry.list_models()) if model_registry else 0,
+    }
+
+
+import ipaddress
+
+
+_public_ip_cache: str | None = None
+
+
+async def _get_public_ip() -> str | None:
+    global _public_ip_cache
+    if _public_ip_cache:
+        return _public_ip_cache
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get("https://api.ipify.org")
+            if resp.status_code == 200:
+                _public_ip_cache = resp.text.strip()
+                return _public_ip_cache
+    except Exception:
+        pass
+    return None
+
+
+@app.get("/p2p/bootstrap")
+async def p2p_bootstrap() -> dict[str, object]:
+    if transport is None:
+        raise HTTPException(status_code=503, detail="Transport not initialized")
+    if P2P_TRANSPORT != "p2p":
+        raise HTTPException(status_code=400, detail="P2P transport is not enabled on this gateway")
+    
+    peer_id = await transport.get_address()
+    visible_maddrs = []
+    if hasattr(transport, "_p2p") and transport._p2p is not None:
+        try:
+            maddrs = await transport._p2p.get_visible_maddrs()
+            visible_maddrs = [str(maddr) for maddr in maddrs]
+        except Exception:
+            pass
+            
+    # Add public host (explicit override or dynamic ipify lookup)
+    public_host = os.getenv("KIWI_P2P_PUBLIC_HOST", "").strip()
+    if public_host.startswith("https://"):
+        public_host = public_host[len("https://"):]
+    elif public_host.startswith("http://"):
+        public_host = public_host[len("http://"):]
+        
+    public_port = P2P_PORT
+    if ":" in public_host:
+        parts = public_host.split(":")
+        public_host = parts[0]
+        try:
+            public_port = int(parts[1])
+        except ValueError:
+            pass
+            
+    if not public_host:
+        public_host = await _get_public_ip() or ""
+        public_port = P2P_PORT
+        
+    if public_host:
+        try:
+            ip = ipaddress.ip_address(public_host)
+            if ip.version == 6:
+                public_maddr = f"/ip6/{public_host}/tcp/{public_port}/p2p/{peer_id}"
+            else:
+                public_maddr = f"/ip4/{public_host}/tcp/{public_port}/p2p/{peer_id}"
+        except ValueError:
+            public_maddr = f"/dns/{public_host}/tcp/{public_port}/p2p/{peer_id}"
+            
+        if public_maddr not in visible_maddrs:
+            visible_maddrs.append(public_maddr)
+            
+    return {
+        "peer_id": peer_id,
+        "p2p_port": P2P_PORT,
+        "visible_maddrs": visible_maddrs,
     }
 
 
@@ -481,11 +613,40 @@ async def registry_view() -> dict[str, object]:
     return result
 
 
+async def _connect_to_worker_p2p(worker: Worker, p2p_port: int) -> None:
+    try:
+        from urllib.parse import urlparse
+        import ipaddress
+        parsed = urlparse(worker.node_url)
+        host = parsed.hostname
+        if not host:
+            return
+        try:
+            ip = ipaddress.ip_address(host)
+            if ip.version == 6:
+                maddr = f"/ip6/{host}/tcp/{p2p_port}/p2p/{worker.peer_id}"
+            else:
+                maddr = f"/ip4/{host}/tcp/{p2p_port}/p2p/{worker.peer_id}"
+        except ValueError:
+            maddr = f"/dns/{host}/tcp/{p2p_port}/p2p/{worker.peer_id}"
+    
+        print(f"[Gateway] Explicitly connecting to worker P2P address: {maddr}", flush=True)
+        try:
+            await transport._p2p._client.connect(PeerID.from_base58(worker.peer_id), [Multiaddr(maddr)])
+            print(f"[Gateway] Successfully connected to worker {worker.node_name} via P2P", flush=True)
+        except Exception as exc:
+            print(f"[Gateway] Failed to explicitly connect to worker {worker.node_name} via P2P: {exc}", flush=True)
+    except Exception as exc:
+        print(f"[Gateway] Failed to explicitly connect to worker {worker.node_name} via P2P: {exc}", flush=True)
+
+
 @app.post("/register")
 async def register_worker(registration: WorkerRegistration) -> JSONResponse:
     if not model_registry:
         raise HTTPException(status_code=503, detail="Gateway not ready")
     worker = await registry.register(registration, model_registry)
+    if P2P_TRANSPORT == "p2p" and transport is not None and worker.peer_id:
+        asyncio.create_task(_connect_to_worker_p2p(worker, registration.p2p_port))
     model = model_registry.resolve(worker.model_id)
     return JSONResponse(
         {
@@ -500,11 +661,12 @@ async def register_worker(registration: WorkerRegistration) -> JSONResponse:
 class HeartbeatRequest(BaseModel):
     node_name: str
     node_url: str
+    latency_ms: float = 0.0
 
 
 @app.post("/heartbeat")
 async def heartbeat(request: HeartbeatRequest) -> dict[str, str]:
-    exists = await registry.heartbeat(request.node_url)
+    exists = await registry.heartbeat(request.node_name, request.latency_ms)
     if not exists:
         raise HTTPException(status_code=404, detail="Worker not registered")
     return {"status": "ok"}
@@ -512,7 +674,7 @@ async def heartbeat(request: HeartbeatRequest) -> dict[str, str]:
 
 @app.post("/deregister")
 async def deregister(request: HeartbeatRequest) -> dict[str, str]:
-    await registry.evict(request.node_url)
+    await registry.evict(request.node_name)
     return {"status": "evicted"}
 
 
@@ -616,10 +778,16 @@ async def _stream_completion(
             yield "data: [DONE]\n\n"
             return
 
+        if transport is None:
+            yield _sse({"error": {"message": "Transport layer not initialized", "type": "server_error"}})
+            yield "data: [DONE]\n\n"
+            return
+
         first = pipeline[0]
-        remaining_urls = ",".join(w.node_url for w in pipeline[1:])
+        first_addr = _worker_address(first)
+        remaining_urls = ",".join(_worker_address(w) for w in pipeline[1:])
         active_nodes = {
-            f"stage_{i}": w.node_url for i, w in enumerate(pipeline)
+            f"stage_{i}": _worker_address(w) for i, w in enumerate(pipeline)
         }
 
         # Build full context: original prompt + any previously generated tokens
@@ -634,64 +802,67 @@ async def _stream_completion(
         body = safetensors_save({"input_ids": context_ids.contiguous()})
         remaining_tokens = request.max_tokens - len(generated_ids)
 
-        timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=10.0)
         stream_ok = True
 
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream(
-                    "POST",
-                    f"{first.node_url}/generate",
-                    headers={
-                        "X-Request-ID": request_id,
-                        "X-Pipeline": remaining_urls,
-                        "X-Max-Tokens": str(remaining_tokens),
-                        "X-Eos-Token-Ids": eos_header,
-                        "Content-Type": "application/octet-stream",
-                    },
-                    content=body,
-                ) as response:
-                    response.raise_for_status()
-                    async for line in response.aiter_lines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            data = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
+            async for chunk_bytes in transport.send_generate(
+                target=first_addr,
+                payload=body,
+                headers={
+                    "X-Request-ID": request_id,
+                    "X-Pipeline": remaining_urls,
+                    "X-Max-Tokens": str(remaining_tokens),
+                    "X-Eos-Token-Ids": eos_header,
+                    "Content-Type": "application/octet-stream",
+                },
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            ):
+                line = chunk_bytes.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-                        if "error" in data:
-                            # Worker-reported pipeline failure
-                            failed_node = data.get("failed_node")
-                            await registry.evict(
-                                failed_node or first.node_url
-                            )
-                            stream_ok = False
-                            break
+                if "error" in data:
+                    # Worker-reported pipeline failure
+                    failed_node = data.get("failed_node")
+                    print(f"[gateway] Worker reported pipeline error from {failed_node}: {data.get('error')}", flush=True)
+                    await registry.evict(
+                        failed_node or first_addr
+                    )
+                    stream_ok = False
+                    break
 
-                        token_id = data.get("token_id")
-                        if token_id is None:
-                            continue
+                token_id = data.get("token_id")
+                if token_id is None:
+                    continue
 
-                        generated_ids.append(token_id)
+                generated_ids.append(token_id)
 
-                        if token_id in eos_set:
-                            break
+                if token_id in eos_set:
+                    break
 
-                        text = tokenizer.decode(
-                            [token_id], skip_special_tokens=False
-                        )
-                        if text:
-                            yield _chunk(
-                                request_id,
-                                model.model_id,
-                                text,
-                                active_nodes=active_nodes,
-                            )
+                text = tokenizer.decode(
+                    [token_id], skip_special_tokens=False
+                )
+                if text:
+                    yield _chunk(
+                        request_id,
+                        model.model_id,
+                        text,
+                        active_nodes=active_nodes,
+                    )
 
-        except httpx.HTTPError:
-            await registry.evict(first.node_url)
+        except Exception as error:
+            print(f"[gateway] Transport error communicating with {first_addr}: {error}")
+            await registry.evict(first_addr)
+            stream_ok = False
+
+        if stream_ok and (not generated_ids or generated_ids[-1] not in eos_set) and len(generated_ids) < request.max_tokens:
+            print(f"[gateway] Stream closed prematurely by {first_addr} before EOS/max_tokens, marking unhealthy and rerouting.", flush=True)
+            await registry.evict(first_addr)
             stream_ok = False
 
         if stream_ok:

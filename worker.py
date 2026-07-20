@@ -17,6 +17,10 @@ from safetensors.torch import load as safetensors_load
 from safetensors.torch import save as safetensors_save
 from transformers import AutoModelForCausalLM
 
+import ipaddress
+from urllib.parse import urlparse
+from transport import KiwiTransport, create_transport
+
 
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://gateway:8080").rstrip("/")
 NODE_NAME = os.getenv("NODE_NAME", "worker")
@@ -29,6 +33,12 @@ USE_INT8 = os.getenv("KIWI_USE_INT8", "false").lower() in ("true", "1", "yes")
 LOSSLESS_ALGORITHM = os.getenv("KIWI_LOSSLESS", "none").lower()
 
 GPU_MEMORY_RESERVE_MB = float(os.getenv("GPU_MEMORY_RESERVE_MB", "512"))
+
+P2P_TRANSPORT = os.getenv("KIWI_P2P_TRANSPORT", "http").lower()
+P2P_RELAY_PEERS = os.getenv("KIWI_RELAY_PEERS", "")
+P2P_PORT = int(os.getenv("KIWI_P2P_PORT", "4001"))
+
+transport: KiwiTransport | None = None
 
 from transformers.cache_utils import Cache
 
@@ -314,14 +324,14 @@ def _detect_device() -> tuple[str, float]:
     return "cpu", 0.0
 
 
-def _estimate_layer_memory_mb(loaded_model: Any, num_layers: int) -> float:
+def _estimate_layer_memory_mb(loaded_model: Any, total_layers: int = 0) -> float:
     """Estimate per-layer GPU memory (MB) from total model parameter size."""
     total_params = sum(p.numel() * p.element_size() for p in loaded_model.parameters())
     # Add ~20% overhead for CUDA context fragmentation.
-    return (total_params / num_layers * 1.2) / (1024 ** 2)
+    return (total_params / total_layers * 1.2) / (1024 ** 2)
 
 
-def _compute_gpu_layers(loaded_model: Any, num_assigned_layers: int) -> int:
+def _compute_gpu_layers(loaded_model: Any, num_assigned_layers: int, total_layers: int = 0) -> int:
     """Decide how many of the assigned layers fit in available VRAM."""
     if not torch.cuda.is_available():
         return 0
@@ -329,12 +339,12 @@ def _compute_gpu_layers(loaded_model: Any, num_assigned_layers: int) -> int:
     usable_mb = free_mem_mb - GPU_MEMORY_RESERVE_MB
     if usable_mb <= 0:
         return 0
-    per_layer_mb = _estimate_layer_memory_mb(loaded_model, num_assigned_layers)
+    per_layer_mb = _estimate_layer_memory_mb(loaded_model, total_layers)
     gpu_layers = int(usable_mb // per_layer_mb)
     return min(gpu_layers, num_assigned_layers)
 
 
-def _place_model_on_device(loaded_model: Any, num_assigned_layers: int) -> str:
+def _place_model_on_device(loaded_model: Any, num_assigned_layers: int, total_layers: int = 0) -> str:
     """Move the model (or a subset of its layers) onto the best available device.
 
     Returns the primary inference device string ("cuda" or "cpu").
@@ -342,7 +352,7 @@ def _place_model_on_device(loaded_model: Any, num_assigned_layers: int) -> str:
     if not torch.cuda.is_available():
         return "cpu"
 
-    gpu_layers = _compute_gpu_layers(loaded_model, num_assigned_layers)
+    gpu_layers = _compute_gpu_layers(loaded_model, num_assigned_layers, total_layers)
 
     if gpu_layers == 0:
         return "cpu"
@@ -371,11 +381,67 @@ def _place_model_on_device(loaded_model: Any, num_assigned_layers: int) -> str:
 # ── Registration / lifecycle ────────────────────────────────────────────────────
 
 
+async def _discover_bootstrap_peers() -> list[str]:
+    """Query gateway via HTTP to dynamically discover P2P bootstrap peer multiaddresses."""
+    if P2P_RELAY_PEERS:
+        return [p.strip() for p in P2P_RELAY_PEERS.split(",") if p.strip()]
+
+    # If no manual relay peers configured, fetch dynamically from gateway HTTP endpoint
+    print(f"[{NODE_NAME}] KIWI_RELAY_PEERS not configured. Discovering bootstrap peers from gateway...", flush=True)
+    bootstrap_maddrs = []
+    
+    # Retry loop since gateway might be booting up concurrently
+    for attempt in range(60):
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(f"{GATEWAY_URL}/p2p/bootstrap")
+                response.raise_for_status()
+                data = response.json()
+                
+                peer_id = data["peer_id"]
+                p2p_port = data["p2p_port"]
+                visible_maddrs = data.get("visible_maddrs", [])
+                
+                # Add visible addresses from gateway response
+                for maddr in visible_maddrs:
+                    if maddr not in bootstrap_maddrs:
+                        bootstrap_maddrs.append(maddr)
+                
+                # Construct address from GATEWAY_URL host
+                parsed = urlparse(GATEWAY_URL)
+                if parsed.hostname:
+                    host = parsed.hostname
+                    # Check if host is IP address
+                    try:
+                        ip = ipaddress.ip_address(host)
+                        if ip.version == 6:
+                            maddr_construct = f"/ip6/{host}/tcp/{p2p_port}/p2p/{peer_id}"
+                        else:
+                            maddr_construct = f"/ip4/{host}/tcp/{p2p_port}/p2p/{peer_id}"
+                    except ValueError:
+                        # DNS name
+                        maddr_construct = f"/dns/{host}/tcp/{p2p_port}/p2p/{peer_id}"
+                    
+                    if maddr_construct not in bootstrap_maddrs:
+                        bootstrap_maddrs.append(maddr_construct)
+                
+                print(f"[{NODE_NAME}] Discovered bootstrap peers: {bootstrap_maddrs}", flush=True)
+                return bootstrap_maddrs
+        except Exception as exc:
+            # Sleep and retry
+            await asyncio.sleep(min(1 + attempt * 0.25, 5))
+            
+    raise RuntimeError(f"{NODE_NAME} failed to discover P2P bootstrap peers from gateway")
+
+
 async def _register() -> dict[str, Any]:
     _, vram_gb = _detect_device()
+    peer_id = await transport.get_address() if transport and P2P_TRANSPORT == "p2p" else ""
     payload = {
         "node_name": NODE_NAME,
         "node_url": NODE_URL,
+        "peer_id": peer_id,
+        "p2p_port": P2P_PORT,
         "cpu_cores": os.cpu_count() or 1,
         "vram_gb": vram_gb,
     }
@@ -426,7 +492,7 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
         loaded_model.model.embed_tokens = torch.nn.Identity()
 
     # ── Device placement ──
-    inference_device = _place_model_on_device(loaded_model, num_assigned)
+    inference_device = _place_model_on_device(loaded_model, num_assigned, total_layers)
     position = (
         "SOLO" if _is_first and _is_last else
         "FIRST" if _is_first else
@@ -478,9 +544,26 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
 
 async def _re_register() -> None:
     _, vram_gb = _detect_device()
+    
+    peer_id = ""
+    if P2P_TRANSPORT == "p2p" and transport is not None:
+        try:
+            peer_id = await transport.get_address()
+            # Dynamic re-discovery of new gateway bootstrap peers
+            new_bootstrap_peers = await _discover_bootstrap_peers()
+            for peer in new_bootstrap_peers:
+                try:
+                    await transport._p2p.connect_to_peer(peer)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     payload = {
         "node_name": NODE_NAME,
         "node_url": NODE_URL,
+        "peer_id": peer_id,
+        "p2p_port": P2P_PORT,
         "cpu_cores": os.cpu_count() or 1,
         "vram_gb": vram_gb,
         "model_id": assigned_model_id,
@@ -496,14 +579,21 @@ async def _re_register() -> None:
 
 async def _heartbeat_loop() -> None:
     """Ping the gateway periodically so it knows we're alive."""
+    latency_ms = 0.0
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
         try:
+            start_time = time.perf_counter()
             async with httpx.AsyncClient(timeout=3.0) as client:
                 response = await client.post(
                     f"{GATEWAY_URL}/heartbeat",
-                    json={"node_name": NODE_NAME, "node_url": NODE_URL},
+                    json={
+                        "node_name": NODE_NAME,
+                        "node_url": NODE_URL,
+                        "latency_ms": latency_ms,
+                    },
                 )
+                latency_ms = (time.perf_counter() - start_time) * 1000.0
                 if response.status_code == 404:
                     await _re_register()
         except httpx.HTTPError:
@@ -540,7 +630,21 @@ async def _deregister() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global assigned_model_id, assigned_dtype, layer_range
-    global is_first_stage, is_last_stage, model
+    global is_first_stage, is_last_stage, model, transport
+
+    initial_peers = []
+    if P2P_TRANSPORT == "p2p":
+        initial_peers = await _discover_bootstrap_peers()
+
+    transport = create_transport(
+        transport_type=P2P_TRANSPORT,
+        node_url=NODE_URL,
+        initial_peers=initial_peers,
+        listen_port=P2P_PORT,
+    )
+    await transport.start()
+    transport.set_forward_handler(_execute_forward_pipeline)
+    transport.set_generate_handler(_execute_generate_pipeline)
 
     assignment = await _register()
     assigned_model_id = assignment["model_id"]
@@ -557,6 +661,7 @@ async def lifespan(_: FastAPI):
     heartbeat_task.cancel()
     eviction_task.cancel()
     await _deregister()
+    await transport.stop()
     kv_cache.clear()
 
 
@@ -786,52 +891,18 @@ def _serialize_hidden_states(result: torch.Tensor) -> tuple[bytes, dict[str, str
     return binary_hidden, headers
 
 
-# ── Forward endpoint ─────────────────────────────────────────────────────────────
-
-
-@app.post("/forward")
-async def forward(request: Request):
-    if model is None:
-        raise HTTPException(status_code=503, detail="Worker model is not ready")
-    request_id = request.headers.get("X-Request-ID")
-    step = request.headers.get("X-Step")
-    if not request_id or step not in {"prefill", "decode"}:
-        raise HTTPException(
-            status_code=400, detail="X-Request-ID and X-Step are required"
-        )
-    if (
-        request.headers.get("content-type", "").split(";", 1)[0]
-        != "application/octet-stream"
-    ):
-        raise HTTPException(
-            status_code=415,
-            detail="Only safetensors application/octet-stream is accepted",
-        )
-
-    # Parse the remaining pipeline from the header.
-    pipeline_header = request.headers.get("X-Pipeline", "")
-    next_workers = [u.strip() for u in pipeline_header.split(",") if u.strip()]
-
-    try:
-        body_bytes = await request.body()
-        encoding = request.headers.get("X-Content-Encoding")
-        if encoding:
-            body_bytes = _decompress_payload(body_bytes, encoding)
-        tensors = safetensors_load(body_bytes)
-    except Exception as error:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid safetensors payload: {error}",
-        ) from error
+async def _process_forward(
+    request_id: str, step: str, body_bytes: bytes, encoding: str | None = None
+) -> Any:
+    if encoding:
+        body_bytes = _decompress_payload(body_bytes, encoding)
+    tensors = safetensors_load(body_bytes)
 
     # ── Run this worker's layers ──
     if is_first_stage:
         input_ids = tensors.get("input_ids")
         if input_ids is None:
-            raise HTTPException(
-                status_code=400,
-                detail="First-stage worker requires input_ids",
-            )
+            raise ValueError("First-stage worker requires input_ids")
         async with model_lock:
             result = await asyncio.to_thread(
                 _run_forward, request_id, step, input_ids=input_ids
@@ -852,7 +923,6 @@ async def forward(request: Request):
                 and scale_tensor is not None
                 and shape_tensor is not None
             ):
-                # Reconstruct CSR and dequantize
                 original_shape = list(shape_tensor.tolist())
                 size_2d = (original_shape[0] * original_shape[1], original_shape[2])
                 sparse_2d = torch.sparse_csr_tensor(crow, col, quantized_val, size=size_2d)
@@ -872,7 +942,6 @@ async def forward(request: Request):
                         hidden_in = hidden_in * channel_scale
                     print(f"[{NODE_NAME}] [INT8] Dequantized activations back to shape {list(hidden_in.shape)}", flush=True)
                 else:
-                    # Check for CSR components
                     crow = tensors.get("crow_indices")
                     col = tensors.get("col_indices")
                     val = tensors.get("values")
@@ -889,9 +958,8 @@ async def forward(request: Request):
                         hidden_in = sparse_2d.to_dense().view(original_shape)
                         print(f"[{NODE_NAME}] [CSR] Decompressed sparse activations back to shape {original_shape}", flush=True)
                     else:
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Non-first-stage worker requires hidden_states, INT8 components, or CSR components",
+                        raise ValueError(
+                            "Non-first-stage worker requires hidden_states, INT8 components, or CSR components"
                         )
         hidden_in = hidden_in.to(_dtype())
 
@@ -899,51 +967,182 @@ async def forward(request: Request):
             result = await asyncio.to_thread(
                 _run_forward, request_id, step, hidden_states=hidden_in
             )
+    return result
 
-    # ── Last stage → return the token ──
+
+async def _execute_forward_pipeline(headers: dict[str, str], body_bytes: bytes) -> bytes:
+    if model is None:
+        raise RuntimeError("Worker model is not ready")
+    request_id = headers.get("x-request-id") or headers.get("X-Request-ID", "")
+    step = headers.get("x-step") or headers.get("X-Step", "")
+    if not request_id or step not in {"prefill", "decode"}:
+        raise ValueError("X-Request-ID and X-Step are required")
+
+    pipeline_header = headers.get("x-pipeline") or headers.get("X-Pipeline", "")
+    next_workers = [u.strip() for u in pipeline_header.split(",") if u.strip()]
+
+    encoding = headers.get("x-content-encoding") or headers.get("X-Content-Encoding")
+    result = await _process_forward(request_id, step, body_bytes, encoding)
+
     if is_last_stage and not next_workers:
-        return JSONResponse({"next_token_id": result})
+        return json.dumps({"next_token_id": result}).encode("utf-8")
 
-    # ── Not last stage → forward hidden_states down the pipeline ──
     if not next_workers:
-        # This shouldn't happen if the gateway built the pipeline correctly.
-        raise HTTPException(
-            status_code=500,
-            detail="Non-last worker received empty pipeline",
-        )
+        raise RuntimeError("Non-last worker received empty pipeline")
 
-    next_url = next_workers[0]
+    next_target = next_workers[0]
     remaining_pipeline = ",".join(next_workers[1:])
-
-    # Compress / serialize output before sending it down the pipeline
     binary_hidden, compression_headers = _serialize_hidden_states(result)
 
+    if transport is None:
+        raise RuntimeError("Transport layer is not initialized")
     try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(120.0, connect=10.0)
-        ) as client:
-            response = await client.post(
-                f"{next_url.rstrip('/')}/forward",
-                headers={
-                    "X-Request-ID": request_id,
-                    "X-Step": step,
-                    "X-Pipeline": remaining_pipeline,
-                    "Content-Type": "application/octet-stream",
-                    **compression_headers,
-                },
-                content=binary_hidden,
-            )
-            response.raise_for_status()
-    except httpx.HTTPError as error:
-        return JSONResponse(
-            {"detail": f"Pipeline forwarding to {next_url} failed: {error}"},
-            status_code=502,
-            headers={"X-Kiwi-Failed-Node": next_url.rstrip("/")},
+        response_bytes = await transport.send_forward(
+            target=next_target,
+            payload=binary_hidden,
+            headers={
+                "X-Request-ID": request_id,
+                "X-Step": step,
+                "X-Pipeline": remaining_pipeline,
+                "Content-Type": "application/octet-stream",
+                **compression_headers,
+            },
+            timeout=120.0,
         )
-    return JSONResponse(response.json())
+        return response_bytes
+    except Exception as error:
+        print(f"[{NODE_NAME}] Forwarding failed to downstream {next_target}: {error}", flush=True)
+        raise
+
+
+@app.post("/forward")
+async def forward(request: Request):
+    if (
+        request.headers.get("content-type", "").split(";", 1)[0]
+        != "application/octet-stream"
+    ):
+        raise HTTPException(
+            status_code=415,
+            detail="Only safetensors application/octet-stream is accepted",
+        )
+    try:
+        response_bytes = await _execute_forward_pipeline(
+            dict(request.headers), await request.body()
+        )
+        return JSONResponse(json.loads(response_bytes))
+    except Exception as error:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Forward execution failed: {error}",
+        ) from error
 
 
 # ── Streaming generation endpoint ────────────────────────────────────────────────
+
+
+async def _token_stream_generator(
+    request_id: str,
+    max_tokens: int,
+    eos_token_ids: set[int],
+    next_workers: list[str],
+    input_ids: torch.Tensor,
+) -> AsyncIterator[bytes]:
+    is_prefill = True
+    last_token_id = None
+
+    for _ in range(max_tokens):
+        step = "prefill" if is_prefill else "decode"
+
+        if is_prefill:
+            step_input = input_ids
+        else:
+            step_input = torch.tensor([[last_token_id]], dtype=torch.long)
+
+        async with model_lock:
+            result = await asyncio.to_thread(
+                _run_forward,
+                request_id,
+                step,
+                input_ids=step_input,
+            )
+
+        if is_last_stage:
+            token_id = result
+        else:
+            if not next_workers:
+                yield json.dumps(
+                    {"error": "Non-last worker has no downstream pipeline"}
+                ).encode("utf-8") + b"\n"
+                return
+
+            binary_hidden, compression_headers = _serialize_hidden_states(result)
+            next_target = next_workers[0]
+            remaining = ",".join(next_workers[1:])
+
+            try:
+                if transport is None:
+                    raise RuntimeError("Transport layer is not initialized")
+                response_bytes = await transport.send_forward(
+                    target=next_target,
+                    payload=binary_hidden,
+                    headers={
+                        "X-Request-ID": request_id,
+                        "X-Step": step,
+                        "X-Pipeline": remaining,
+                        "Content-Type": "application/octet-stream",
+                        **compression_headers,
+                    },
+                    timeout=120.0,
+                )
+                resp_dict = json.loads(response_bytes)
+                token_id = int(resp_dict["next_token_id"])
+            except Exception as error:
+                print(f"[{NODE_NAME}] Pipeline forwarding failed to downstream {next_target}: {error}", flush=True)
+                yield json.dumps(
+                    {
+                        "error": f"Pipeline forwarding failed: {error}",
+                        "failed_node": next_target.rstrip("/"),
+                    }
+                ).encode("utf-8") + b"\n"
+                return
+
+        yield json.dumps({"token_id": token_id}).encode("utf-8") + b"\n"
+        last_token_id = token_id
+
+        if token_id in eos_token_ids:
+            return
+
+        is_prefill = False
+
+
+async def _execute_generate_pipeline(
+    headers: dict[str, str], body_bytes: bytes
+) -> AsyncIterator[bytes]:
+    if model is None:
+        raise RuntimeError("Worker model is not ready")
+    if not is_first_stage:
+        raise RuntimeError("Only first-stage workers support /generate")
+
+    request_id = headers.get("x-request-id") or headers.get("X-Request-ID", "")
+    if not request_id:
+        raise ValueError("X-Request-ID is required")
+
+    max_tokens = int(headers.get("x-max-tokens") or headers.get("X-Max-Tokens", "128"))
+    eos_ids_raw = headers.get("x-eos-token-ids") or headers.get("X-Eos-Token-Ids", "")
+    eos_token_ids = {int(x) for x in eos_ids_raw.split(",") if x.strip()}
+
+    pipeline_header = headers.get("x-pipeline") or headers.get("X-Pipeline", "")
+    next_workers = [u.strip() for u in pipeline_header.split(",") if u.strip()]
+
+    tensors = safetensors_load(body_bytes)
+    input_ids = tensors.get("input_ids")
+    if input_ids is None:
+        raise ValueError("input_ids required for /generate")
+
+    async for chunk in _token_stream_generator(
+        request_id, max_tokens, eos_token_ids, next_workers, input_ids
+    ):
+        yield chunk
 
 
 @app.post("/generate")
@@ -953,122 +1152,7 @@ async def generate(request: Request):
     Drives the full prefill + decode loop, P2P-forwarding hidden states
     to downstream workers and streaming token IDs back to the gateway.
     """
-    if model is None:
-        raise HTTPException(status_code=503, detail="Worker model is not ready")
-    if not is_first_stage:
-        raise HTTPException(status_code=400, detail="Only first-stage workers support /generate")
-
-    request_id = request.headers.get("X-Request-ID")
-    if not request_id:
-        raise HTTPException(status_code=400, detail="X-Request-ID is required")
-
-    max_tokens = int(request.headers.get("X-Max-Tokens", "128"))
-    eos_ids_raw = request.headers.get("X-Eos-Token-Ids", "")
-    eos_token_ids = {int(x) for x in eos_ids_raw.split(",") if x.strip()}
-
-    # Downstream pipeline (workers after self)
-    pipeline_header = request.headers.get("X-Pipeline", "")
-    next_workers = [u.strip() for u in pipeline_header.split(",") if u.strip()]
-
-    # Parse input_ids from safetensors body
-    try:
-        tensors = safetensors_load(await request.body())
-    except Exception as error:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid safetensors payload: {error}",
-        ) from error
-
-    input_ids = tensors.get("input_ids")
-    if input_ids is None:
-        raise HTTPException(
-            status_code=400, detail="input_ids required for /generate"
-        )
-
-    async def _token_stream():
-        is_prefill = True
-        last_token_id = None
-
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(120.0, connect=10.0)
-        ) as client:
-            for _ in range(max_tokens):
-                step = "prefill" if is_prefill else "decode"
-
-                # Build input for this step
-                if is_prefill:
-                    step_input = input_ids
-                else:
-                    step_input = torch.tensor(
-                        [[last_token_id]], dtype=torch.long
-                    )
-
-                # Run this worker's layers
-                async with model_lock:
-                    result = await asyncio.to_thread(
-                        _run_forward,
-                        request_id,
-                        step,
-                        input_ids=step_input,
-                    )
-
-                # Solo worker (first + last): result is already a token_id
-                if is_last_stage:
-                    token_id = result
-                else:
-                    # P2P forward hidden states to downstream pipeline
-                    if not next_workers:
-                        yield json.dumps(
-                            {"error": "Non-last worker has no downstream pipeline"}
-                        ) + "\n"
-                        return
-
-                    binary_hidden, compression_headers = _serialize_hidden_states(result)
-                    next_url = next_workers[0]
-                    remaining = ",".join(next_workers[1:])
-
-                    try:
-                        response = await client.post(
-                            f"{next_url.rstrip('/')}/forward",
-                            headers={
-                                "X-Request-ID": request_id,
-                                "X-Step": step,
-                                "X-Pipeline": remaining,
-                                "Content-Type": "application/octet-stream",
-                                **compression_headers,
-                            },
-                            content=binary_hidden,
-                        )
-                        response.raise_for_status()
-                        token_id = int(response.json()["next_token_id"])
-                    except httpx.HTTPError as error:
-                        failed_url = None
-                        if isinstance(error, httpx.HTTPStatusError):
-                            failed_url = error.response.headers.get(
-                                "X-Kiwi-Failed-Node"
-                            )
-                        yield json.dumps({
-                            "error": f"Pipeline forwarding failed: {error}",
-                            "failed_node": (
-                                failed_url or next_url
-                            ).rstrip("/"),
-                        }) + "\n"
-                        return
-                    except (KeyError, TypeError, ValueError) as error:
-                        yield json.dumps({
-                            "error": f"Invalid downstream response: {error}",
-                        }) + "\n"
-                        return
-
-                yield json.dumps({"token_id": token_id}) + "\n"
-                last_token_id = token_id
-
-                if token_id in eos_token_ids:
-                    return
-
-                is_prefill = False
-
     return StreamingResponse(
-        _token_stream(),
+        _execute_generate_pipeline(dict(request.headers), await request.body()),
         media_type="application/x-ndjson",
     )
