@@ -252,10 +252,13 @@ class WorkerRegistry:
                 return existing
 
             # Node is brand new or was hard-evicted. 
-            # Force a fresh layer assignment based on current swarm bottlenecks.
-            model = self._pick_model(model_registry, registration.vram_gb)
-            model_id = model.model_id
-            layers = self._pick_layers(model, registration.vram_gb)
+            if registration.model_id and registration.layers:
+                model_id = registration.model_id
+                layers = (registration.layers[0], registration.layers[-1])
+            else:
+                model = self._pick_model(model_registry, registration.vram_gb)
+                model_id = model.model_id
+                layers = self._pick_layers(model, registration.vram_gb)
 
             worker = Worker(
                 node_name=registration.node_name,

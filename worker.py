@@ -543,9 +543,25 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
 
 async def _re_register() -> None:
     _, vram_gb = _detect_device()
+    
+    peer_id = ""
+    if P2P_TRANSPORT == "p2p" and transport is not None:
+        try:
+            peer_id = await transport.get_address()
+            # Dynamic re-discovery of new gateway bootstrap peers
+            new_bootstrap_peers = await _discover_bootstrap_peers()
+            for peer in new_bootstrap_peers:
+                try:
+                    await transport._p2p.connect_to_peer(peer)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     payload = {
         "node_name": NODE_NAME,
         "node_url": NODE_URL,
+        "peer_id": peer_id,
         "cpu_cores": os.cpu_count() or 1,
         "vram_gb": vram_gb,
         "model_id": assigned_model_id,
