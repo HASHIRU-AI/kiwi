@@ -408,11 +408,14 @@ async def _discover_bootstrap_peers() -> list[str]:
 
                 # Add visible addresses from gateway response
                 for maddr in visible_maddrs:
+                    # Do not pass circuit relay addresses as initial_peers, as this causes p2pd startup to fail
+                    if "/p2p-circuit/" in maddr or maddr.endswith("/p2p-circuit"):
+                        continue
                     if is_remote_gateway:
                         # Exclude private loopback/bridge addresses when connecting across WAN
                         if any(priv in maddr for priv in ["/ip4/127.0.0.1", "/ip4/172.", "/ip4/10.", "/ip4/192.168."]):
                             continue
-                        if "/dns/" in maddr and "/p2p-circuit" not in maddr and gw_host not in maddr:
+                        if "/dns/" in maddr and gw_host not in maddr:
                             continue
                     if maddr not in bootstrap_maddrs:
                         bootstrap_maddrs.append(maddr)
