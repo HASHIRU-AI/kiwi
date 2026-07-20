@@ -579,36 +579,44 @@ async def p2p_bootstrap() -> dict[str, object]:
         if public_maddr not in visible_maddrs:
             visible_maddrs.append(public_maddr)
 
+    debug_info = {"snapshot_len": 0, "processed": [], "errors": []}
     try:
         snapshot = await registry.snapshot()
+        debug_info["snapshot_len"] = len(snapshot)
         for w in snapshot:
-            w_peer_id = w.get("peer_id", "") if isinstance(w, dict) else getattr(w, "peer_id", "")
-            w_node_url = w.get("node_url", "") if isinstance(w, dict) else getattr(w, "node_url", "")
-            w_p2p_port = w.get("p2p_port", 4001) if isinstance(w, dict) else getattr(w, "p2p_port", 4001)
-            if not w_peer_id or not w_node_url:
-                continue
-            parsed = urlparse(w_node_url)
-            whost = parsed.hostname
-            if not whost:
-                continue
             try:
-                wip = ipaddress.ip_address(whost)
-                w_maddr = f"/ip6/{whost}/tcp/{w_p2p_port}/p2p/{w_peer_id}" if wip.version == 6 else f"/ip4/{whost}/tcp/{w_p2p_port}/p2p/{w_peer_id}"
-            except ValueError:
-                w_maddr = f"/dns/{whost}/tcp/{w_p2p_port}/p2p/{w_peer_id}"
-            if w_maddr not in visible_maddrs:
-                visible_maddrs.append(w_maddr)
-            if public_host:
-                relay_maddr = f"/ip4/{public_host}/tcp/{public_port}/p2p/{peer_id}/p2p-circuit/p2p/{w_peer_id}"
-                if relay_maddr not in visible_maddrs:
-                    visible_maddrs.append(relay_maddr)
+                w_peer_id = w.get("peer_id", "") if isinstance(w, dict) else getattr(w, "peer_id", "")
+                w_node_url = w.get("node_url", "") if isinstance(w, dict) else getattr(w, "node_url", "")
+                w_p2p_port = w.get("p2p_port", 4001) if isinstance(w, dict) else getattr(w, "p2p_port", 4001)
+                debug_info["processed"].append({"w_peer_id": w_peer_id, "w_node_url": w_node_url, "w_p2p_port": w_p2p_port})
+                if not w_peer_id or not w_node_url:
+                    continue
+                parsed = urlparse(w_node_url)
+                whost = parsed.hostname
+                if not whost:
+                    continue
+                try:
+                    wip = ipaddress.ip_address(whost)
+                    w_maddr = f"/ip6/{whost}/tcp/{w_p2p_port}/p2p/{w_peer_id}" if wip.version == 6 else f"/ip4/{whost}/tcp/{w_p2p_port}/p2p/{w_peer_id}"
+                except ValueError:
+                    w_maddr = f"/dns/{whost}/tcp/{w_p2p_port}/p2p/{w_peer_id}"
+                if w_maddr not in visible_maddrs:
+                    visible_maddrs.append(w_maddr)
+                if public_host:
+                    relay_maddr = f"/ip4/{public_host}/tcp/{public_port}/p2p/{peer_id}/p2p-circuit/p2p/{w_peer_id}"
+                    if relay_maddr not in visible_maddrs:
+                        visible_maddrs.append(relay_maddr)
+            except Exception as e_inner:
+                debug_info["errors"].append(f"inner: {e_inner}")
     except Exception as exc:
+        debug_info["errors"].append(f"outer: {exc}")
         print(f"[Gateway] Error during p2p_bootstrap worker discovery: {exc}", flush=True)
 
     return {
         "peer_id": peer_id,
         "p2p_port": P2P_PORT,
         "visible_maddrs": visible_maddrs,
+        "debug": debug_info,
     }
 
 
