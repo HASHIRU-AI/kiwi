@@ -280,7 +280,20 @@ class P2PTransport(KiwiTransport):
                 with suppress(Exception):
                     await writer.wait_closed()
 
-        return await asyncio.wait_for(_call(), timeout=timeout)
+        max_attempts = 5
+        backoff = 0.1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return await asyncio.wait_for(_call(), timeout=timeout)
+            except Exception as e:
+                if attempt == max_attempts:
+                    logger.error(f"[P2PTransport] send_forward to {target} failed after {max_attempts} attempts: {e}")
+                    raise
+                logger.warning(
+                    f"[P2PTransport] Attempt {attempt} failed forwarding to {target}: {e}. Retrying in {backoff}s..."
+                )
+                await asyncio.sleep(backoff)
+                backoff *= 2
 
     async def send_generate(
         self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 60.0
@@ -299,27 +312,46 @@ class P2PTransport(KiwiTransport):
             + payload
         )
 
-        _, reader, writer = await asyncio.wait_for(
-            self._p2p.call_binary_stream_handler(target_peer, "kiwi/generate/1.0"),
-            timeout=10.0,
-        )
+        max_attempts = 5
+        backoff = 0.1
+        reader, writer = None, None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                _, reader, writer = await asyncio.wait_for(
+                    self._p2p.call_binary_stream_handler(target_peer, "kiwi/generate/1.0"),
+                    timeout=10.0,
+                )
+                writer.write(framed_req)
+                await writer.drain()
+                break
+            except Exception as e:
+                if writer is not None:
+                    writer.close()
+                    with suppress(Exception):
+                        await writer.wait_closed()
+                if attempt == max_attempts:
+                    logger.error(f"[P2PTransport] send_generate to {target} failed to establish stream after {max_attempts} attempts: {e}")
+                    raise
+                logger.warning(
+                    f"[P2PTransport] Attempt {attempt} failed to establish generate stream to {target}: {e}. Retrying in {backoff}s..."
+                )
+                await asyncio.sleep(backoff)
+                backoff *= 2
 
         try:
-            writer.write(framed_req)
-            await writer.drain()
-
             while not reader.at_eof():
                 try:
                     line = await asyncio.wait_for(reader.readline(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    break
+                except asyncio.TimeoutError as exc:
+                    raise TimeoutError(f"Timed out reading from P2P stream to {target}") from exc
                 if not line:
                     break
                 yield line.strip()
         finally:
-            writer.close()
-            with suppress(Exception):
-                await writer.wait_closed()
+            if writer is not None:
+                writer.close()
+                with suppress(Exception):
+                    await writer.wait_closed()
 
     def set_forward_handler(
         self, handler: Callable[[dict[str, str], bytes], asyncio.Future[bytes] | bytes]
