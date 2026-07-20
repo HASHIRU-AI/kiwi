@@ -24,6 +24,9 @@ from transformers import AutoTokenizer
 from models import ModelConfig, ModelRegistry, load_model_registry
 from transport import KiwiTransport, create_transport
 
+from hivemind.p2p.p2p_daemon_bindings import PeerID
+from hivemind.utils.multiaddr.multiaddr import Multiaddr
+
 
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
 MAX_REROUTES = int(os.getenv("MAX_REROUTES", "4"))
@@ -626,9 +629,9 @@ async def _connect_to_worker_p2p(worker: Worker, p2p_port: int) -> None:
                 maddr = f"/ip4/{host}/tcp/{p2p_port}/p2p/{worker.peer_id}"
         except ValueError:
             maddr = f"/dns/{host}/tcp/{p2p_port}/p2p/{worker.peer_id}"
-        
+    
         print(f"[Gateway] Explicitly connecting to worker P2P address: {maddr}", flush=True)
-        await transport._p2p.connect_to_peer(maddr)
+        await transport._p2p._client.connect(PeerID.from_base58(worker.peer_id), [Multiaddr(maddr)])
         print(f"[Gateway] Successfully connected to worker {worker.node_name} via P2P", flush=True)
     except Exception as exc:
         print(f"[Gateway] Failed to explicitly connect to worker {worker.node_name} via P2P: {exc}", flush=True)
