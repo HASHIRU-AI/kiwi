@@ -211,14 +211,6 @@ class P2PTransport(KiwiTransport):
         
         host_maddrs = [f"/ip4/0.0.0.0/tcp/{self.listen_port}"]
         
-        filtered_peers = []
-        if self.initial_peers:
-            for p in self.initial_peers:
-                # If we have public/circuit-relay peers mixed with private/loopback, avoid hanging on loopback across WAN
-                if any(pub in p for p in self.initial_peers if "/p2p-circuit" in pub or not any(priv in pub for priv in ["/ip4/127.0.0.1", "/ip4/172.18.", "/ip4/172.16."])):
-                    pass
-                filtered_peers.append(p)
-        
         self._p2p = await P2P.create(
             initial_peers=self.initial_peers if self.initial_peers else None,
             host_maddrs=host_maddrs,
@@ -226,7 +218,7 @@ class P2PTransport(KiwiTransport):
             use_auto_relay=True,
             dht_mode="server",
             force_reachability="public" if self.relay_mode else "private",
-            startup_timeout=120.0,
+            startup_timeout=180.0,
         )
         self._peer_id = self._p2p.peer_id.to_base58()
         logger.info(f"[P2PTransport] P2P node started! PeerID: {self._peer_id}")
