@@ -129,10 +129,11 @@ class HttpTransport(KiwiTransport):
 
 
 async def _write_stream_chunked(writer: asyncio.StreamWriter, data: bytes, chunk_size: int = 32768) -> None:
-    """Write data in chunks with writer.drain() to prevent libp2p circuit relay window buffer overflows."""
+    """Write data in chunks with writer.drain() and micro-buffer to prevent libp2p Yamux window congestion."""
     for i in range(0, len(data), chunk_size):
         writer.write(data[i : i + chunk_size])
         await writer.drain()
+        await asyncio.sleep(0.005)
 
 
 async def _read_stream_chunked(reader: asyncio.StreamReader, total_len: int, chunk_size: int = 32768) -> bytes:
@@ -140,7 +141,9 @@ async def _read_stream_chunked(reader: asyncio.StreamReader, total_len: int, chu
     buffer = bytearray()
     remaining = total_len
     while remaining > 0:
-        chunk = await reader.readexactly(min(remaining, chunk_size))
+        chunk = await reader.read(min(remaining, chunk_size))
+        if not chunk:
+            raise asyncio.exceptions.IncompleteReadError(bytes(buffer), total_len)
         buffer.extend(chunk)
         remaining -= len(chunk)
     return bytes(buffer)
