@@ -439,13 +439,17 @@ async def _register() -> dict[str, Any]:
     _, vram_gb = _detect_device()
     peer_id = ""
     public_ip = get_public_ip()
+    print(f"[{NODE_NAME}] Public IP: {public_ip}", flush=True)
     visible_maddrs = [f"/ip4/{public_ip}/tcp/{P2P_PORT}/p2p/{await transport.get_address()}"]
     
     if transport and P2P_TRANSPORT == "p2p" and hasattr(transport, "_p2p"):
         try:
             peer_id = await transport.get_address()
             maddrs = await transport._p2p.get_visible_maddrs()
-            visible_maddrs = [str(m) for m in maddrs]
+            for m in maddrs:
+                m_str = str(m)
+                if m_str not in visible_maddrs:
+                    visible_maddrs.append(m_str) # APPEND, don't overwrite!
         except Exception:
             pass
 
@@ -557,16 +561,24 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
 
 async def _re_register() -> None:
     _, vram_gb = _detect_device()
-    peer_id = ""
-    public_ip = get_public_ip()
-    visible_maddrs = [f"/ip4/{public_ip}/tcp/{P2P_PORT}/p2p/{await transport.get_address()}"]
+    peer_id = await transport.get_address()
     
+    # 1. Fetch public IP using your new utility
+    public_ip = get_public_ip()
+    
+    # 2. Start with the verified public address
+    visible_maddrs = [f"/ip4/{public_ip}/tcp/{P2P_PORT}/p2p/{peer_id}"]
+    
+    # 3. Append discovered P2P addresses (do not overwrite)
     if P2P_TRANSPORT == "p2p" and transport is not None and hasattr(transport, "_p2p"):
         try:
-            peer_id = await transport.get_address()
             maddrs = await transport._p2p.get_visible_maddrs()
-            visible_maddrs = [str(m) for m in maddrs]
+            for m in maddrs:
+                m_str = str(m)
+                if m_str not in visible_maddrs:
+                    visible_maddrs.append(m_str)
             
+            # Proactively connect to discovered bootstrap peers
             new_bootstrap_peers = await _discover_bootstrap_peers()
             for peer in new_bootstrap_peers:
                 try:
@@ -585,7 +597,7 @@ async def _re_register() -> None:
         "vram_gb": vram_gb,
         "model_id": assigned_model_id,
         "layers": list(layer_range) if layer_range else None,
-        "visible_maddrs": visible_maddrs,
+        "visible_maddrs": visible_maddrs,  # Now contains both public and bridge IPs
     }
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -593,7 +605,6 @@ async def _re_register() -> None:
             response.raise_for_status()
     except httpx.HTTPError:
         pass
-
 
 async def _heartbeat_loop() -> None:
     """Ping the gateway periodically and proactively wire P2P connections to swarm peers."""
