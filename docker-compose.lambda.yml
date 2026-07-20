@@ -35,7 +35,7 @@ services:
       retries: 5
       start_period: 20s
 
-  worker_1:
+  worker-1:
     build:
       context: .
       target: worker
@@ -48,7 +48,7 @@ services:
       - "4002:4002"
     environment:
       NODE_NAME: lambda_worker_1
-      NODE_URL: http://worker_1:8000
+      NODE_URL: http://worker-1:8000
       GATEWAY_URL: http://gateway:8080
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4002"
@@ -75,7 +75,7 @@ services:
               count: 1
               capabilities: [ gpu ]
 
-  worker_2:
+  worker-2:
     image: kiwi-worker:latest
     container_name: harshil_worker_2_p2p
     init: true
@@ -85,7 +85,7 @@ services:
       - "4003:4003"
     environment:
       NODE_NAME: lambda_worker_2
-      NODE_URL: http://worker_2:8000
+      NODE_URL: http://worker-2:8000
       GATEWAY_URL: http://gateway:8080
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4003"

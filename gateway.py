@@ -669,8 +669,11 @@ async def _connect_to_worker_p2p(worker: Worker, p2p_port: int) -> None:
     
         print(f"[Gateway] Explicitly connecting to worker P2P address: {maddr}", flush=True)
         try:
-            await transport._p2p._client.connect(PeerID.from_base58(worker.peer_id), [Multiaddr(maddr)])
-            print(f"[Gateway] Successfully connected to worker {worker.node_name} via P2P", flush=True)
+            connected = await transport.connect_to_peer(maddr)
+            if connected:
+                print(f"[Gateway] Successfully connected to worker {worker.node_name} via P2P", flush=True)
+            else:
+                print(f"[Gateway] Failed to explicitly connect to worker {worker.node_name} via P2P", flush=True)
         except Exception as exc:
             print(f"[Gateway] Failed to explicitly connect to worker {worker.node_name} via P2P: {exc}", flush=True)
     except Exception as exc:

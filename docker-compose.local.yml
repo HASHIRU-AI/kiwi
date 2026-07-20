@@ -1,0 +1,41 @@
+services:
+  worker_3:
+    build:
+      context: .
+      target: worker
+    image: kiwi-worker:latest
+    container_name: harshil_worker_3_local_p2p
+    init: true
+    command: uvicorn worker:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8002:8000"
+      - "4004:4004"
+    environment:
+      NODE_NAME: harshil_local_india_worker
+      NODE_URL: http://harshil-local-india-worker:8000
+      # Points to your Lambda Labs instance public IP
+      GATEWAY_URL: "http://${LAMBDA_IP?Please_set_LAMBDA_IP_environment_variable}:8080"
+      KIWI_P2P_TRANSPORT: "p2p"
+      KIWI_P2P_PORT: "4004"
+      KIWI_RELAY_PEERS: ""
+      KIWI_USE_CSR: "false"
+      KIWI_USE_INT8: "true"
+      KIWI_LOSSLESS: "zstd"
+      GPU_MEMORY_RESERVE_MB: "512"
+      KIWI_VRAM_GB_OVERRIDE: "4.0"
+
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+      - ./worker.py:/app/worker.py
+      - ./models.py:/app/models.py
+      - ./transport.py:/app/transport.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+
+volumes:
+  hf_cache:

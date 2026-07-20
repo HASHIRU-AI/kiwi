@@ -205,6 +205,7 @@ class P2PTransport(KiwiTransport):
         self._peer_id = ""
         self._forward_handler: Callable | None = None
         self._generate_handler: Callable | None = None
+        self.known_peer_maddrs: dict[str, set[str]] = {}
 
     async def start(self) -> None:
         try:
@@ -257,8 +258,22 @@ class P2PTransport(KiwiTransport):
             peer_id_str = maddr_str.split("/p2p/")[-1].split("/")[0]
             if peer_id_str == self._peer_id:
                 return True
+            if peer_id_str not in self.known_peer_maddrs:
+                self.known_peer_maddrs[peer_id_str] = set()
+            self.known_peer_maddrs[peer_id_str].add(maddr_str)
+
+            # Strip target /p2p/<peer_id> from the end so go-libp2p protobuf parser doesn't throw length errors
+            clean_maddr_str = "/p2p/".join(maddr_str.split("/p2p/")[:-1]) if "/p2p/" in maddr_str else maddr_str
+            # Sanitize underscores in DNS hostnames to hyphens (avoids IDNA codepoint rejection)
+            if "/dns/" in clean_maddr_str:
+                parts = clean_maddr_str.split("/")
+                for idx, p in enumerate(parts):
+                    if idx > 0 and parts[idx - 1] == "dns":
+                        parts[idx] = p.replace("_", "-")
+                clean_maddr_str = "/".join(parts)
+
             peer_id = PeerID.from_base58(peer_id_str)
-            maddr = Multiaddr(maddr_str)
+            maddr = Multiaddr(clean_maddr_str)
             await self._p2p._client.connect(peer_id, [maddr])
             return True
         except Exception as exc:
@@ -358,6 +373,9 @@ class P2PTransport(KiwiTransport):
                 logger.warning(
                     f"[P2PTransport] Attempt {attempt} failed forwarding to {target}: {e}. Retrying in {backoff:.1f}s..."
                 )
+                for maddr_str in self.known_peer_maddrs.get(target, set()):
+                    with suppress(Exception):
+                        await self.connect_to_peer(maddr_str)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 1.5, 2.0)
 
@@ -400,6 +418,9 @@ class P2PTransport(KiwiTransport):
                 logger.warning(
                     f"[P2PTransport] Attempt {attempt} failed to establish generate stream to {target}: {e}. Retrying in {backoff:.1f}s..."
                 )
+                for maddr_str in self.known_peer_maddrs.get(target, set()):
+                    with suppress(Exception):
+                        await self.connect_to_peer(maddr_str)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 1.5, 2.0)
 
