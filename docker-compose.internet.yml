@@ -21,6 +21,9 @@ services:
       KIWI_P2P_PUBLIC_HOST: "4.tcp.us-cal-1.ngrok.io:26494"
     volumes:
       - hf_cache:/root/.cache/huggingface
+      - ./gateway.py:/app/gateway.py
+      - ./models.py:/app/models.py
+      - ./transport.py:/app/transport.py
     healthcheck:
       test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')" ]
       interval: 10s
@@ -55,6 +58,7 @@ services:
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./worker.py:/app/worker.py
+      - ./models.py:/app/models.py
       - ./transport.py:/app/transport.py
     depends_on:
       gateway:
@@ -91,6 +95,7 @@ services:
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./worker.py:/app/worker.py
+      - ./models.py:/app/models.py
       - ./transport.py:/app/transport.py
     depends_on:
       gateway:
