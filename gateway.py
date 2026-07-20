@@ -539,28 +539,26 @@ async def registry_view() -> dict[str, object]:
     return result
 
 
-async def _connect_to_worker_p2p(worker: Worker, p2p_port: int) -> None:
+async def _connect_to_worker_p2p(worker: Worker) -> None:
     try:
-        from urllib.parse import urlparse
-        import ipaddress
-        parsed = urlparse(worker.node_url)
-        host = parsed.hostname
-        if not host:
-            return
-        try:
-            ip = ipaddress.ip_address(host)
-            if ip.version == 6:
-                maddr = f"/ip6/{host}/tcp/{p2p_port}/p2p/{worker.peer_id}"
-            else:
-                maddr = f"/ip4/{host}/tcp/{p2p_port}/p2p/{worker.peer_id}"
-        except ValueError:
-            maddr = f"/dns/{host}/tcp/{p2p_port}/p2p/{worker.peer_id}"
+        # If the worker has no visible addresses, or if we haven't connected yet,
+        # we MUST force a manual DNS dial as a last resort.
+        hostname = worker.node_url.split("//")[-1].split(":")[0]
+        fallback_maddr = f"/dns/{hostname}/tcp/{worker.p2p_port}/p2p/{worker.peer_id}"
         
-        print(f"[Gateway] Explicitly connecting to worker P2P address: {maddr}", flush=True)
-        await transport._p2p.connect_to_peer(maddr)
-        print(f"[Gateway] Successfully connected to worker {worker.node_name} via P2P", flush=True)
+        # Combine verified addresses + manual fallback
+        maddrs = list(dict.fromkeys((worker.visible_maddrs or []) + [fallback_maddr]))
+        
+        if hasattr(transport, "connect_to_peer"):
+            for maddr in maddrs:
+                try:
+                    await transport.connect_to_peer(maddr)
+                    print(f"[Gateway] Successfully connected to {worker.node_name} via {maddr}", flush=True)
+                    return
+                except Exception:
+                    continue
     except Exception as exc:
-        print(f"[Gateway] Failed to explicitly connect to worker {worker.node_name} via P2P: {exc}", flush=True)
+        print(f"[Gateway] Failed to wire {worker.node_name}: {exc}", flush=True)
 
 
 @app.post("/register")
@@ -569,7 +567,7 @@ async def register_worker(registration: WorkerRegistration) -> JSONResponse:
         raise HTTPException(status_code=503, detail="Gateway not ready")
     worker = await registry.register(registration, model_registry)
     if P2P_TRANSPORT == "p2p" and transport is not None and worker.peer_id:
-        asyncio.create_task(_connect_to_worker_p2p(worker, registration.p2p_port))
+        asyncio.create_task(_connect_to_worker_p2p(worker))
     model = model_registry.resolve(worker.model_id)
     return JSONResponse(
         {

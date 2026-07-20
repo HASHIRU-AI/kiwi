@@ -330,6 +330,12 @@ class P2PTransport(KiwiTransport):
         self, handler: Callable[[dict[str, str], bytes], AsyncIterator[bytes]]
     ) -> None:
         self._generate_handler = handler
+    
+    async def connect_to_peer(self, maddr: str) -> None:
+        """Helper to safely dial a peer."""
+        if self._p2p is not None:
+            # The 'host' attribute holds the actual libp2p host instance
+            await self._p2p.host.connect(maddr)
 
 
 def create_transport(
