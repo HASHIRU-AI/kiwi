@@ -46,6 +46,7 @@ class WorkerRegistration(BaseModel):
     node_name: str
     node_url: str
     peer_id: str = ""
+    p2p_port: int = 4001
     cpu_cores: int = Field(ge=1)
     vram_gb: float = Field(ge=0)
     model_id: str | None = None
@@ -77,9 +78,11 @@ class Worker:
     cpu_cores: int
     vram_gb: float
     peer_id: str = ""
+    p2p_port: int = 4001
     healthy: bool = True
     registered_at: float = 0.0
     last_seen: float = 0.0
+    latency_ms: float = 0.0
 
 
 def _worker_address(w: Worker) -> str:
@@ -242,6 +245,7 @@ class WorkerRegistry:
                 # Node is still in memory (soft restart / IP change)
                 existing.node_url = registration.node_url
                 existing.peer_id = registration.peer_id or ""
+                existing.p2p_port = registration.p2p_port
                 existing.cpu_cores = registration.cpu_cores
                 existing.vram_gb = registration.vram_gb
                 existing.healthy = True
@@ -268,6 +272,7 @@ class WorkerRegistry:
                 cpu_cores=registration.cpu_cores,
                 vram_gb=registration.vram_gb,
                 peer_id=registration.peer_id or "",
+                p2p_port=registration.p2p_port,
                 registered_at=time.time(),
                 last_seen=time.time(),
             )
@@ -337,6 +342,7 @@ class WorkerRegistry:
                         "last_seen": round(time.time() - w.last_seen, 1),
                         "cpu_cores": w.cpu_cores,
                         "vram_gb": w.vram_gb,
+                        "latency_ms": round(w.latency_ms, 1),
                     }
                 )
             return result
@@ -358,12 +364,13 @@ class WorkerRegistry:
                 }
             return result
 
-    async def heartbeat(self, node_name: str) -> bool:
+    async def heartbeat(self, node_name: str, latency_ms: float = 0.0) -> bool:
         async with self._lock:
             worker = self._workers.get(node_name)
             if worker:
                 worker.last_seen = time.time()
                 worker.healthy = True
+                worker.latency_ms = latency_ms
                 return True
             return False
 
@@ -585,11 +592,37 @@ async def registry_view() -> dict[str, object]:
     return result
 
 
+async def _connect_to_worker_p2p(worker: Worker, p2p_port: int) -> None:
+    try:
+        from urllib.parse import urlparse
+        import ipaddress
+        parsed = urlparse(worker.node_url)
+        host = parsed.hostname
+        if not host:
+            return
+        try:
+            ip = ipaddress.ip_address(host)
+            if ip.version == 6:
+                maddr = f"/ip6/{host}/tcp/{p2p_port}/p2p/{worker.peer_id}"
+            else:
+                maddr = f"/ip4/{host}/tcp/{p2p_port}/p2p/{worker.peer_id}"
+        except ValueError:
+            maddr = f"/dns/{host}/tcp/{p2p_port}/p2p/{worker.peer_id}"
+        
+        logger.info(f"[Gateway] Explicitly connecting to worker P2P address: {maddr}")
+        await transport._p2p.connect_to_peer(maddr)
+        logger.info(f"[Gateway] Successfully connected to worker {worker.node_name} via P2P")
+    except Exception as exc:
+        logger.warning(f"[Gateway] Failed to explicitly connect to worker {worker.node_name} via P2P: {exc}")
+
+
 @app.post("/register")
 async def register_worker(registration: WorkerRegistration) -> JSONResponse:
     if not model_registry:
         raise HTTPException(status_code=503, detail="Gateway not ready")
     worker = await registry.register(registration, model_registry)
+    if P2P_TRANSPORT == "p2p" and transport is not None and worker.peer_id:
+        asyncio.create_task(_connect_to_worker_p2p(worker, registration.p2p_port))
     model = model_registry.resolve(worker.model_id)
     return JSONResponse(
         {
@@ -604,11 +637,12 @@ async def register_worker(registration: WorkerRegistration) -> JSONResponse:
 class HeartbeatRequest(BaseModel):
     node_name: str
     node_url: str
+    latency_ms: float = 0.0
 
 
 @app.post("/heartbeat")
 async def heartbeat(request: HeartbeatRequest) -> dict[str, str]:
-    exists = await registry.heartbeat(request.node_name)
+    exists = await registry.heartbeat(request.node_name, request.latency_ms)
     if not exists:
         raise HTTPException(status_code=404, detail="Worker not registered")
     return {"status": "ok"}

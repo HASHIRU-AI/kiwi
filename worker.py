@@ -441,6 +441,7 @@ async def _register() -> dict[str, Any]:
         "node_name": NODE_NAME,
         "node_url": NODE_URL,
         "peer_id": peer_id,
+        "p2p_port": P2P_PORT,
         "cpu_cores": os.cpu_count() or 1,
         "vram_gb": vram_gb,
     }
@@ -562,6 +563,7 @@ async def _re_register() -> None:
         "node_name": NODE_NAME,
         "node_url": NODE_URL,
         "peer_id": peer_id,
+        "p2p_port": P2P_PORT,
         "cpu_cores": os.cpu_count() or 1,
         "vram_gb": vram_gb,
         "model_id": assigned_model_id,
@@ -577,14 +579,21 @@ async def _re_register() -> None:
 
 async def _heartbeat_loop() -> None:
     """Ping the gateway periodically so it knows we're alive."""
+    latency_ms = 0.0
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
         try:
+            start_time = time.perf_counter()
             async with httpx.AsyncClient(timeout=3.0) as client:
                 response = await client.post(
                     f"{GATEWAY_URL}/heartbeat",
-                    json={"node_name": NODE_NAME, "node_url": NODE_URL},
+                    json={
+                        "node_name": NODE_NAME,
+                        "node_url": NODE_URL,
+                        "latency_ms": latency_ms,
+                    },
                 )
+                latency_ms = (time.perf_counter() - start_time) * 1000.0
                 if response.status_code == 404:
                     await _re_register()
         except httpx.HTTPError:
