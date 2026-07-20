@@ -381,13 +381,14 @@ def _place_model_on_device(loaded_model: Any, num_assigned_layers: int, total_la
 # ── Registration / lifecycle ────────────────────────────────────────────────────
 
 
-async def _discover_bootstrap_peers() -> list[str]:
+async def _discover_bootstrap_peers(quiet: bool = False) -> list[str]:
     """Query gateway via HTTP to dynamically discover P2P bootstrap peer multiaddresses."""
     if P2P_RELAY_PEERS:
         return [p.strip() for p in P2P_RELAY_PEERS.split(",") if p.strip()]
 
     # If no manual relay peers configured, fetch dynamically from gateway HTTP endpoint
-    print(f"[{NODE_NAME}] KIWI_RELAY_PEERS not configured. Discovering bootstrap peers from gateway...", flush=True)
+    if not quiet:
+        print(f"[{NODE_NAME}] KIWI_RELAY_PEERS not configured. Discovering bootstrap peers from gateway...", flush=True)
     bootstrap_maddrs = []
     
     # Retry loop since gateway might be booting up concurrently
@@ -406,7 +407,16 @@ async def _discover_bootstrap_peers() -> list[str]:
                 gw_host = parsed.hostname or ""
                 is_remote_gateway = gw_host not in ("127.0.0.1", "localhost", "gateway") and not gw_host.startswith(("172.", "10.", "192.168."))
 
-                # Add visible addresses from gateway response
+                # Feed all visible_maddrs into transport.known_peer_maddrs for future dials
+                if transport is not None and hasattr(transport, "known_peer_maddrs"):
+                    for maddr in visible_maddrs:
+                        if "/p2p/" in maddr:
+                            peer_id_str = maddr.split("/p2p/")[-1].split("/")[0]
+                            if peer_id_str not in transport.known_peer_maddrs:
+                                transport.known_peer_maddrs[peer_id_str] = set()
+                            transport.known_peer_maddrs[peer_id_str].add(maddr)
+
+                # Add visible addresses from gateway response to initial_peers
                 for maddr in visible_maddrs:
                     # Do not pass circuit relay addresses as initial_peers, as this causes p2pd startup to fail
                     if "/p2p-circuit/" in maddr or maddr.endswith("/p2p-circuit"):
@@ -438,7 +448,8 @@ async def _discover_bootstrap_peers() -> list[str]:
                     if maddr_construct not in bootstrap_maddrs:
                         bootstrap_maddrs.append(maddr_construct)
                 
-                print(f"[{NODE_NAME}] Discovered bootstrap peers: {bootstrap_maddrs}", flush=True)
+                if not quiet:
+                    print(f"[{NODE_NAME}] Discovered bootstrap peers: {bootstrap_maddrs}", flush=True)
                 return bootstrap_maddrs
         except Exception as exc:
             # Sleep and retry
@@ -563,7 +574,7 @@ async def _re_register() -> None:
         try:
             peer_id = await transport.get_address()
             # Dynamic re-discovery of new gateway bootstrap peers
-            new_bootstrap_peers = await _discover_bootstrap_peers()
+            new_bootstrap_peers = await _discover_bootstrap_peers(quiet=True)
             for peer in new_bootstrap_peers:
                 try:
                     await transport.connect_to_peer(peer)
@@ -610,9 +621,7 @@ async def _heartbeat_loop() -> None:
                 if response.status_code == 404:
                     await _re_register()
             if P2P_TRANSPORT == "p2p" and transport is not None:
-                for peer in await _discover_bootstrap_peers():
-                    with suppress(Exception):
-                        await transport.connect_to_peer(peer)
+                await _discover_bootstrap_peers(quiet=True)
         except Exception:
             pass  # Gateway may be temporarily unreachable; keep retrying.
 
