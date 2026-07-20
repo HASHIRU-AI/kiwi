@@ -596,6 +596,41 @@ async def _heartbeat_loop() -> None:
                 latency_ms = (time.perf_counter() - start_time) * 1000.0
                 if response.status_code == 404:
                     await _re_register()
+
+                # --- NEW FIX: Explicitly wire P2P connections to other workers ---
+                if P2P_TRANSPORT == "p2p" and transport is not None and hasattr(transport, "_p2p"):
+                    reg_resp = await client.get(f"{GATEWAY_URL}/registry")
+                    if reg_resp.status_code == 200:
+                        workers = reg_resp.json().get("workers", [])
+                        my_peer_id = await transport.get_address()
+                        
+                        for w in workers:
+                            peer_id = w.get("peer_id")
+                            if not peer_id or peer_id == my_peer_id:
+                                continue
+                            
+                            parsed = urlparse(w.get("node_url", ""))
+                            host = parsed.hostname
+                            if not host:
+                                continue
+                            
+                            p2p_port = w.get("p2p_port", 4001)
+                            try:
+                                ip = ipaddress.ip_address(host)
+                                if ip.version == 6:
+                                    maddr = f"/ip6/{host}/tcp/{p2p_port}/p2p/{peer_id}"
+                                else:
+                                    maddr = f"/ip4/{host}/tcp/{p2p_port}/p2p/{peer_id}"
+                            except ValueError:
+                                maddr = f"/dns/{host}/tcp/{p2p_port}/p2p/{peer_id}"
+                                
+                            try:
+                                # This forces the DHT to map the peer ID to the correct Docker DNS hostname
+                                await transport._p2p.connect_to_peer(maddr)
+                            except Exception:
+                                pass
+                # -----------------------------------------------------------------
+
         except httpx.HTTPError:
             pass  # Gateway may be temporarily unreachable; keep retrying.
 
