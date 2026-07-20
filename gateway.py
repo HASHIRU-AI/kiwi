@@ -38,7 +38,7 @@ P2P_PORT = int(os.getenv("KIWI_P2P_PORT", "4001"))
 transport: KiwiTransport | None = None
 
 # ── 2-Stage Eviction Thresholds ──
-HEARTBEAT_SOFT_STALE_SECONDS = float(os.getenv("HEARTBEAT_SOFT_STALE_SECONDS", "15"))
+HEARTBEAT_SOFT_STALE_SECONDS = float(os.getenv("HEARTBEAT_SOFT_STALE_SECONDS", "30"))
 HEARTBEAT_HARD_STALE_SECONDS = float(os.getenv("HEARTBEAT_HARD_STALE_SECONDS", "120"))
 
 

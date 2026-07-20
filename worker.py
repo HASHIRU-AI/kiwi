@@ -324,14 +324,14 @@ def _detect_device() -> tuple[str, float]:
     return "cpu", 0.0
 
 
-def _estimate_layer_memory_mb(loaded_model: Any, num_layers: int) -> float:
+def _estimate_layer_memory_mb(loaded_model: Any, total_layers: int = 0) -> float:
     """Estimate per-layer GPU memory (MB) from total model parameter size."""
     total_params = sum(p.numel() * p.element_size() for p in loaded_model.parameters())
     # Add ~20% overhead for CUDA context fragmentation.
-    return (total_params / num_layers * 1.2) / (1024 ** 2)
+    return (total_params / total_layers * 1.2) / (1024 ** 2)
 
 
-def _compute_gpu_layers(loaded_model: Any, num_assigned_layers: int) -> int:
+def _compute_gpu_layers(loaded_model: Any, num_assigned_layers: int, total_layers: int = 0) -> int:
     """Decide how many of the assigned layers fit in available VRAM."""
     if not torch.cuda.is_available():
         return 0
@@ -339,12 +339,12 @@ def _compute_gpu_layers(loaded_model: Any, num_assigned_layers: int) -> int:
     usable_mb = free_mem_mb - GPU_MEMORY_RESERVE_MB
     if usable_mb <= 0:
         return 0
-    per_layer_mb = _estimate_layer_memory_mb(loaded_model, num_assigned_layers)
+    per_layer_mb = _estimate_layer_memory_mb(loaded_model, total_layers)
     gpu_layers = int(usable_mb // per_layer_mb)
     return min(gpu_layers, num_assigned_layers)
 
 
-def _place_model_on_device(loaded_model: Any, num_assigned_layers: int) -> str:
+def _place_model_on_device(loaded_model: Any, num_assigned_layers: int, total_layers: int = 0) -> str:
     """Move the model (or a subset of its layers) onto the best available device.
 
     Returns the primary inference device string ("cuda" or "cpu").
@@ -352,7 +352,7 @@ def _place_model_on_device(loaded_model: Any, num_assigned_layers: int) -> str:
     if not torch.cuda.is_available():
         return "cpu"
 
-    gpu_layers = _compute_gpu_layers(loaded_model, num_assigned_layers)
+    gpu_layers = _compute_gpu_layers(loaded_model, num_assigned_layers, total_layers)
 
     if gpu_layers == 0:
         return "cpu"
@@ -492,7 +492,7 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
         loaded_model.model.embed_tokens = torch.nn.Identity()
 
     # ── Device placement ──
-    inference_device = _place_model_on_device(loaded_model, num_assigned)
+    inference_device = _place_model_on_device(loaded_model, num_assigned, total_layers)
     position = (
         "SOLO" if _is_first and _is_last else
         "FIRST" if _is_first else
