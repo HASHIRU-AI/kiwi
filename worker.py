@@ -402,8 +402,18 @@ async def _discover_bootstrap_peers() -> list[str]:
                 p2p_port = data["p2p_port"]
                 visible_maddrs = data.get("visible_maddrs", [])
                 
+                parsed = urlparse(GATEWAY_URL)
+                gw_host = parsed.hostname or ""
+                is_remote_gateway = gw_host not in ("127.0.0.1", "localhost", "gateway") and not gw_host.startswith(("172.", "10.", "192.168."))
+
                 # Add visible addresses from gateway response
                 for maddr in visible_maddrs:
+                    if is_remote_gateway:
+                        # Exclude private loopback/bridge addresses when connecting across WAN
+                        if any(priv in maddr for priv in ["/ip4/127.0.0.1", "/ip4/172.", "/ip4/10.", "/ip4/192.168."]):
+                            continue
+                        if "/dns/" in maddr and "/p2p-circuit" not in maddr and gw_host not in maddr:
+                            continue
                     if maddr not in bootstrap_maddrs:
                         bootstrap_maddrs.append(maddr)
                 
