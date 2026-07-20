@@ -441,6 +441,7 @@ async def _register() -> dict[str, Any]:
         "node_name": NODE_NAME,
         "node_url": NODE_URL,
         "peer_id": peer_id,
+        "p2p_port": P2P_PORT,
         "cpu_cores": os.cpu_count() or 1,
         "vram_gb": vram_gb,
     }
@@ -543,9 +544,26 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
 
 async def _re_register() -> None:
     _, vram_gb = _detect_device()
+    
+    peer_id = ""
+    if P2P_TRANSPORT == "p2p" and transport is not None:
+        try:
+            peer_id = await transport.get_address()
+            # Dynamic re-discovery of new gateway bootstrap peers
+            new_bootstrap_peers = await _discover_bootstrap_peers()
+            for peer in new_bootstrap_peers:
+                try:
+                    await transport._p2p.connect_to_peer(peer)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     payload = {
         "node_name": NODE_NAME,
         "node_url": NODE_URL,
+        "peer_id": peer_id,
+        "p2p_port": P2P_PORT,
         "cpu_cores": os.cpu_count() or 1,
         "vram_gb": vram_gb,
         "model_id": assigned_model_id,
@@ -561,14 +579,21 @@ async def _re_register() -> None:
 
 async def _heartbeat_loop() -> None:
     """Ping the gateway periodically so it knows we're alive."""
+    latency_ms = 0.0
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
         try:
+            start_time = time.perf_counter()
             async with httpx.AsyncClient(timeout=3.0) as client:
                 response = await client.post(
                     f"{GATEWAY_URL}/heartbeat",
-                    json={"node_name": NODE_NAME, "node_url": NODE_URL},
+                    json={
+                        "node_name": NODE_NAME,
+                        "node_url": NODE_URL,
+                        "latency_ms": latency_ms,
+                    },
                 )
+                latency_ms = (time.perf_counter() - start_time) * 1000.0
                 if response.status_code == 404:
                     await _re_register()
         except httpx.HTTPError:

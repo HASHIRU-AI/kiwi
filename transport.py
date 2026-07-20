@@ -46,12 +46,9 @@ class KiwiTransport(ABC):
 
     @abstractmethod
     async def send_forward(
-        self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 3.0
+        self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 30.0
     ) -> bytes:
-        """Send hidden state tensors to the target node's /forward endpoint.
-
-        Returns the response bytes from the target node.
-        """
+        """Send hidden state tensors to the target node's /forward endpoint..."""
 
     @abstractmethod
     async def send_generate(
@@ -96,7 +93,7 @@ class HttpTransport(KiwiTransport):
         return self._node_url
 
     async def send_forward(
-        self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 3.0
+        self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 30.0
     ) -> bytes:
         target_url = f"{target.rstrip('/')}/forward"
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -251,7 +248,7 @@ class P2PTransport(KiwiTransport):
                 await writer.wait_closed()
 
     async def send_forward(
-        self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 3.0
+        self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 30.0
     ) -> bytes:
         if self._p2p is None:
             raise RuntimeError("P2PTransport not started.")
