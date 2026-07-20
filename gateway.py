@@ -609,11 +609,11 @@ async def _connect_to_worker_p2p(worker: Worker, p2p_port: int) -> None:
         except ValueError:
             maddr = f"/dns/{host}/tcp/{p2p_port}/p2p/{worker.peer_id}"
         
-        logger.info(f"[Gateway] Explicitly connecting to worker P2P address: {maddr}")
+        print(f"[Gateway] Explicitly connecting to worker P2P address: {maddr}", flush=True)
         await transport._p2p.connect_to_peer(maddr)
-        logger.info(f"[Gateway] Successfully connected to worker {worker.node_name} via P2P")
+        print(f"[Gateway] Successfully connected to worker {worker.node_name} via P2P", flush=True)
     except Exception as exc:
-        logger.warning(f"[Gateway] Failed to explicitly connect to worker {worker.node_name} via P2P: {exc}")
+        print(f"[Gateway] Failed to explicitly connect to worker {worker.node_name} via P2P: {exc}", flush=True)
 
 
 @app.post("/register")
