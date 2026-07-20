@@ -128,8 +128,8 @@ class HttpTransport(KiwiTransport):
         self._generate_handler = handler
 
 
-async def _write_stream_chunked(writer: asyncio.StreamWriter, data: bytes, chunk_size: int = 32768) -> None:
-    """Write data in chunks with writer.drain() to prevent libp2p circuit relay window buffer overflows."""
+async def _write_stream_chunked(writer: asyncio.StreamWriter, data: bytes, chunk_size: int = 16384) -> None:
+    """Write data in chunks with writer.drain() and micro-pacing to prevent libp2p/Yamux flow-control window overflows across oceanic circuit relays."""
     total_len = len(data)
     chunks_count = (total_len + chunk_size - 1) // chunk_size if total_len > 0 else 1
     if total_len > chunk_size:
@@ -139,6 +139,8 @@ async def _write_stream_chunked(writer: asyncio.StreamWriter, data: bytes, chunk
         chunk = data[i : i + chunk_size]
         writer.write(chunk)
         await writer.drain()
+        if total_len > 32768:
+            await asyncio.sleep(0.005)  # 5ms micro-pacing gives Yamux window ACKs time to traverse trans-oceanic relays
         if total_len > chunk_size and (idx == 1 or idx == chunks_count or idx % 5 == 0):
             logger.info(f"[P2PTransport] [ChunkedWrite] Drained chunk {idx}/{chunks_count} ({len(chunk):,}B)...")
 
@@ -146,8 +148,8 @@ async def _write_stream_chunked(writer: asyncio.StreamWriter, data: bytes, chunk
         logger.info(f"[P2PTransport] [ChunkedWrite] Successfully streamed all {total_len:,} bytes across {chunks_count} chunks!")
 
 
-async def _read_stream_chunked(reader: asyncio.StreamReader, total_len: int, chunk_size: int = 32768) -> bytes:
-    """Read total_len bytes in chunks to prevent libp2p stream buffer starvation / timeouts."""
+async def _read_stream_chunked(reader: asyncio.StreamReader, total_len: int, chunk_size: int = 16384) -> bytes:
+    """Read total_len bytes flexibly in chunks to prevent libp2p stream buffer starvation / timeouts."""
     chunks_expected = (total_len + chunk_size - 1) // chunk_size if total_len > 0 else 1
     if total_len > chunk_size:
         logger.info(f"[P2PTransport] [ChunkedRead] Starting multi-chunk read of {total_len:,} bytes expecting ~{chunks_expected} chunks (chunk_size={chunk_size:,}B)...")
@@ -156,11 +158,13 @@ async def _read_stream_chunked(reader: asyncio.StreamReader, total_len: int, chu
     remaining = total_len
     chunks_read = 0
     while remaining > 0:
-        chunk = await reader.readexactly(min(remaining, chunk_size))
+        chunk = await reader.read(min(remaining, chunk_size))
+        if not chunk:
+            raise asyncio.exceptions.IncompleteReadError(bytes(buffer), total_len)
         buffer.extend(chunk)
         remaining -= len(chunk)
         chunks_read += 1
-        if total_len > chunk_size and (chunks_read == 1 or remaining == 0 or chunks_read % 5 == 0):
+        if total_len > chunk_size and (chunks_read == 1 or remaining == 0 or chunks_read % 10 == 0):
             logger.info(f"[P2PTransport] [ChunkedRead] Read chunk {chunks_read} ({len(chunk):,}B), remaining: {remaining:,}B")
 
     if total_len > chunk_size:
