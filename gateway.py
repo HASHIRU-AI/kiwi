@@ -478,6 +478,29 @@ async def health() -> dict[str, object]:
     }
 
 
+@app.get("/p2p/bootstrap")
+async def p2p_bootstrap() -> dict[str, object]:
+    if transport is None:
+        raise HTTPException(status_code=503, detail="Transport not initialized")
+    if P2P_TRANSPORT != "p2p":
+        raise HTTPException(status_code=400, detail="P2P transport is not enabled on this gateway")
+    
+    peer_id = await transport.get_address()
+    visible_maddrs = []
+    if hasattr(transport, "_p2p") and transport._p2p is not None:
+        try:
+            maddrs = await transport._p2p.get_visible_maddrs()
+            visible_maddrs = [str(maddr) for maddr in maddrs]
+        except Exception:
+            pass
+            
+    return {
+        "peer_id": peer_id,
+        "p2p_port": P2P_PORT,
+        "visible_maddrs": visible_maddrs,
+    }
+
+
 @app.get("/v1/models")
 async def list_models() -> dict[str, object]:
     """OpenAI-compatible model listing with readiness info."""

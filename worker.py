@@ -17,6 +17,8 @@ from safetensors.torch import load as safetensors_load
 from safetensors.torch import save as safetensors_save
 from transformers import AutoModelForCausalLM
 
+import ipaddress
+from urllib.parse import urlparse
 from transport import KiwiTransport, create_transport
 
 
@@ -379,6 +381,59 @@ def _place_model_on_device(loaded_model: Any, num_assigned_layers: int) -> str:
 # ── Registration / lifecycle ────────────────────────────────────────────────────
 
 
+async def _discover_bootstrap_peers() -> list[str]:
+    """Query gateway via HTTP to dynamically discover P2P bootstrap peer multiaddresses."""
+    if P2P_RELAY_PEERS:
+        return [p.strip() for p in P2P_RELAY_PEERS.split(",") if p.strip()]
+
+    # If no manual relay peers configured, fetch dynamically from gateway HTTP endpoint
+    print(f"[{NODE_NAME}] KIWI_RELAY_PEERS not configured. Discovering bootstrap peers from gateway...", flush=True)
+    bootstrap_maddrs = []
+    
+    # Retry loop since gateway might be booting up concurrently
+    for attempt in range(60):
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(f"{GATEWAY_URL}/p2p/bootstrap")
+                response.raise_for_status()
+                data = response.json()
+                
+                peer_id = data["peer_id"]
+                p2p_port = data["p2p_port"]
+                visible_maddrs = data.get("visible_maddrs", [])
+                
+                # Add visible addresses from gateway response
+                for maddr in visible_maddrs:
+                    if maddr not in bootstrap_maddrs:
+                        bootstrap_maddrs.append(maddr)
+                
+                # Construct address from GATEWAY_URL host
+                parsed = urlparse(GATEWAY_URL)
+                if parsed.hostname:
+                    host = parsed.hostname
+                    # Check if host is IP address
+                    try:
+                        ip = ipaddress.ip_address(host)
+                        if ip.version == 6:
+                            maddr_construct = f"/ip6/{host}/tcp/{p2p_port}/p2p/{peer_id}"
+                        else:
+                            maddr_construct = f"/ip4/{host}/tcp/{p2p_port}/p2p/{peer_id}"
+                    except ValueError:
+                        # DNS name
+                        maddr_construct = f"/dns/{host}/tcp/{p2p_port}/p2p/{peer_id}"
+                    
+                    if maddr_construct not in bootstrap_maddrs:
+                        bootstrap_maddrs.append(maddr_construct)
+                
+                print(f"[{NODE_NAME}] Discovered bootstrap peers: {bootstrap_maddrs}", flush=True)
+                return bootstrap_maddrs
+        except Exception as exc:
+            # Sleep and retry
+            await asyncio.sleep(min(1 + attempt * 0.25, 5))
+            
+    raise RuntimeError(f"{NODE_NAME} failed to discover P2P bootstrap peers from gateway")
+
+
 async def _register() -> dict[str, Any]:
     _, vram_gb = _detect_device()
     peer_id = await transport.get_address() if transport and P2P_TRANSPORT == "p2p" else ""
@@ -552,10 +607,14 @@ async def lifespan(_: FastAPI):
     global assigned_model_id, assigned_dtype, layer_range
     global is_first_stage, is_last_stage, model, transport
 
+    initial_peers = []
+    if P2P_TRANSPORT == "p2p":
+        initial_peers = await _discover_bootstrap_peers()
+
     transport = create_transport(
         transport_type=P2P_TRANSPORT,
         node_url=NODE_URL,
-        initial_peers=[p.strip() for p in P2P_RELAY_PEERS.split(",") if p.strip()],
+        initial_peers=initial_peers,
         listen_port=P2P_PORT,
     )
     await transport.start()

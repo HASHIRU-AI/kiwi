@@ -41,11 +41,11 @@ services:
     environment:
       NODE_NAME: worker_1
       NODE_URL: http://worker_1:8000
-      GATEWAY_URL: http://gateway:8080
+      GATEWAY_URL: https://dexter-freckly-sinuately.ngrok-free.dev
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4002"
-      # Replace <GATEWAY_PEER_ID> with the PeerID printed by the gateway container on startup
-      KIWI_RELAY_PEERS: "/dns/gateway/tcp/4001/p2p/12D3KooWQwjXHTYVUQLc68RqBNt61NwDPZgiuFTn2Q2YJfzy679S"
+      # Automatically discovered from the gateway's HTTP endpoint if left blank
+      KIWI_RELAY_PEERS: ""
       KIWI_USE_CSR: "false"
       KIWI_USE_INT8: "true"
       KIWI_LOSSLESS: "zstd"
@@ -75,11 +75,11 @@ services:
     environment:
       NODE_NAME: worker_2
       NODE_URL: http://worker_2:8000
-      GATEWAY_URL: http://gateway:8080
+      GATEWAY_URL: https://dexter-freckly-sinuately.ngrok-free.dev
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4003"
-      # Replace <GATEWAY_PEER_ID> with the PeerID printed by the gateway container on startup
-      KIWI_RELAY_PEERS: "/dns/gateway/tcp/4001/p2p/12D3KooWQwjXHTYVUQLc68RqBNt61NwDPZgiuFTn2Q2YJfzy679S"
+      # Automatically discovered from the gateway's HTTP endpoint if left blank
+      KIWI_RELAY_PEERS: ""
       KIWI_USE_CSR: "false"
       KIWI_USE_INT8: "true"
       KIWI_LOSSLESS: "zstd"
