@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
 import random
@@ -12,6 +13,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Literal
+from urllib.parse import urlparse
 
 import httpx
 import torch
