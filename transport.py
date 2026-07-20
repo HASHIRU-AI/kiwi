@@ -311,8 +311,8 @@ class P2PTransport(KiwiTransport):
             while not reader.at_eof():
                 try:
                     line = await asyncio.wait_for(reader.readline(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    break
+                except asyncio.TimeoutError as exc:
+                    raise TimeoutError(f"Timed out reading from P2P stream to {target}") from exc
                 if not line:
                     break
                 yield line.strip()

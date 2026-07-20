@@ -854,6 +854,11 @@ async def _stream_completion(
             await registry.evict(first_addr)
             stream_ok = False
 
+        if stream_ok and (not generated_ids or generated_ids[-1] not in eos_set) and len(generated_ids) < request.max_tokens:
+            print(f"[gateway] Stream closed prematurely by {first_addr} before EOS/max_tokens, marking unhealthy and rerouting.", flush=True)
+            await registry.evict(first_addr)
+            stream_ok = False
+
         if stream_ok:
             break
 
