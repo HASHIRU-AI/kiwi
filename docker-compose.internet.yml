@@ -18,6 +18,7 @@ services:
       REQUEST_TIMEOUT_SECONDS: "120"
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4001"
+      KIWI_P2P_PUBLIC_HOST: "4.tcp.us-cal-1.ngrok.io:26494"
     volumes:
       - hf_cache:/root/.cache/huggingface
     healthcheck:
@@ -41,7 +42,7 @@ services:
     environment:
       NODE_NAME: worker_1
       NODE_URL: http://worker_1:8000
-      GATEWAY_URL: https://dexter-freckly-sinuately.ngrok-free.dev
+      GATEWAY_URL: https://1ecd-108-68-107-178.ngrok-free.app
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4002"
       # Automatically discovered from the gateway's HTTP endpoint if left blank
@@ -75,7 +76,7 @@ services:
     environment:
       NODE_NAME: worker_2
       NODE_URL: http://worker_2:8000
-      GATEWAY_URL: https://dexter-freckly-sinuately.ngrok-free.dev
+      GATEWAY_URL: https://1ecd-108-68-107-178.ngrok-free.app
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4003"
       # Automatically discovered from the gateway's HTTP endpoint if left blank

@@ -478,6 +478,27 @@ async def health() -> dict[str, object]:
     }
 
 
+import ipaddress
+
+
+_public_ip_cache: str | None = None
+
+
+async def _get_public_ip() -> str | None:
+    global _public_ip_cache
+    if _public_ip_cache:
+        return _public_ip_cache
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get("https://api.ipify.org")
+            if resp.status_code == 200:
+                _public_ip_cache = resp.text.strip()
+                return _public_ip_cache
+    except Exception:
+        pass
+    return None
+
+
 @app.get("/p2p/bootstrap")
 async def p2p_bootstrap() -> dict[str, object]:
     if transport is None:
@@ -493,6 +514,39 @@ async def p2p_bootstrap() -> dict[str, object]:
             visible_maddrs = [str(maddr) for maddr in maddrs]
         except Exception:
             pass
+            
+    # Add public host (explicit override or dynamic ipify lookup)
+    public_host = os.getenv("KIWI_P2P_PUBLIC_HOST", "").strip()
+    if public_host.startswith("https://"):
+        public_host = public_host[len("https://"):]
+    elif public_host.startswith("http://"):
+        public_host = public_host[len("http://"):]
+        
+    public_port = P2P_PORT
+    if ":" in public_host:
+        parts = public_host.split(":")
+        public_host = parts[0]
+        try:
+            public_port = int(parts[1])
+        except ValueError:
+            pass
+            
+    if not public_host:
+        public_host = await _get_public_ip() or ""
+        public_port = P2P_PORT
+        
+    if public_host:
+        try:
+            ip = ipaddress.ip_address(public_host)
+            if ip.version == 6:
+                public_maddr = f"/ip6/{public_host}/tcp/{public_port}/p2p/{peer_id}"
+            else:
+                public_maddr = f"/ip4/{public_host}/tcp/{public_port}/p2p/{peer_id}"
+        except ValueError:
+            public_maddr = f"/dns/{public_host}/tcp/{public_port}/p2p/{peer_id}"
+            
+        if public_maddr not in visible_maddrs:
+            visible_maddrs.append(public_maddr)
             
     return {
         "peer_id": peer_id,
