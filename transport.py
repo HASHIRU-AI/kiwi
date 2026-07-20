@@ -181,7 +181,6 @@ class P2PTransport(KiwiTransport):
             use_relay=True,
             use_auto_relay=True,
             dht_mode="server",
-            force_reachability="public" if self.relay_mode else "private",
         )
         if self.announce_maddrs:
             create_kwargs["announce_maddrs"] = self.announce_maddrs
