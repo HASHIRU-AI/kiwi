@@ -145,11 +145,16 @@ class P2PTransport(KiwiTransport):
     """P2P transport implementation wrapping hivemind.p2p libp2p streams."""
 
     def __init__(
-        self, initial_peers: list[str] | None = None, listen_port: int = 4001, relay_mode: bool = False
+        self,
+        initial_peers: list[str] | None = None,
+        listen_port: int = 4001,
+        relay_mode: bool = False,
+        announce_maddrs: list[str] | None = None,
     ) -> None:
         self.initial_peers = initial_peers or []
         self.listen_port = listen_port
         self.relay_mode = relay_mode
+        self.announce_maddrs = announce_maddrs
         self._p2p: Any | None = None
         self._peer_id = ""
         self._forward_handler: Callable | None = None
@@ -167,7 +172,10 @@ class P2PTransport(KiwiTransport):
         
         host_maddrs = [f"/ip4/0.0.0.0/tcp/{self.listen_port}"]
         
-        self._p2p = await P2P.create(
+        # announce_maddrs tells the libp2p daemon which addresses to advertise
+        # in the DHT.  Without this, Docker containers announce their bridge
+        # network IPs (172.18.x.x) which are unreachable from the internet.
+        create_kwargs: dict[str, Any] = dict(
             initial_peers=self.initial_peers if self.initial_peers else None,
             host_maddrs=host_maddrs,
             use_relay=True,
@@ -175,6 +183,12 @@ class P2PTransport(KiwiTransport):
             dht_mode="server",
             force_reachability="public" if self.relay_mode else "private",
         )
+        if self.announce_maddrs:
+            create_kwargs["announce_maddrs"] = self.announce_maddrs
+            logger.info(f"[P2PTransport] Announcing public addresses: {self.announce_maddrs}")
+            print(f"[P2PTransport] Announcing public addresses: {self.announce_maddrs}", flush=True)
+
+        self._p2p = await P2P.create(**create_kwargs)
         self._peer_id = self._p2p.peer_id.to_base58()
         logger.info(f"[P2PTransport] P2P node started! PeerID: {self._peer_id}")
         print(f"[P2PTransport] P2P node started! PeerID: {self._peer_id}", flush=True)
@@ -356,11 +370,15 @@ def create_transport(
     initial_peers: list[str] | None = None,
     listen_port: int = 4001,
     relay_mode: bool = False,
+    announce_maddrs: list[str] | None = None,
 ) -> KiwiTransport:
     """Factory function to instantiate the requested transport type."""
     t_type = transport_type.lower().strip()
     if t_type == "p2p":
         return P2PTransport(
-            initial_peers=initial_peers, listen_port=listen_port, relay_mode=relay_mode
+            initial_peers=initial_peers,
+            listen_port=listen_port,
+            relay_mode=relay_mode,
+            announce_maddrs=announce_maddrs,
         )
     return HttpTransport(node_url=node_url)

@@ -430,11 +430,17 @@ async def _get_tokenizer(model_id: str) -> AutoTokenizer:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global model_registry, transport
+    # Auto-detect public IP for DHT address announcements
+    public_ip = get_public_ip()
+    announce_maddrs = [f"/ip4/{public_ip}/tcp/{P2P_PORT}"]
+    print(f"[gateway] Public IP detected: {public_ip}", flush=True)
+
     transport = create_transport(
         transport_type=P2P_TRANSPORT,
         initial_peers=[],  # Gateway acts as the swarm bootstrap/relay point
         listen_port=P2P_PORT,
         relay_mode=True,
+        announce_maddrs=announce_maddrs if P2P_TRANSPORT == "p2p" else None,
     )
     await transport.start()
     if hasattr(transport, "get_peer_id") and transport.get_peer_id():

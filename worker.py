@@ -739,14 +739,20 @@ async def lifespan(_: FastAPI):
     global is_first_stage, is_last_stage, model, transport
 
     initial_peers = []
+    announce_maddrs = None
     if P2P_TRANSPORT == "p2p":
         initial_peers = await _discover_bootstrap_peers()
+        # Tell libp2p daemon to announce our public IP instead of Docker-internal addresses
+        public_ip = get_public_ip()
+        announce_maddrs = [f"/ip4/{public_ip}/tcp/{P2P_PORT}"]
+        print(f"[{NODE_NAME}] Public IP for DHT announcement: {public_ip}", flush=True)
 
     transport = create_transport(
         transport_type=P2P_TRANSPORT,
         node_url=NODE_URL,
         initial_peers=initial_peers,
         listen_port=P2P_PORT,
+        announce_maddrs=announce_maddrs,
     )
     await transport.start()
     transport.set_forward_handler(_execute_forward_pipeline)
