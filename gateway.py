@@ -103,7 +103,7 @@ class WorkerRegistry:
         return [
             w
             for key, w in self._workers.items()
-            if key == w.node_url
+            if key == w.node_name
             and w.healthy
             and (model_id is None or w.model_id == model_id)
         ]
@@ -268,7 +268,6 @@ class WorkerRegistry:
                 registered_at=time.time(),
                 last_seen=time.time(),
             )
-            self._workers[worker.node_url] = worker
             self._workers[registration.node_name] = worker
             if worker.peer_id:
                 self._workers[worker.peer_id] = worker
@@ -310,9 +309,9 @@ class WorkerRegistry:
                 target = max_end + 1
             return pipeline
 
-    async def evict(self, node_key: str) -> None:
+    async def evict(self, node_name: str) -> None:
         async with self._lock:
-            worker = self._workers.get(node_key.rstrip("/"))
+            worker = self._workers.get(node_name)
             if worker:
                 worker.healthy = False
 
@@ -321,9 +320,9 @@ class WorkerRegistry:
             seen: set[str] = set()
             result: list[dict[str, object]] = []
             for key, w in self._workers.items():
-                if w.node_url in seen:
+                if w.node_name in seen:
                     continue
-                seen.add(w.node_url)
+                seen.add(w.node_name)
                 result.append(
                     {
                         "node_name": w.node_name,
@@ -356,9 +355,9 @@ class WorkerRegistry:
                 }
             return result
 
-    async def heartbeat(self, node_url: str) -> bool:
+    async def heartbeat(self, node_name: str) -> bool:
         async with self._lock:
-            worker = self._workers.get(node_url.rstrip("/"))
+            worker = self._workers.get(node_name)
             if worker:
                 worker.last_seen = time.time()
                 worker.healthy = True
@@ -382,13 +381,13 @@ class WorkerRegistry:
                 # Check Stage 2: Hard Eviction first
                 if worker.last_seen < hard_cutoff:
                     keys_to_delete.append(key)
-                    if key == worker.node_url:
+                    if key == worker.node_name:
                         hard_evicted.append(worker.node_name)
                         
                 # Check Stage 1: Soft Eviction second
                 elif worker.healthy and worker.last_seen < soft_cutoff:
                     worker.healthy = False
-                    if key == worker.node_url:
+                    if key == worker.node_name:
                         soft_evicted.append(worker.node_name)
             
             # Execute hard deletions
@@ -606,7 +605,7 @@ class HeartbeatRequest(BaseModel):
 
 @app.post("/heartbeat")
 async def heartbeat(request: HeartbeatRequest) -> dict[str, str]:
-    exists = await registry.heartbeat(request.node_url)
+    exists = await registry.heartbeat(request.node_name)
     if not exists:
         raise HTTPException(status_code=404, detail="Worker not registered")
     return {"status": "ok"}
@@ -614,7 +613,7 @@ async def heartbeat(request: HeartbeatRequest) -> dict[str, str]:
 
 @app.post("/deregister")
 async def deregister(request: HeartbeatRequest) -> dict[str, str]:
-    await registry.evict(request.node_url)
+    await registry.evict(request.node_name)
     return {"status": "evicted"}
 
 
