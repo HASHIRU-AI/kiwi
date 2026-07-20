@@ -99,6 +99,19 @@ class WorkerRegistry:
         self._workers: dict[str, Worker] = {}
         self._lock = asyncio.Lock()
 
+    def _find_worker(self, identifier: str) -> Worker | None:
+        """Find a worker by node_name, node_url, or peer_id."""
+        if not identifier:
+            return None
+        cleaned = identifier.rstrip("/")
+        worker = self._workers.get(cleaned) or self._workers.get(identifier)
+        if worker:
+            return worker
+        for w in self._workers.values():
+            if cleaned in (w.node_name, w.node_url.rstrip("/"), w.peer_id):
+                return w
+        return None
+
     # ── Internal helpers (caller must hold lock) ─────────────────────────────
 
     def _healthy_workers(self, model_id: str | None = None) -> list[Worker]:
@@ -243,7 +256,7 @@ class WorkerRegistry:
             
             if existing:
                 # Node is still in memory (soft restart / IP change)
-                existing.node_url = registration.node_url
+                existing.node_url = registration.node_url.rstrip("/")
                 existing.peer_id = registration.peer_id or ""
                 existing.p2p_port = registration.p2p_port
                 existing.cpu_cores = registration.cpu_cores
@@ -251,8 +264,11 @@ class WorkerRegistry:
                 existing.healthy = True
                 existing.registered_at = time.time()
                 existing.last_seen = time.time()
+                self._workers[existing.node_name] = existing
                 if existing.peer_id:
                     self._workers[existing.peer_id] = existing
+                if existing.node_url:
+                    self._workers[existing.node_url] = existing
                 return existing
 
             # Node is brand new or was hard-evicted. 
@@ -276,9 +292,11 @@ class WorkerRegistry:
                 registered_at=time.time(),
                 last_seen=time.time(),
             )
-            self._workers[registration.node_name] = worker
+            self._workers[worker.node_name] = worker
             if worker.peer_id:
                 self._workers[worker.peer_id] = worker
+            if worker.node_url:
+                self._workers[worker.node_url] = worker
             return worker
 
     async def select_pipeline(
@@ -319,7 +337,7 @@ class WorkerRegistry:
 
     async def evict(self, node_name: str) -> None:
         async with self._lock:
-            worker = self._workers.get(node_name)
+            worker = self._find_worker(node_name)
             if worker:
                 worker.healthy = False
 
@@ -366,7 +384,7 @@ class WorkerRegistry:
 
     async def heartbeat(self, node_name: str, latency_ms: float = 0.0) -> bool:
         async with self._lock:
-            worker = self._workers.get(node_name)
+            worker = self._find_worker(node_name)
             if worker:
                 worker.last_seen = time.time()
                 worker.healthy = True
