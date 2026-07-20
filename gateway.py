@@ -51,6 +51,7 @@ class WorkerRegistration(BaseModel):
     vram_gb: float = Field(ge=0)
     model_id: str | None = None
     layers: list[int] | None = None
+    visible_maddrs: list[str] = Field(default_factory=list)
 
 
 class ChatMessage(BaseModel):

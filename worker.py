@@ -436,7 +436,18 @@ async def _discover_bootstrap_peers() -> list[str]:
 
 async def _register() -> dict[str, Any]:
     _, vram_gb = _detect_device()
-    peer_id = await transport.get_address() if transport and P2P_TRANSPORT == "p2p" else ""
+    peer_id = ""
+    visible_maddrs = []
+    
+    if transport and P2P_TRANSPORT == "p2p" and hasattr(transport, "_p2p"):
+        peer_id = await transport.get_address()
+        try:
+            # Let libp2p figure out our real internet addresses
+            maddrs = await transport._p2p.get_visible_maddrs()
+            visible_maddrs = [str(m) for m in maddrs]
+        except Exception:
+            pass
+
     payload = {
         "node_name": NODE_NAME,
         "node_url": NODE_URL,
@@ -444,6 +455,7 @@ async def _register() -> dict[str, Any]:
         "p2p_port": P2P_PORT,
         "cpu_cores": os.cpu_count() or 1,
         "vram_gb": vram_gb,
+        "visible_maddrs": visible_maddrs,
     }
     for attempt in range(60):
         try:
@@ -578,7 +590,7 @@ async def _re_register() -> None:
 
 
 async def _heartbeat_loop() -> None:
-    """Ping the gateway periodically so it knows we're alive."""
+    """Ping the gateway periodically and proactively wire P2P connections to swarm peers."""
     latency_ms = 0.0
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
@@ -597,7 +609,7 @@ async def _heartbeat_loop() -> None:
                 if response.status_code == 404:
                     await _re_register()
 
-                # --- NEW FIX: Explicitly wire P2P connections to other workers ---
+                # Explicitly wire P2P connections using verified multiaddresses from the registry
                 if P2P_TRANSPORT == "p2p" and transport is not None and hasattr(transport, "_p2p"):
                     reg_resp = await client.get(f"{GATEWAY_URL}/registry")
                     if reg_resp.status_code == 200:
@@ -606,31 +618,21 @@ async def _heartbeat_loop() -> None:
                         
                         for w in workers:
                             peer_id = w.get("peer_id")
+                            # Skip if this is me or if no P2P ID exists
                             if not peer_id or peer_id == my_peer_id:
                                 continue
                             
-                            parsed = urlparse(w.get("node_url", ""))
-                            host = parsed.hostname
-                            if not host:
-                                continue
-                            
-                            p2p_port = w.get("p2p_port", 4001)
-                            try:
-                                ip = ipaddress.ip_address(host)
-                                if ip.version == 6:
-                                    maddr = f"/ip6/{host}/tcp/{p2p_port}/p2p/{peer_id}"
-                                else:
-                                    maddr = f"/ip4/{host}/tcp/{p2p_port}/p2p/{peer_id}"
-                            except ValueError:
-                                maddr = f"/dns/{host}/tcp/{p2p_port}/p2p/{peer_id}"
-                                
-                            try:
-                                # This forces the DHT to map the peer ID to the correct Docker DNS hostname
-                                await transport._p2p.connect_to_peer(maddr)
-                            except Exception:
-                                pass
-                # -----------------------------------------------------------------
-
+                            # Use the verified visible_maddrs list collected during registration
+                            maddrs = w.get("visible_maddrs", [])
+                            for maddr in maddrs:
+                                try:
+                                    # Force the P2P transport to dial the verified public address
+                                    await transport._p2p.connect_to_peer(maddr)
+                                    # Once connected, we don't need to try other addresses for this peer
+                                    break
+                                except Exception:
+                                    continue
+                                    
         except httpx.HTTPError:
             pass  # Gateway may be temporarily unreachable; keep retrying.
 
