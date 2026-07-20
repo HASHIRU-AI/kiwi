@@ -24,6 +24,7 @@ services:
       - ./gateway.py:/app/gateway.py
       - ./models.py:/app/models.py
       - ./transport.py:/app/transport.py
+      - ./network_utils.py:/app/network_utils.py
     healthcheck:
       test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')" ]
       interval: 10s
@@ -60,6 +61,7 @@ services:
       - ./worker.py:/app/worker.py
       - ./models.py:/app/models.py
       - ./transport.py:/app/transport.py
+      - ./network_utils.py:/app/network_utils.py
     depends_on:
       gateway:
         condition: service_healthy
@@ -97,6 +99,7 @@ services:
       - ./worker.py:/app/worker.py
       - ./models.py:/app/models.py
       - ./transport.py:/app/transport.py
+      - ./network_utils.py:/app/network_utils.py
     depends_on:
       gateway:
         condition: service_healthy
