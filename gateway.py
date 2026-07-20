@@ -357,6 +357,7 @@ class WorkerRegistry:
                         "node_name": w.node_name,
                         "node_url": w.node_url,
                         "peer_id": w.peer_id,
+                        "p2p_port": w.p2p_port,
                         "model_id": w.model_id,
                         "layers": list(w.layers),
                         "healthy": w.healthy,
@@ -601,8 +602,8 @@ async def p2p_bootstrap() -> dict[str, object]:
                 relay_maddr = f"/ip4/{public_host}/tcp/{public_port}/p2p/{peer_id}/p2p-circuit/p2p/{w_peer_id}"
                 if relay_maddr not in visible_maddrs:
                     visible_maddrs.append(relay_maddr)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[Gateway] Error during p2p_bootstrap worker discovery: {exc}", flush=True)
 
     return {
         "peer_id": peer_id,
