@@ -128,15 +128,15 @@ class HttpTransport(KiwiTransport):
         self._generate_handler = handler
 
 
-async def _write_stream_chunked(writer: asyncio.StreamWriter, data: bytes, chunk_size: int = 32768) -> None:
+async def _write_stream_chunked(writer: asyncio.StreamWriter, data: bytes, chunk_size: int = 16384) -> None:
     """Write data in chunks with writer.drain() and micro-buffer to prevent libp2p Yamux window congestion."""
     for i in range(0, len(data), chunk_size):
         writer.write(data[i : i + chunk_size])
         await writer.drain()
-        await asyncio.sleep(0.005)
+        await asyncio.sleep(0.015)
 
 
-async def _read_stream_chunked(reader: asyncio.StreamReader, total_len: int, chunk_size: int = 32768) -> bytes:
+async def _read_stream_chunked(reader: asyncio.StreamReader, total_len: int, chunk_size: int = 16384) -> bytes:
     """Read total_len bytes in chunks to prevent libp2p stream buffer starvation / timeouts."""
     buffer = bytearray()
     remaining = total_len
@@ -151,12 +151,12 @@ async def _read_stream_chunked(reader: asyncio.StreamReader, total_len: int, chu
 
 async def _read_framed_request(reader: asyncio.StreamReader) -> tuple[dict[str, str], bytes]:
     """Read a framed request of [4B header_len][header_json][4B payload_len][payload]."""
-    header_len_bytes = await reader.readexactly(4)
+    header_len_bytes = await _read_stream_chunked(reader, 4)
     header_len = struct.unpack(">I", header_len_bytes)[0]
-    header_json_bytes = await reader.readexactly(header_len)
+    header_json_bytes = await _read_stream_chunked(reader, header_len)
     headers = json.loads(header_json_bytes.decode("utf-8"))
 
-    payload_len_bytes = await reader.readexactly(4)
+    payload_len_bytes = await _read_stream_chunked(reader, 4)
     payload_len = struct.unpack(">I", payload_len_bytes)[0]
     payload = await _read_stream_chunked(reader, payload_len)
     return headers, payload
@@ -290,7 +290,7 @@ class P2PTransport(KiwiTransport):
             try:
                 await _write_stream_chunked(writer, framed_req)
 
-                resp_len_bytes = await reader.readexactly(4)
+                resp_len_bytes = await _read_stream_chunked(reader, 4)
                 resp_len = struct.unpack(">I", resp_len_bytes)[0]
                 return await _read_stream_chunked(reader, resp_len)
             finally:
