@@ -578,7 +578,7 @@ async def _re_register() -> None:
 
 
 async def _heartbeat_loop() -> None:
-    """Ping the gateway periodically so it knows we're alive."""
+    """Ping the gateway periodically so it knows we're alive and refresh P2P mesh peers."""
     latency_ms = 0.0
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
@@ -596,6 +596,10 @@ async def _heartbeat_loop() -> None:
                 latency_ms = (time.perf_counter() - start_time) * 1000.0
                 if response.status_code == 404:
                     await _re_register()
+            if P2P_TRANSPORT == "p2p" and transport is not None:
+                for peer in await _discover_bootstrap_peers():
+                    with suppress(Exception):
+                        await transport._p2p.connect_to_peer(peer)
         except Exception:
             pass  # Gateway may be temporarily unreachable; keep retrying.
 
