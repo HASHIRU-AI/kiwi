@@ -128,6 +128,24 @@ class HttpTransport(KiwiTransport):
         self._generate_handler = handler
 
 
+async def _write_stream_chunked(writer: asyncio.StreamWriter, data: bytes, chunk_size: int = 32768) -> None:
+    """Write data in chunks with writer.drain() to prevent libp2p circuit relay window buffer overflows."""
+    for i in range(0, len(data), chunk_size):
+        writer.write(data[i : i + chunk_size])
+        await writer.drain()
+
+
+async def _read_stream_chunked(reader: asyncio.StreamReader, total_len: int, chunk_size: int = 32768) -> bytes:
+    """Read total_len bytes in chunks to prevent libp2p stream buffer starvation / timeouts."""
+    buffer = bytearray()
+    remaining = total_len
+    while remaining > 0:
+        chunk = await reader.readexactly(min(remaining, chunk_size))
+        buffer.extend(chunk)
+        remaining -= len(chunk)
+    return bytes(buffer)
+
+
 async def _read_framed_request(reader: asyncio.StreamReader) -> tuple[dict[str, str], bytes]:
     """Read a framed request of [4B header_len][header_json][4B payload_len][payload]."""
     header_len_bytes = await reader.readexactly(4)
@@ -137,7 +155,7 @@ async def _read_framed_request(reader: asyncio.StreamReader) -> tuple[dict[str, 
 
     payload_len_bytes = await reader.readexactly(4)
     payload_len = struct.unpack(">I", payload_len_bytes)[0]
-    payload = await reader.readexactly(payload_len)
+    payload = await _read_stream_chunked(reader, payload_len)
     return headers, payload
 
 
@@ -210,14 +228,12 @@ class P2PTransport(KiwiTransport):
             else:
                 response_bytes = response
 
-            writer.write(struct.pack(">I", len(response_bytes)) + response_bytes)
-            await writer.drain()
+            await _write_stream_chunked(writer, struct.pack(">I", len(response_bytes)) + response_bytes)
         except Exception as exc:
             logger.error(f"[P2PTransport] Error handling forward stream from {getattr(stream_info, 'peer_id', 'unknown')}: {exc}", exc_info=True)
             print(f"[P2PTransport] Error handling forward stream from {getattr(stream_info, 'peer_id', 'unknown')}: {exc}", flush=True)
             err_bytes = json.dumps({"error": str(exc)}).encode("utf-8")
-            writer.write(struct.pack(">I", len(err_bytes)) + err_bytes)
-            await writer.drain()
+            await _write_stream_chunked(writer, struct.pack(">I", len(err_bytes)) + err_bytes)
         finally:
             writer.close()
             with suppress(Exception):
@@ -269,12 +285,11 @@ class P2PTransport(KiwiTransport):
                 target_peer, "kiwi/forward/1.0"
             )
             try:
-                writer.write(framed_req)
-                await writer.drain()
+                await _write_stream_chunked(writer, framed_req)
 
                 resp_len_bytes = await reader.readexactly(4)
                 resp_len = struct.unpack(">I", resp_len_bytes)[0]
-                return await reader.readexactly(resp_len)
+                return await _read_stream_chunked(reader, resp_len)
             finally:
                 writer.close()
                 with suppress(Exception):
@@ -321,8 +336,7 @@ class P2PTransport(KiwiTransport):
                     self._p2p.call_binary_stream_handler(target_peer, "kiwi/generate/1.0"),
                     timeout=10.0,
                 )
-                writer.write(framed_req)
-                await writer.drain()
+                await _write_stream_chunked(writer, framed_req)
                 break
             except Exception as e:
                 if writer is not None:
