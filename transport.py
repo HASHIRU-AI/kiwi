@@ -262,8 +262,12 @@ class P2PTransport(KiwiTransport):
                 self.known_peer_maddrs[peer_id_str] = set()
             self.known_peer_maddrs[peer_id_str].add(maddr_str)
 
-            # Strip target /p2p/<peer_id> from the end so go-libp2p protobuf parser doesn't throw length errors
-            clean_maddr_str = "/p2p/".join(maddr_str.split("/p2p/")[:-1]) if "/p2p/" in maddr_str else maddr_str
+            # Strip target /p2p/<peer_id> from direct TCP addresses so go-libp2p protobuf parser doesn't throw length errors,
+            # but PRESERVE it for /p2p-circuit/ relay addresses since go-libp2p requires the target ID after /p2p-circuit to route across the relay.
+            if "/p2p-circuit/" in maddr_str or maddr_str.endswith("/p2p-circuit"):
+                clean_maddr_str = maddr_str
+            else:
+                clean_maddr_str = "/p2p/".join(maddr_str.split("/p2p/")[:-1]) if "/p2p/" in maddr_str else maddr_str
             # Sanitize underscores in DNS hostnames to hyphens (avoids IDNA codepoint rejection)
             if "/dns/" in clean_maddr_str:
                 parts = clean_maddr_str.split("/")
