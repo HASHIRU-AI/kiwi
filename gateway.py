@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator, Literal
-
+from network_utils import get_public_ip
 import httpx
 import torch
 from fastapi import FastAPI, HTTPException
@@ -493,25 +493,6 @@ async def health() -> dict[str, object]:
 
 import ipaddress
 
-
-_public_ip_cache: str | None = None
-
-
-async def _get_public_ip() -> str | None:
-    global _public_ip_cache
-    if _public_ip_cache:
-        return _public_ip_cache
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.get("https://api.ipify.org")
-            if resp.status_code == 200:
-                _public_ip_cache = resp.text.strip()
-                return _public_ip_cache
-    except Exception:
-        pass
-    return None
-
-
 @app.get("/p2p/bootstrap")
 async def p2p_bootstrap() -> dict[str, object]:
     if transport is None:
@@ -519,52 +500,14 @@ async def p2p_bootstrap() -> dict[str, object]:
     if P2P_TRANSPORT != "p2p":
         raise HTTPException(status_code=400, detail="P2P transport is not enabled on this gateway")
     
+    public_ip = get_public_ip()
     peer_id = await transport.get_address()
-    visible_maddrs = []
-    if hasattr(transport, "_p2p") and transport._p2p is not None:
-        try:
-            maddrs = await transport._p2p.get_visible_maddrs()
-            visible_maddrs = [str(maddr) for maddr in maddrs]
-        except Exception:
-            pass
-            
-    # Add public host (explicit override or dynamic ipify lookup)
-    public_host = os.getenv("KIWI_P2P_PUBLIC_HOST", "").strip()
-    if public_host.startswith("https://"):
-        public_host = public_host[len("https://"):]
-    elif public_host.startswith("http://"):
-        public_host = public_host[len("http://"):]
-        
-    public_port = P2P_PORT
-    if ":" in public_host:
-        parts = public_host.split(":")
-        public_host = parts[0]
-        try:
-            public_port = int(parts[1])
-        except ValueError:
-            pass
-            
-    if not public_host:
-        public_host = await _get_public_ip() or ""
-        public_port = P2P_PORT
-        
-    if public_host:
-        try:
-            ip = ipaddress.ip_address(public_host)
-            if ip.version == 6:
-                public_maddr = f"/ip6/{public_host}/tcp/{public_port}/p2p/{peer_id}"
-            else:
-                public_maddr = f"/ip4/{public_host}/tcp/{public_port}/p2p/{peer_id}"
-        except ValueError:
-            public_maddr = f"/dns/{public_host}/tcp/{public_port}/p2p/{peer_id}"
-            
-        if public_maddr not in visible_maddrs:
-            visible_maddrs.append(public_maddr)
-            
+    public_maddr = f"/ip4/{public_ip}/tcp/{P2P_PORT}/p2p/{peer_id}"
+    
     return {
         "peer_id": peer_id,
         "p2p_port": P2P_PORT,
-        "visible_maddrs": visible_maddrs,
+        "visible_maddrs": [public_maddr], # Distribute the verified public route
     }
 
 

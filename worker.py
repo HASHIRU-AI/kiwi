@@ -8,6 +8,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from typing import Any
+from network_utils import get_public_ip
 
 import httpx
 import torch
@@ -437,7 +438,8 @@ async def _discover_bootstrap_peers() -> list[str]:
 async def _register() -> dict[str, Any]:
     _, vram_gb = _detect_device()
     peer_id = ""
-    visible_maddrs = []
+    public_ip = get_public_ip()
+    visible_maddrs = [f"/ip4/{public_ip}/tcp/{P2P_PORT}/p2p/{await transport.get_address()}"]
     
     if transport and P2P_TRANSPORT == "p2p" and hasattr(transport, "_p2p"):
         try:
@@ -556,7 +558,8 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
 async def _re_register() -> None:
     _, vram_gb = _detect_device()
     peer_id = ""
-    visible_maddrs = []
+    public_ip = get_public_ip()
+    visible_maddrs = [f"/ip4/{public_ip}/tcp/{P2P_PORT}/p2p/{await transport.get_address()}"]
     
     if P2P_TRANSPORT == "p2p" and transport is not None and hasattr(transport, "_p2p"):
         try:
@@ -582,7 +585,7 @@ async def _re_register() -> None:
         "vram_gb": vram_gb,
         "model_id": assigned_model_id,
         "layers": list(layer_range) if layer_range else None,
-        "visible_maddrs": visible_maddrs,  # <--- SEND HERE
+        "visible_maddrs": visible_maddrs,
     }
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
