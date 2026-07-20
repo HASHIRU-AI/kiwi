@@ -302,12 +302,8 @@ class WorkerRegistry:
 
             pipeline: list[Worker] = []
             target = 0
-            i = 0
             while target < num_layers:
-                eligible: list[Worker] = []
-                while i < len(candidates) and candidates[i].layers[0] <= target:
-                    eligible.append(candidates[i])
-                    i += 1
+                eligible = [w for w in candidates if w.layers[0] <= target]
                 if not eligible:
                     raise RuntimeError(
                         f"Layer coverage gap at layer {target} for model {model_id}"

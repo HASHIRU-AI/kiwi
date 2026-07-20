@@ -340,7 +340,7 @@ def _compute_gpu_layers(loaded_model: Any, num_assigned_layers: int) -> int:
     usable_mb = free_mem_mb - GPU_MEMORY_RESERVE_MB
     if usable_mb <= 0:
         return 0
-    per_layer_mb = _estimate_layer_memory_mb(loaded_model, num_assigned_layers)
+    per_layer_mb = _estimate_layer_memory_mb(loaded_model, total_model_layers)
     gpu_layers = int(usable_mb // per_layer_mb)
     return min(gpu_layers, num_assigned_layers)
 
