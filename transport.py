@@ -129,24 +129,27 @@ class HttpTransport(KiwiTransport):
 
 
 async def _write_stream_chunked(writer: asyncio.StreamWriter, data: bytes, chunk_size: int = 16384) -> None:
-    """Write data in chunks with writer.drain() and micro-buffer to prevent libp2p Yamux window congestion."""
-    for i in range(0, len(data), chunk_size):
-        writer.write(data[i : i + chunk_size])
-        await writer.drain()
-        await asyncio.sleep(0.015)
+    """Write data directly without chunking."""
+    # for i in range(0, len(data), chunk_size):
+    #     writer.write(data[i : i + chunk_size])
+    #     await writer.drain()
+    #     await asyncio.sleep(0.015)
+    writer.write(data)
+    await writer.drain()
 
 
 async def _read_stream_chunked(reader: asyncio.StreamReader, total_len: int, chunk_size: int = 16384) -> bytes:
-    """Read total_len bytes in chunks to prevent libp2p stream buffer starvation / timeouts."""
-    buffer = bytearray()
-    remaining = total_len
-    while remaining > 0:
-        chunk = await reader.read(min(remaining, chunk_size))
-        if not chunk:
-            raise asyncio.exceptions.IncompleteReadError(bytes(buffer), total_len)
-        buffer.extend(chunk)
-        remaining -= len(chunk)
-    return bytes(buffer)
+    """Read total_len bytes directly without chunk loop."""
+    # buffer = bytearray()
+    # remaining = total_len
+    # while remaining > 0:
+    #     chunk = await reader.read(min(remaining, chunk_size))
+    #     if not chunk:
+    #         raise asyncio.exceptions.IncompleteReadError(bytes(buffer), total_len)
+    #     buffer.extend(chunk)
+    #     remaining -= len(chunk)
+    # return bytes(buffer)
+    return await reader.readexactly(total_len)
 
 
 async def _read_framed_request(reader: asyncio.StreamReader) -> tuple[dict[str, str], bytes]:
