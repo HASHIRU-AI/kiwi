@@ -48,7 +48,7 @@ services:
       - "4002:4002"
     environment:
       NODE_NAME: lambda_worker_1
-      NODE_URL: http://lambda_worker_1:8000
+      NODE_URL: http://worker_1:8000
       GATEWAY_URL: http://gateway:8080
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4002"
@@ -85,7 +85,7 @@ services:
       - "4003:4003"
     environment:
       NODE_NAME: lambda_worker_2
-      NODE_URL: http://lambda_worker_2:8000
+      NODE_URL: http://worker_2:8000
       GATEWAY_URL: http://gateway:8080
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4003"
