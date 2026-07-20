@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     transformers==4.48.3 \
     hivemind>=1.1.10
 
-COPY gateway.py models.py transport.py index.html ./
+COPY gateway.py models.py transport.py network_utils.py index.html ./
 
 EXPOSE 8080 4001
 CMD ["uvicorn", "gateway:app", "--host", "0.0.0.0", "--port", "8080"]
@@ -67,7 +67,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     lz4==4.3.3 \
     hivemind>=1.1.10
 
-COPY worker.py models.py transport.py ./
+COPY worker.py models.py transport.py network_utils.py ./
 
 EXPOSE 8000 4001
 CMD ["uvicorn", "worker:app", "--host", "0.0.0.0", "--port", "8000"]

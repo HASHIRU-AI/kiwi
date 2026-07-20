@@ -486,8 +486,30 @@ async def health() -> dict[str, object]:
         "models_loaded": len(model_registry.list_models()) if model_registry else 0,
     }
 
-
 import ipaddress
+import re
+
+_MADDR_IP4_RE = re.compile(r"/ip4/([^/]+)/")
+_MADDR_IP6_RE = re.compile(r"/ip6/([^/]+)/")
+
+
+def _is_public_maddr(maddr: str) -> bool:
+    """Return True if the multiaddr contains a publicly-routable IP."""
+    if "/p2p-circuit/" in maddr or maddr.startswith("/dns"):
+        return True
+    m4 = _MADDR_IP4_RE.search(maddr)
+    if m4:
+        try:
+            return ipaddress.ip_address(m4.group(1)).is_global
+        except ValueError:
+            return False
+    m6 = _MADDR_IP6_RE.search(maddr)
+    if m6:
+        try:
+            return ipaddress.ip_address(m6.group(1)).is_global
+        except ValueError:
+            return False
+    return True
 
 @app.get("/p2p/bootstrap")
 async def p2p_bootstrap() -> dict[str, object]:
@@ -537,13 +559,13 @@ async def registry_view() -> dict[str, object]:
 
 async def _connect_to_worker_p2p(worker: Worker) -> None:
     try:
-        # If the worker has no visible addresses, or if we haven't connected yet,
-        # we MUST force a manual DNS dial as a last resort.
+        # DNS fallback in case the worker has no visible addresses
         hostname = worker.node_url.split("//")[-1].split(":")[0]
         fallback_maddr = f"/dns/{hostname}/tcp/{worker.p2p_port}/p2p/{worker.peer_id}"
         
-        # Combine verified addresses + manual fallback
-        maddrs = list(dict.fromkeys((worker.visible_maddrs or []) + [fallback_maddr]))
+        # Combine verified addresses + fallback, then filter to public-only
+        raw_maddrs = list(dict.fromkeys((worker.visible_maddrs or []) + [fallback_maddr]))
+        maddrs = [m for m in raw_maddrs if _is_public_maddr(m)]
         
         if hasattr(transport, "connect_to_peer"):
             for maddr in maddrs:
@@ -553,6 +575,7 @@ async def _connect_to_worker_p2p(worker: Worker) -> None:
                     return
                 except Exception:
                     continue
+        print(f"[Gateway] Could not connect to {worker.node_name} via any of {maddrs}", flush=True)
     except Exception as exc:
         print(f"[Gateway] Failed to wire {worker.node_name}: {exc}", flush=True)
 

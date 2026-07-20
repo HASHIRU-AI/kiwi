@@ -332,10 +332,22 @@ class P2PTransport(KiwiTransport):
         self._generate_handler = handler
     
     async def connect_to_peer(self, maddr: str) -> None:
-        """Helper to safely dial a peer."""
-        if self._p2p is not None:
-            # The 'host' attribute holds the actual libp2p host instance
-            await self._p2p.host.connect(maddr)
+        """Dial a peer by multiaddr string using hivemind's p2pd client."""
+        if self._p2p is None:
+            raise RuntimeError("P2PTransport not started.")
+
+        from multiaddr import Multiaddr
+
+        parsed = Multiaddr(maddr)
+        try:
+            await asyncio.wait_for(
+                self._p2p._client.connect(parsed.to_bytes()),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            raise ConnectionError(f"Timed out connecting to {maddr}")
+        except Exception as exc:
+            raise ConnectionError(f"Failed to connect to {maddr}: {exc}") from exc
 
 
 def create_transport(

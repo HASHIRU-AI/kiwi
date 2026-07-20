@@ -19,8 +19,48 @@ from safetensors.torch import save as safetensors_save
 from transformers import AutoModelForCausalLM
 
 import ipaddress
+import re
 from urllib.parse import urlparse
 from transport import KiwiTransport, create_transport
+
+
+# ── Multiaddr filtering ─────────────────────────────────────────────────────────
+
+_MADDR_IP4_RE = re.compile(r"/ip4/([^/]+)/")
+_MADDR_IP6_RE = re.compile(r"/ip6/([^/]+)/")
+
+PEER_DIAL_COOLDOWN_SECONDS = float(os.getenv("KIWI_PEER_DIAL_COOLDOWN", "60"))
+
+
+def _is_public_maddr(maddr: str) -> bool:
+    """Return True if the multiaddr contains a publicly-routable IP.
+
+    Filters out Docker bridge IPs (172.17-31.x.x, 10.x.x.x, 192.168.x.x),
+    link-local addresses, and loopback.  Relay-circuit addresses and DNS
+    addresses are always allowed through.
+    """
+    # Relay-circuit and DNS addresses are fine
+    if "/p2p-circuit/" in maddr or maddr.startswith("/dns"):
+        return True
+
+    m4 = _MADDR_IP4_RE.search(maddr)
+    if m4:
+        try:
+            ip = ipaddress.ip_address(m4.group(1))
+            return ip.is_global
+        except ValueError:
+            return False
+
+    m6 = _MADDR_IP6_RE.search(maddr)
+    if m6:
+        try:
+            ip = ipaddress.ip_address(m6.group(1))
+            return ip.is_global
+        except ValueError:
+            return False
+
+    # Unknown format — let it through rather than silently dropping
+    return True
 
 
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://gateway:8080").rstrip("/")
@@ -448,10 +488,12 @@ async def _register() -> dict[str, Any]:
             maddrs = await transport._p2p.get_visible_maddrs()
             for m in maddrs:
                 m_str = str(m)
-                if m_str not in visible_maddrs:
-                    visible_maddrs.append(m_str) # APPEND, don't overwrite!
+                # Only advertise publicly-routable addresses (filter Docker bridge IPs)
+                if m_str not in visible_maddrs and _is_public_maddr(m_str):
+                    visible_maddrs.append(m_str)
         except Exception:
             pass
+    print(f"[{NODE_NAME}] Advertising maddrs: {visible_maddrs}", flush=True)
 
     payload = {
         "node_name": NODE_NAME,
@@ -569,22 +611,14 @@ async def _re_register() -> None:
     # 2. Start with the verified public address
     visible_maddrs = [f"/ip4/{public_ip}/tcp/{P2P_PORT}/p2p/{peer_id}"]
     
-    # 3. Append discovered P2P addresses (do not overwrite)
+    # 3. Append only publicly-routable discovered addresses
     if P2P_TRANSPORT == "p2p" and transport is not None and hasattr(transport, "_p2p"):
         try:
             maddrs = await transport._p2p.get_visible_maddrs()
             for m in maddrs:
                 m_str = str(m)
-                if m_str not in visible_maddrs:
+                if m_str not in visible_maddrs and _is_public_maddr(m_str):
                     visible_maddrs.append(m_str)
-            
-            # Proactively connect to discovered bootstrap peers
-            new_bootstrap_peers = await _discover_bootstrap_peers()
-            for peer in new_bootstrap_peers:
-                try:
-                    await transport._p2p.connect_to_peer(peer)
-                except Exception:
-                    pass
         except Exception:
             pass
 
@@ -597,7 +631,7 @@ async def _re_register() -> None:
         "vram_gb": vram_gb,
         "model_id": assigned_model_id,
         "layers": list(layer_range) if layer_range else None,
-        "visible_maddrs": visible_maddrs,  # Now contains both public and bridge IPs
+        "visible_maddrs": visible_maddrs,
     }
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -607,8 +641,12 @@ async def _re_register() -> None:
         pass
 
 async def _heartbeat_loop() -> None:
-    """Ping the gateway periodically and proactively wire P2P connections to swarm peers."""
+    """Ping the gateway periodically and wire new P2P peer connections on discovery."""
     latency_ms = 0.0
+    # Track peers we've already connected to (or recently failed to connect to)
+    _connected_peers: set[str] = set()
+    _dial_cooldowns: dict[str, float] = {}  # peer_id -> timestamp of last attempt
+
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
         try:
@@ -626,30 +664,44 @@ async def _heartbeat_loop() -> None:
                 if response.status_code == 404:
                     await _re_register()
 
-                # Explicitly wire P2P connections using verified multiaddresses from the registry
+                # Only attempt P2P wiring for *newly discovered* peers
                 if P2P_TRANSPORT == "p2p" and transport is not None and hasattr(transport, "_p2p"):
                     reg_resp = await client.get(f"{GATEWAY_URL}/registry")
                     if reg_resp.status_code == 200:
                         workers = reg_resp.json().get("workers", [])
                         my_peer_id = await transport.get_address()
-                        
+                        now = time.time()
+
                         for w in workers:
                             peer_id = w.get("peer_id")
-                            # Skip if this is me or if no P2P ID exists
                             if not peer_id or peer_id == my_peer_id:
                                 continue
-                            
-                            # Use the verified visible_maddrs list collected during registration
-                            maddrs = w.get("visible_maddrs", [])
+
+                            # Skip if already connected
+                            if peer_id in _connected_peers:
+                                continue
+
+                            # Skip if we recently tried and failed (cooldown)
+                            last_attempt = _dial_cooldowns.get(peer_id, 0.0)
+                            if now - last_attempt < PEER_DIAL_COOLDOWN_SECONDS:
+                                continue
+
+                            # Filter to only public addresses before dialing
+                            maddrs = [m for m in w.get("visible_maddrs", []) if _is_public_maddr(m)]
+                            _dial_cooldowns[peer_id] = now
+                            connected = False
                             for maddr in maddrs:
                                 try:
-                                    # Force the P2P transport to dial the verified public address
-                                    await transport._p2p.connect_to_peer(maddr)
-                                    # Once connected, we don't need to try other addresses for this peer
+                                    await transport.connect_to_peer(maddr)
+                                    _connected_peers.add(peer_id)
+                                    connected = True
+                                    print(f"[{NODE_NAME}] Connected to peer {w.get('node_name', peer_id)} via {maddr}", flush=True)
                                     break
                                 except Exception:
                                     continue
-                                    
+                            if not connected:
+                                print(f"[{NODE_NAME}] Failed to dial {w.get('node_name', peer_id)}, will retry in {PEER_DIAL_COOLDOWN_SECONDS}s", flush=True)
+
         except httpx.HTTPError:
             pass  # Gateway may be temporarily unreachable; keep retrying.
 
