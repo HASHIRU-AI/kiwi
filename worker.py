@@ -563,7 +563,7 @@ async def _re_register() -> None:
             new_bootstrap_peers = await _discover_bootstrap_peers()
             for peer in new_bootstrap_peers:
                 try:
-                    await transport._p2p.connect_to_peer(peer)
+                    await transport.connect_to_peer(peer)
                 except Exception:
                     pass
         except Exception:
@@ -609,7 +609,7 @@ async def _heartbeat_loop() -> None:
             if P2P_TRANSPORT == "p2p" and transport is not None:
                 for peer in await _discover_bootstrap_peers():
                     with suppress(Exception):
-                        await transport._p2p.connect_to_peer(peer)
+                        await transport.connect_to_peer(peer)
         except Exception:
             pass  # Gateway may be temporarily unreachable; keep retrying.
 
@@ -665,7 +665,7 @@ async def lifespan(_: FastAPI):
         try:
             for peer in await _discover_bootstrap_peers():
                 with suppress(Exception):
-                    await transport._p2p.connect_to_peer(peer)
+                    await transport.connect_to_peer(peer)
         except Exception:
             pass
     assigned_model_id = assignment["model_id"]

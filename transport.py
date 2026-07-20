@@ -44,6 +44,10 @@ class KiwiTransport(ABC):
         P2P mode: returns libp2p PeerID (e.g. 'QmXyz...')
         """
 
+    async def connect_to_peer(self, maddr_str: str) -> bool:
+        """Explicitly connect or register a peer address into the transport pool."""
+        return True
+
     @abstractmethod
     async def send_forward(
         self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 30.0
@@ -91,6 +95,9 @@ class HttpTransport(KiwiTransport):
 
     async def get_address(self) -> str:
         return self._node_url
+
+    async def connect_to_peer(self, maddr_str: str) -> bool:
+        return True
 
     async def send_forward(
         self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 30.0
@@ -240,6 +247,23 @@ class P2PTransport(KiwiTransport):
 
     async def get_address(self) -> str:
         return self._peer_id
+
+    async def connect_to_peer(self, maddr_str: str) -> bool:
+        """Explicitly connect to a peer given its multiaddress string."""
+        if self._p2p is None or "/p2p/" not in maddr_str:
+            return False
+        try:
+            from hivemind.p2p.p2p_daemon_bindings.p2pclient import PeerID, Multiaddr
+            peer_id_str = maddr_str.split("/p2p/")[-1].split("/")[0]
+            if peer_id_str == self._peer_id:
+                return True
+            peer_id = PeerID.from_base58(peer_id_str)
+            maddr = Multiaddr(maddr_str)
+            await self._p2p._client.connect(peer_id, [maddr])
+            return True
+        except Exception as exc:
+            logger.debug(f"[P2PTransport] Could not explicitly connect to {maddr_str}: {exc}")
+            return False
 
     async def _handle_forward_stream(
         self, stream_info: Any, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
