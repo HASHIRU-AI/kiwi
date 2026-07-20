@@ -128,40 +128,82 @@ class HttpTransport(KiwiTransport):
         self._generate_handler = handler
 
 
-async def _write_stream_chunked(writer: asyncio.StreamWriter, data: bytes, chunk_size: int = 16384) -> None:
-    """Write data directly without chunking."""
-    # for i in range(0, len(data), chunk_size):
-    #     writer.write(data[i : i + chunk_size])
-    #     await writer.drain()
-    #     await asyncio.sleep(0.015)
-    writer.write(data)
-    await writer.drain()
+# ── ACK-based chunked stream protocol ─────────────────────────────────────────
+# Provides true end-to-end flow control through libp2p circuit relays.
+# The sender writes data in 32KB chunks and waits for a 1-byte ACK from the
+# receiver after each chunk, preventing the relay's ~64KB buffer from overflowing.
+
+_ACK = b"\x06"
+_CHUNK_SIZE = 32768  # 32KB — safely under the 64KB circuit relay window
 
 
-async def _read_stream_chunked(reader: asyncio.StreamReader, total_len: int, chunk_size: int = 16384) -> bytes:
-    """Read total_len bytes directly without chunk loop."""
-    # buffer = bytearray()
-    # remaining = total_len
-    # while remaining > 0:
-    #     chunk = await reader.read(min(remaining, chunk_size))
-    #     if not chunk:
-    #         raise asyncio.exceptions.IncompleteReadError(bytes(buffer), total_len)
-    #     buffer.extend(chunk)
-    #     remaining -= len(chunk)
-    # return bytes(buffer)
-    return await reader.readexactly(total_len)
+async def _write_acked(
+    writer: asyncio.StreamWriter,
+    reader: asyncio.StreamReader,
+    data: bytes,
+    chunk_size: int = _CHUNK_SIZE,
+) -> None:
+    """Write *data* in chunks, waiting for a 1-byte ACK after each chunk."""
+    offset = 0
+    total = len(data)
+    while offset < total:
+        end = min(offset + chunk_size, total)
+        writer.write(data[offset:end])
+        await writer.drain()
+        ack = await asyncio.wait_for(reader.readexactly(1), timeout=60.0)
+        if ack != _ACK:
+            raise RuntimeError(f"Expected ACK 0x06, got {ack!r}")
+        offset = end
 
 
-async def _read_framed_request(reader: asyncio.StreamReader) -> tuple[dict[str, str], bytes]:
-    """Read a framed request of [4B header_len][header_json][4B payload_len][payload]."""
-    header_len_bytes = await _read_stream_chunked(reader, 4)
-    header_len = struct.unpack(">I", header_len_bytes)[0]
-    header_json_bytes = await _read_stream_chunked(reader, header_len)
+async def _read_acked(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    total_len: int,
+    chunk_size: int = _CHUNK_SIZE,
+) -> bytes:
+    """Read *total_len* bytes in chunks, sending a 1-byte ACK after each chunk."""
+    buffer = bytearray()
+    while len(buffer) < total_len:
+        to_read = min(chunk_size, total_len - len(buffer))
+        chunk = await asyncio.wait_for(reader.readexactly(to_read), timeout=60.0)
+        buffer.extend(chunk)
+        writer.write(_ACK)
+        await writer.drain()
+    return bytes(buffer)
+
+
+async def _write_framed_request(
+    writer: asyncio.StreamWriter,
+    reader: asyncio.StreamReader,
+    headers: dict[str, str],
+    payload: bytes,
+) -> None:
+    """Write a framed request [4B header_len][header_json][4B payload_len][payload] with ACKs."""
+    header_bytes = json.dumps(headers).encode("utf-8")
+    # Header length + header body (small — typically < 1 KB)
+    await _write_acked(writer, reader, struct.pack(">I", len(header_bytes)) + header_bytes)
+    # Payload length prefix
+    await _write_acked(writer, reader, struct.pack(">I", len(payload)))
+    # Payload body (potentially large — up to several MB)
+    if payload:
+        await _write_acked(writer, reader, payload)
+
+
+async def _read_framed_request(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> tuple[dict[str, str], bytes]:
+    """Read a framed request [4B header_len][header_json][4B payload_len][payload] with ACKs."""
+    # Header length + header body
+    header_block = await _read_acked(reader, writer, 4)
+    header_len = struct.unpack(">I", header_block)[0]
+    header_json_bytes = await _read_acked(reader, writer, header_len)
     headers = json.loads(header_json_bytes.decode("utf-8"))
-
-    payload_len_bytes = await _read_stream_chunked(reader, 4)
+    # Payload length prefix
+    payload_len_bytes = await _read_acked(reader, writer, 4)
     payload_len = struct.unpack(">I", payload_len_bytes)[0]
-    payload = await _read_stream_chunked(reader, payload_len)
+    # Payload body
+    payload = await _read_acked(reader, writer, payload_len) if payload_len else b""
     return headers, payload
 
 
@@ -169,11 +211,16 @@ class P2PTransport(KiwiTransport):
     """P2P transport implementation wrapping hivemind.p2p libp2p streams."""
 
     def __init__(
-        self, initial_peers: list[str] | None = None, listen_port: int = 4001, relay_mode: bool = False
+        self,
+        initial_peers: list[str] | None = None,
+        listen_port: int = 4001,
+        relay_mode: bool = False,
+        announce_maddrs: list[str] | None = None,
     ) -> None:
         self.initial_peers = initial_peers or []
         self.listen_port = listen_port
         self.relay_mode = relay_mode
+        self.announce_maddrs = announce_maddrs
         self._p2p: Any | None = None
         self._peer_id = ""
         self._forward_handler: Callable | None = None
@@ -191,7 +238,7 @@ class P2PTransport(KiwiTransport):
         
         host_maddrs = [f"/ip4/0.0.0.0/tcp/{self.listen_port}"]
         
-        self._p2p = await P2P.create(
+        create_kwargs = dict(
             initial_peers=self.initial_peers if self.initial_peers else None,
             host_maddrs=host_maddrs,
             use_relay=True,
@@ -199,6 +246,10 @@ class P2PTransport(KiwiTransport):
             dht_mode="server",
             force_reachability="public" if self.relay_mode else "private",
         )
+        if self.announce_maddrs:
+            create_kwargs["announce_maddrs"] = self.announce_maddrs
+            print(f"[P2PTransport] Announcing public addresses: {self.announce_maddrs}", flush=True)
+        self._p2p = await P2P.create(**create_kwargs)
         self._peer_id = self._p2p.peer_id.to_base58()
         logger.info(f"[P2PTransport] P2P node started! PeerID: {self._peer_id}")
         print(f"[P2PTransport] P2P node started! PeerID: {self._peer_id}", flush=True)
@@ -224,7 +275,7 @@ class P2PTransport(KiwiTransport):
         self, stream_info: Any, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         try:
-            headers, payload = await _read_framed_request(reader)
+            headers, payload = await _read_framed_request(reader, writer)
             if not self._forward_handler:
                 raise RuntimeError("No forward handler set on P2PTransport")
 
@@ -234,12 +285,18 @@ class P2PTransport(KiwiTransport):
             else:
                 response_bytes = response
 
-            await _write_stream_chunked(writer, struct.pack(">I", len(response_bytes)) + response_bytes)
+            # Send response length + body with ACKs
+            await _write_acked(writer, reader, struct.pack(">I", len(response_bytes)))
+            await _write_acked(writer, reader, response_bytes)
         except Exception as exc:
             logger.error(f"[P2PTransport] Error handling forward stream from {getattr(stream_info, 'peer_id', 'unknown')}: {exc}", exc_info=True)
             print(f"[P2PTransport] Error handling forward stream from {getattr(stream_info, 'peer_id', 'unknown')}: {exc}", flush=True)
-            err_bytes = json.dumps({"error": str(exc)}).encode("utf-8")
-            await _write_stream_chunked(writer, struct.pack(">I", len(err_bytes)) + err_bytes)
+            try:
+                err_bytes = json.dumps({"error": str(exc)}).encode("utf-8")
+                await _write_acked(writer, reader, struct.pack(">I", len(err_bytes)))
+                await _write_acked(writer, reader, err_bytes)
+            except Exception:
+                pass  # Best-effort error response; caller will timeout and retry
         finally:
             writer.close()
             with suppress(Exception):
@@ -249,7 +306,7 @@ class P2PTransport(KiwiTransport):
         self, stream_info: Any, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         try:
-            headers, payload = await _read_framed_request(reader)
+            headers, payload = await _read_framed_request(reader, writer)
             if not self._generate_handler:
                 raise RuntimeError("No generate handler set on P2PTransport")
 
@@ -270,7 +327,7 @@ class P2PTransport(KiwiTransport):
                 await writer.wait_closed()
 
     async def send_forward(
-        self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 30.0
+        self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 120.0
     ) -> bytes:
         if self._p2p is None:
             raise RuntimeError("P2PTransport not started.")
@@ -278,24 +335,18 @@ class P2PTransport(KiwiTransport):
         from hivemind.p2p.p2p_daemon_bindings import PeerID
 
         target_peer = PeerID.from_base58(target)
-        header_bytes = json.dumps(headers).encode("utf-8")
-        framed_req = (
-            struct.pack(">I", len(header_bytes))
-            + header_bytes
-            + struct.pack(">I", len(payload))
-            + payload
-        )
 
         async def _call() -> bytes:
             _, reader, writer = await self._p2p.call_binary_stream_handler(
                 target_peer, "kiwi/forward/1.0"
             )
             try:
-                await _write_stream_chunked(writer, framed_req)
-
-                resp_len_bytes = await _read_stream_chunked(reader, 4)
+                # Send request with ACK-based flow control
+                await _write_framed_request(writer, reader, headers, payload)
+                # Read response with ACK-based flow control
+                resp_len_bytes = await _read_acked(reader, writer, 4)
                 resp_len = struct.unpack(">I", resp_len_bytes)[0]
-                return await _read_stream_chunked(reader, resp_len)
+                return await _read_acked(reader, writer, resp_len)
             finally:
                 writer.close()
                 with suppress(Exception):
@@ -325,13 +376,6 @@ class P2PTransport(KiwiTransport):
         from hivemind.p2p.p2p_daemon_bindings import PeerID
 
         target_peer = PeerID.from_base58(target)
-        header_bytes = json.dumps(headers).encode("utf-8")
-        framed_req = (
-            struct.pack(">I", len(header_bytes))
-            + header_bytes
-            + struct.pack(">I", len(payload))
-            + payload
-        )
 
         max_attempts = 5
         backoff = 0.1
@@ -342,7 +386,8 @@ class P2PTransport(KiwiTransport):
                     self._p2p.call_binary_stream_handler(target_peer, "kiwi/generate/1.0"),
                     timeout=10.0,
                 )
-                await _write_stream_chunked(writer, framed_req)
+                # Send request with ACK-based flow control
+                await _write_framed_request(writer, reader, headers, payload)
                 break
             except Exception as e:
                 if writer is not None:
@@ -390,11 +435,15 @@ def create_transport(
     initial_peers: list[str] | None = None,
     listen_port: int = 4001,
     relay_mode: bool = False,
+    announce_maddrs: list[str] | None = None,
 ) -> KiwiTransport:
     """Factory function to instantiate the requested transport type."""
     t_type = transport_type.lower().strip()
     if t_type == "p2p":
         return P2PTransport(
-            initial_peers=initial_peers, listen_port=listen_port, relay_mode=relay_mode
+            initial_peers=initial_peers,
+            listen_port=listen_port,
+            relay_mode=relay_mode,
+            announce_maddrs=announce_maddrs,
         )
     return HttpTransport(node_url=node_url)

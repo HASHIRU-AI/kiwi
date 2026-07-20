@@ -636,11 +636,25 @@ async def lifespan(_: FastAPI):
     if P2P_TRANSPORT == "p2p":
         initial_peers = await _discover_bootstrap_peers()
 
+    # Compute announce_maddrs for direct P2P connections (bypass circuit relay)
+    announce_maddrs = None
+    if P2P_TRANSPORT == "p2p":
+        public_host = os.getenv("KIWI_P2P_PUBLIC_HOST", "").strip()
+        if not public_host and GATEWAY_URL:
+            from urllib.parse import urlparse as _urlparse
+            _parsed = _urlparse(GATEWAY_URL)
+            if _parsed.hostname and _parsed.hostname not in ("gateway", "localhost", "127.0.0.1", "0.0.0.0"):
+                public_host = _parsed.hostname
+        if public_host:
+            announce_maddrs = [f"/ip4/{public_host}/tcp/{P2P_PORT}"]
+            print(f"[{NODE_NAME}] Will announce public address: {announce_maddrs}", flush=True)
+
     transport = create_transport(
         transport_type=P2P_TRANSPORT,
         node_url=NODE_URL,
         initial_peers=initial_peers,
         listen_port=P2P_PORT,
+        announce_maddrs=announce_maddrs,
     )
     await transport.start()
     transport.set_forward_handler(_execute_forward_pipeline)
