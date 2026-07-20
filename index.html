@@ -62,29 +62,10 @@
     let isGenerating = false;
     let activeNodes = null;
 
-    function resizeCanvas() {
-      const parent = topoCanvas.parentElement;
-      if (parent && !parent.classList.contains('hidden')) {
-        const rect = parent.getBoundingClientRect();
-        topoCanvas.width = Math.max(640, rect.width - 24);
-      }
-    }
-
     toggleTopo.addEventListener('click', () => {
       topoVisible = !topoVisible;
       topoPanel.classList.toggle('hidden', !topoVisible);
       toggleTopo.textContent = topoVisible ? 'Hide Topology' : 'Topology';
-      if (topoVisible) {
-        resizeCanvas();
-        drawTopo();
-      }
-    });
-
-    window.addEventListener('resize', () => {
-      if (topoVisible) {
-        resizeCanvas();
-        drawTopo();
-      }
     });
 
     function drawRoundedRect(x, y, w, h, r) {
@@ -113,6 +94,19 @@
       }
 
       const gwX = W / 2, gwY = 30;
+      const nodeW = 130, nodeH = 58, nodeR = 10;
+
+      // Gateway node
+      drawRoundedRect(gwX - nodeW / 2, gwY - 18, nodeW, 36, 8);
+      ctx.fillStyle = '#1e293b';
+      ctx.fill();
+      ctx.strokeStyle = '#a3e635';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = '#a3e635';
+      ctx.font = 'bold 13px system-ui';
+      ctx.textAlign = 'center';
+      ctx.fillText('Gateway', gwX, gwY + 5);
 
       // Group workers by model
       const models = {};
@@ -135,44 +129,16 @@
         models[mid].forEach(w => allWorkers.push({ ...w, _modelId: mid }));
       });
 
-      const gap = 12;
-      const maxTotalWidth = W - 32;
-      let nodeW = 130;
-      if (allWorkers.length * nodeW + (allWorkers.length - 1) * gap > maxTotalWidth) {
-        nodeW = Math.max(65, (maxTotalWidth - (allWorkers.length - 1) * gap) / allWorkers.length);
-      }
-      const nodeH = 82, nodeR = 8;
-      const isCompact = nodeW < 120;
-
-      // Gateway node (keep fixed width of 120 so it looks clean)
-      drawRoundedRect(gwX - 120 / 2, gwY - 18, 120, 36, 8);
-      ctx.fillStyle = '#1e293b';
-      ctx.fill();
-      ctx.strokeStyle = '#a3e635';
-      ctx.lineWidth = 2;
-      ctx.stroke();
-      ctx.fillStyle = '#a3e635';
-      ctx.font = 'bold 13px system-ui';
-      ctx.textAlign = 'center';
-      ctx.fillText('Gateway', gwX, gwY + 5);
-
-      const totalWidth = allWorkers.length * nodeW + (allWorkers.length - 1) * gap;
+      const totalWidth = allWorkers.length * nodeW + (allWorkers.length - 1) * 20;
       const startX = W / 2 - totalWidth / 2 + nodeW / 2;
 
       // Calculate coordinates first
       const coords = {};
       allWorkers.forEach((w, i) => {
-        const pt = {
-          x: startX + i * (nodeW + gap),
+        coords[w.node_url] = {
+          x: startX + i * (nodeW + 20),
           y: workerY
         };
-        coords[w.node_name] = pt; // Unique key by node_name to prevent overlap
-        if (w.node_url) {
-          coords[w.node_url] = pt;
-        }
-        if (w.peer_id) {
-          coords[w.peer_id] = pt;
-        }
       });
 
       // ── Draw Edges & Paths ──
@@ -187,8 +153,8 @@
           return idxA - idxB;
         });
         sortedKeys.forEach(k => {
-          const urlOrPeerId = activeNodes[k];
-          const pt = coords[urlOrPeerId];
+          const url = activeNodes[k];
+          const pt = coords[url];
           if (pt) pathPoints.push(pt);
         });
         pathPoints.push({ x: gwX, y: gwY + 18 });
@@ -196,8 +162,8 @@
 
       // 1. Draw idle/pool edges
       allWorkers.forEach(w => {
-        const pt = coords[w.node_name]; // Use node_name key
-        const isActive = activeSet.has(w.node_url) || (w.peer_id && activeSet.has(w.peer_id));
+        const pt = coords[w.node_url];
+        const isActive = activeSet.has(w.node_url);
         // Only draw radial gateway lines for workers that are not in the active pipeline
         if (!isGenerating || !isActive) {
           ctx.beginPath();
@@ -247,10 +213,10 @@
 
       // ── Draw Worker Nodes ──
       allWorkers.forEach((w, i) => {
-        const pt = coords[w.node_name]; // Use node_name key
+        const pt = coords[w.node_url];
         const x = pt.x;
         const y = pt.y;
-        const isActive = activeSet.has(w.node_url) || (w.peer_id && activeSet.has(w.peer_id));
+        const isActive = activeSet.has(w.node_url);
         const isDimmed = isGenerating && activeNodes && !isActive;
 
         // Node box styling based on state
@@ -313,27 +279,17 @@
 
         // Text
         ctx.fillStyle = mainTextColor;
-        ctx.font = isActive 
-          ? (isCompact ? 'bold 11px system-ui' : 'bold 13px system-ui') 
-          : (isCompact ? 'bold 10px system-ui' : 'bold 12px system-ui');
+        ctx.font = isActive ? 'bold 13px system-ui' : 'bold 12px system-ui';
         ctx.textAlign = 'center';
-        ctx.fillText(w.node_name, x, y - 20);
+        ctx.fillText(w.node_name, x, y - 12);
 
         ctx.fillStyle = subTextColor;
-        ctx.font = isCompact ? '9px system-ui' : '10px system-ui';
+        ctx.font = '10px system-ui';
         // Show model short name + layer range
         const shortModel = (w.model_id || '').split('/').pop() || '?';
-        ctx.fillText(`${shortModel}`, x, y - 6);
-        ctx.fillText(`L${w.layers[0]}-${w.layers[1]}`, x, y + 6);
-        
-        // Show hardware specs
-        const cpuText = w.cpu_cores ? `${w.cpu_cores}c` : '?c';
-        const vramText = w.vram_gb ? `${w.vram_gb.toFixed(0)}G` : '?G';
-        ctx.fillText(isCompact ? `HW: ${cpuText}/${vramText}` : `CPU: ${w.cpu_cores} Cores | VRAM: ${vramText}`, x, y + 18);
-        
-        // Show latency / staleness
-        const latencyText = w.latency_ms !== undefined && w.latency_ms > 0 ? `${w.latency_ms.toFixed(0)}ms` : '0ms';
-        ctx.fillText(w.healthy ? (isCompact ? `${latencyText} (${w.last_seen.toFixed(0)}s)` : `Ping: ${latencyText} (${w.last_seen.toFixed(0)}s ago)`) : 'EVICTED', x, y + 30);
+        ctx.fillText(`${shortModel}`, x, y + 2);
+        ctx.fillText(`L${w.layers[0]}-${w.layers[1]}`, x, y + 14);
+        ctx.fillText(w.healthy ? `${w.last_seen.toFixed(0)}s ago` : 'EVICTED', x, y + 26);
         ctx.globalAlpha = 1.0;
       });
 

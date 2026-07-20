@@ -46,9 +46,12 @@ class KiwiTransport(ABC):
 
     @abstractmethod
     async def send_forward(
-        self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 30.0
+        self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 3.0
     ) -> bytes:
-        """Send hidden state tensors to the target node's /forward endpoint..."""
+        """Send hidden state tensors to the target node's /forward endpoint.
+
+        Returns the response bytes from the target node.
+        """
 
     @abstractmethod
     async def send_generate(
@@ -93,7 +96,7 @@ class HttpTransport(KiwiTransport):
         return self._node_url
 
     async def send_forward(
-        self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 30.0
+        self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 3.0
     ) -> bytes:
         target_url = f"{target.rstrip('/')}/forward"
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -145,16 +148,11 @@ class P2PTransport(KiwiTransport):
     """P2P transport implementation wrapping hivemind.p2p libp2p streams."""
 
     def __init__(
-        self,
-        initial_peers: list[str] | None = None,
-        listen_port: int = 4001,
-        relay_mode: bool = False,
-        announce_maddrs: list[str] | None = None,
+        self, initial_peers: list[str] | None = None, listen_port: int = 4001, relay_mode: bool = False
     ) -> None:
         self.initial_peers = initial_peers or []
         self.listen_port = listen_port
         self.relay_mode = relay_mode
-        self.announce_maddrs = announce_maddrs
         self._p2p: Any | None = None
         self._peer_id = ""
         self._forward_handler: Callable | None = None
@@ -172,22 +170,14 @@ class P2PTransport(KiwiTransport):
         
         host_maddrs = [f"/ip4/0.0.0.0/tcp/{self.listen_port}"]
         
-        # announce_maddrs tells the libp2p daemon which addresses to advertise
-        # in the DHT.  Without this, Docker containers announce their bridge
-        # network IPs (172.18.x.x) which are unreachable from the internet.
-        create_kwargs: dict[str, Any] = dict(
+        self._p2p = await P2P.create(
             initial_peers=self.initial_peers if self.initial_peers else None,
             host_maddrs=host_maddrs,
             use_relay=True,
             use_auto_relay=True,
             dht_mode="server",
+            force_reachability="public" if self.relay_mode else "private",
         )
-        if self.announce_maddrs:
-            create_kwargs["announce_maddrs"] = self.announce_maddrs
-            logger.info(f"[P2PTransport] Announcing public addresses: {self.announce_maddrs}")
-            print(f"[P2PTransport] Announcing public addresses: {self.announce_maddrs}", flush=True)
-
-        self._p2p = await P2P.create(**create_kwargs)
         self._peer_id = self._p2p.peer_id.to_base58()
         logger.info(f"[P2PTransport] P2P node started! PeerID: {self._peer_id}")
         print(f"[P2PTransport] P2P node started! PeerID: {self._peer_id}", flush=True)
@@ -261,7 +251,7 @@ class P2PTransport(KiwiTransport):
                 await writer.wait_closed()
 
     async def send_forward(
-        self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 30.0
+        self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 3.0
     ) -> bytes:
         if self._p2p is None:
             raise RuntimeError("P2PTransport not started.")
@@ -343,24 +333,6 @@ class P2PTransport(KiwiTransport):
         self, handler: Callable[[dict[str, str], bytes], AsyncIterator[bytes]]
     ) -> None:
         self._generate_handler = handler
-    
-    async def connect_to_peer(self, maddr: str) -> None:
-        """Dial a peer by multiaddr string using hivemind's p2pd client."""
-        if self._p2p is None:
-            raise RuntimeError("P2PTransport not started.")
-
-        from multiaddr import Multiaddr
-
-        parsed = Multiaddr(maddr)
-        try:
-            await asyncio.wait_for(
-                self._p2p._client.connect(parsed.to_bytes()),
-                timeout=10.0,
-            )
-        except asyncio.TimeoutError:
-            raise ConnectionError(f"Timed out connecting to {maddr}")
-        except Exception as exc:
-            raise ConnectionError(f"Failed to connect to {maddr}: {exc}") from exc
 
 
 def create_transport(
@@ -369,15 +341,11 @@ def create_transport(
     initial_peers: list[str] | None = None,
     listen_port: int = 4001,
     relay_mode: bool = False,
-    announce_maddrs: list[str] | None = None,
 ) -> KiwiTransport:
     """Factory function to instantiate the requested transport type."""
     t_type = transport_type.lower().strip()
     if t_type == "p2p":
         return P2PTransport(
-            initial_peers=initial_peers,
-            listen_port=listen_port,
-            relay_mode=relay_mode,
-            announce_maddrs=announce_maddrs,
+            initial_peers=initial_peers, listen_port=listen_port, relay_mode=relay_mode
         )
     return HttpTransport(node_url=node_url)

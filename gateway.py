@@ -9,10 +9,10 @@ import random
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Literal
-from network_utils import get_public_ip
+
 import httpx
 import torch
 from fastapi import FastAPI, HTTPException
@@ -46,12 +46,10 @@ class WorkerRegistration(BaseModel):
     node_name: str
     node_url: str
     peer_id: str = ""
-    p2p_port: int = 4001
     cpu_cores: int = Field(ge=1)
     vram_gb: float = Field(ge=0)
     model_id: str | None = None
     layers: list[int] | None = None
-    visible_maddrs: list[str] = Field(default_factory=list)
 
 
 class ChatMessage(BaseModel):
@@ -79,12 +77,9 @@ class Worker:
     cpu_cores: int
     vram_gb: float
     peer_id: str = ""
-    p2p_port: int = 4001
-    visible_maddrs: list[str] = field(default_factory=list)
     healthy: bool = True
     registered_at: float = 0.0
     last_seen: float = 0.0
-    latency_ms: float = 0.0
 
 
 def _worker_address(w: Worker) -> str:
@@ -108,7 +103,7 @@ class WorkerRegistry:
         return [
             w
             for key, w in self._workers.items()
-            if key == w.node_name
+            if key == w.node_url
             and w.healthy
             and (model_id is None or w.model_id == model_id)
         ]
@@ -244,12 +239,11 @@ class WorkerRegistry:
             existing = self._workers.get(registration.node_name)
             
             if existing:
+                # Node is still in memory (soft restart / IP change)
                 existing.node_url = registration.node_url
                 existing.peer_id = registration.peer_id or ""
-                existing.p2p_port = registration.p2p_port
                 existing.cpu_cores = registration.cpu_cores
                 existing.vram_gb = registration.vram_gb
-                existing.visible_maddrs = registration.visible_maddrs  # <--- UPDATE THIS
                 existing.healthy = True
                 existing.registered_at = time.time()
                 existing.last_seen = time.time()
@@ -257,13 +251,11 @@ class WorkerRegistry:
                     self._workers[existing.peer_id] = existing
                 return existing
 
-            if registration.model_id and registration.layers:
-                model_id = registration.model_id
-                layers = (registration.layers[0], registration.layers[-1])
-            else:
-                model = self._pick_model(model_registry, registration.vram_gb)
-                model_id = model.model_id
-                layers = self._pick_layers(model, registration.vram_gb)
+            # Node is brand new or was hard-evicted. 
+            # Force a fresh layer assignment based on current swarm bottlenecks.
+            model = self._pick_model(model_registry, registration.vram_gb)
+            model_id = model.model_id
+            layers = self._pick_layers(model, registration.vram_gb)
 
             worker = Worker(
                 node_name=registration.node_name,
@@ -273,11 +265,10 @@ class WorkerRegistry:
                 cpu_cores=registration.cpu_cores,
                 vram_gb=registration.vram_gb,
                 peer_id=registration.peer_id or "",
-                p2p_port=registration.p2p_port,
-                visible_maddrs=registration.visible_maddrs,  # <--- PASS THIS
                 registered_at=time.time(),
                 last_seen=time.time(),
             )
+            self._workers[worker.node_url] = worker
             self._workers[registration.node_name] = worker
             if worker.peer_id:
                 self._workers[worker.peer_id] = worker
@@ -302,8 +293,12 @@ class WorkerRegistry:
 
             pipeline: list[Worker] = []
             target = 0
+            i = 0
             while target < num_layers:
-                eligible = [w for w in candidates if w.layers[0] <= target]
+                eligible: list[Worker] = []
+                while i < len(candidates) and candidates[i].layers[0] <= target:
+                    eligible.append(candidates[i])
+                    i += 1
                 if not eligible:
                     raise RuntimeError(
                         f"Layer coverage gap at layer {target} for model {model_id}"
@@ -315,9 +310,9 @@ class WorkerRegistry:
                 target = max_end + 1
             return pipeline
 
-    async def evict(self, node_name: str) -> None:
+    async def evict(self, node_key: str) -> None:
         async with self._lock:
-            worker = self._workers.get(node_name)
+            worker = self._workers.get(node_key.rstrip("/"))
             if worker:
                 worker.healthy = False
 
@@ -326,23 +321,20 @@ class WorkerRegistry:
             seen: set[str] = set()
             result: list[dict[str, object]] = []
             for key, w in self._workers.items():
-                if w.node_name in seen:
+                if w.node_url in seen:
                     continue
-                seen.add(w.node_name)
+                seen.add(w.node_url)
                 result.append(
                     {
                         "node_name": w.node_name,
                         "node_url": w.node_url,
                         "peer_id": w.peer_id,
-                        "p2p_port": w.p2p_port,
-                        "visible_maddrs": w.visible_maddrs,  # <--- EXPOSE IN SNAPSHOT
                         "model_id": w.model_id,
                         "layers": list(w.layers),
                         "healthy": w.healthy,
                         "last_seen": round(time.time() - w.last_seen, 1),
                         "cpu_cores": w.cpu_cores,
                         "vram_gb": w.vram_gb,
-                        "latency_ms": round(w.latency_ms, 1),
                     }
                 )
             return result
@@ -364,13 +356,12 @@ class WorkerRegistry:
                 }
             return result
 
-    async def heartbeat(self, node_name: str, latency_ms: float = 0.0) -> bool:
+    async def heartbeat(self, node_url: str) -> bool:
         async with self._lock:
-            worker = self._workers.get(node_name)
+            worker = self._workers.get(node_url.rstrip("/"))
             if worker:
                 worker.last_seen = time.time()
                 worker.healthy = True
-                worker.latency_ms = latency_ms
                 return True
             return False
 
@@ -391,13 +382,13 @@ class WorkerRegistry:
                 # Check Stage 2: Hard Eviction first
                 if worker.last_seen < hard_cutoff:
                     keys_to_delete.append(key)
-                    if key == worker.node_name:
+                    if key == worker.node_url:
                         hard_evicted.append(worker.node_name)
                         
                 # Check Stage 1: Soft Eviction second
                 elif worker.healthy and worker.last_seen < soft_cutoff:
                     worker.healthy = False
-                    if key == worker.node_name:
+                    if key == worker.node_url:
                         soft_evicted.append(worker.node_name)
             
             # Execute hard deletions
@@ -430,15 +421,11 @@ async def _get_tokenizer(model_id: str) -> AutoTokenizer:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global model_registry, transport
-    # Auto-detect public IP for DHT address announcements
-    public_ip = get_public_ip()
-    announce_maddrs = [f"/ip4/{public_ip}/tcp/{P2P_PORT}"]
-    print(f"[gateway] Public IP detected: {public_ip}", flush=True)
-
     transport = create_transport(
         transport_type=P2P_TRANSPORT,
         initial_peers=[],  # Gateway acts as the swarm bootstrap/relay point
         listen_port=P2P_PORT,
+        relay_mode=True,
     )
     await transport.start()
     if hasattr(transport, "get_peer_id") and transport.get_peer_id():
@@ -490,30 +477,6 @@ async def health() -> dict[str, object]:
         "models_loaded": len(model_registry.list_models()) if model_registry else 0,
     }
 
-import ipaddress
-import re
-
-_MADDR_IP4_RE = re.compile(r"/ip4/([^/]+)/")
-_MADDR_IP6_RE = re.compile(r"/ip6/([^/]+)/")
-
-
-def _is_public_maddr(maddr: str) -> bool:
-    """Return True if the multiaddr contains a publicly-routable IP."""
-    if "/p2p-circuit/" in maddr or maddr.startswith("/dns"):
-        return True
-    m4 = _MADDR_IP4_RE.search(maddr)
-    if m4:
-        try:
-            return ipaddress.ip_address(m4.group(1)).is_global
-        except ValueError:
-            return False
-    m6 = _MADDR_IP6_RE.search(maddr)
-    if m6:
-        try:
-            return ipaddress.ip_address(m6.group(1)).is_global
-        except ValueError:
-            return False
-    return True
 
 @app.get("/p2p/bootstrap")
 async def p2p_bootstrap() -> dict[str, object]:
@@ -522,14 +485,19 @@ async def p2p_bootstrap() -> dict[str, object]:
     if P2P_TRANSPORT != "p2p":
         raise HTTPException(status_code=400, detail="P2P transport is not enabled on this gateway")
     
-    public_ip = get_public_ip()
     peer_id = await transport.get_address()
-    public_maddr = f"/ip4/{public_ip}/tcp/{P2P_PORT}/p2p/{peer_id}"
-    
+    visible_maddrs = []
+    if hasattr(transport, "_p2p") and transport._p2p is not None:
+        try:
+            maddrs = await transport._p2p.get_visible_maddrs()
+            visible_maddrs = [str(maddr) for maddr in maddrs]
+        except Exception:
+            pass
+            
     return {
         "peer_id": peer_id,
         "p2p_port": P2P_PORT,
-        "visible_maddrs": [public_maddr], # Distribute the verified public route
+        "visible_maddrs": visible_maddrs,
     }
 
 
@@ -561,36 +529,11 @@ async def registry_view() -> dict[str, object]:
     return result
 
 
-async def _connect_to_worker_p2p(worker: Worker) -> None:
-    try:
-        # DNS fallback in case the worker has no visible addresses
-        hostname = worker.node_url.split("//")[-1].split(":")[0]
-        fallback_maddr = f"/dns/{hostname}/tcp/{worker.p2p_port}/p2p/{worker.peer_id}"
-        
-        # Combine verified addresses + fallback, then filter to public-only
-        raw_maddrs = list(dict.fromkeys((worker.visible_maddrs or []) + [fallback_maddr]))
-        maddrs = [m for m in raw_maddrs if _is_public_maddr(m)]
-        
-        if hasattr(transport, "connect_to_peer"):
-            for maddr in maddrs:
-                try:
-                    await transport.connect_to_peer(maddr)
-                    print(f"[Gateway] Successfully connected to {worker.node_name} via {maddr}", flush=True)
-                    return
-                except Exception:
-                    continue
-        print(f"[Gateway] Could not connect to {worker.node_name} via any of {maddrs}", flush=True)
-    except Exception as exc:
-        print(f"[Gateway] Failed to wire {worker.node_name}: {exc}", flush=True)
-
-
 @app.post("/register")
 async def register_worker(registration: WorkerRegistration) -> JSONResponse:
     if not model_registry:
         raise HTTPException(status_code=503, detail="Gateway not ready")
     worker = await registry.register(registration, model_registry)
-    if P2P_TRANSPORT == "p2p" and transport is not None and worker.peer_id:
-        asyncio.create_task(_connect_to_worker_p2p(worker))
     model = model_registry.resolve(worker.model_id)
     return JSONResponse(
         {
@@ -605,12 +548,11 @@ async def register_worker(registration: WorkerRegistration) -> JSONResponse:
 class HeartbeatRequest(BaseModel):
     node_name: str
     node_url: str
-    latency_ms: float = 0.0
 
 
 @app.post("/heartbeat")
 async def heartbeat(request: HeartbeatRequest) -> dict[str, str]:
-    exists = await registry.heartbeat(request.node_name, request.latency_ms)
+    exists = await registry.heartbeat(request.node_url)
     if not exists:
         raise HTTPException(status_code=404, detail="Worker not registered")
     return {"status": "ok"}
@@ -618,7 +560,7 @@ async def heartbeat(request: HeartbeatRequest) -> dict[str, str]:
 
 @app.post("/deregister")
 async def deregister(request: HeartbeatRequest) -> dict[str, str]:
-    await registry.evict(request.node_name)
+    await registry.evict(request.node_url)
     return {"status": "evicted"}
 
 

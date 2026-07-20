@@ -8,7 +8,6 @@ import os
 import time
 from contextlib import asynccontextmanager
 from typing import Any
-from network_utils import get_public_ip
 
 import httpx
 import torch
@@ -19,48 +18,8 @@ from safetensors.torch import save as safetensors_save
 from transformers import AutoModelForCausalLM
 
 import ipaddress
-import re
 from urllib.parse import urlparse
 from transport import KiwiTransport, create_transport
-
-
-# ── Multiaddr filtering ─────────────────────────────────────────────────────────
-
-_MADDR_IP4_RE = re.compile(r"/ip4/([^/]+)/")
-_MADDR_IP6_RE = re.compile(r"/ip6/([^/]+)/")
-
-PEER_DIAL_COOLDOWN_SECONDS = float(os.getenv("KIWI_PEER_DIAL_COOLDOWN", "60"))
-
-
-def _is_public_maddr(maddr: str) -> bool:
-    """Return True if the multiaddr contains a publicly-routable IP.
-
-    Filters out Docker bridge IPs (172.17-31.x.x, 10.x.x.x, 192.168.x.x),
-    link-local addresses, and loopback.  Relay-circuit addresses and DNS
-    addresses are always allowed through.
-    """
-    # Relay-circuit and DNS addresses are fine
-    if "/p2p-circuit/" in maddr or maddr.startswith("/dns"):
-        return True
-
-    m4 = _MADDR_IP4_RE.search(maddr)
-    if m4:
-        try:
-            ip = ipaddress.ip_address(m4.group(1))
-            return ip.is_global
-        except ValueError:
-            return False
-
-    m6 = _MADDR_IP6_RE.search(maddr)
-    if m6:
-        try:
-            ip = ipaddress.ip_address(m6.group(1))
-            return ip.is_global
-        except ValueError:
-            return False
-
-    # Unknown format — let it through rather than silently dropping
-    return True
 
 
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://gateway:8080").rstrip("/")
@@ -372,7 +331,7 @@ def _estimate_layer_memory_mb(loaded_model: Any, num_layers: int) -> float:
     return (total_params / num_layers * 1.2) / (1024 ** 2)
 
 
-def _compute_gpu_layers(loaded_model: Any, num_assigned_layers: int, total_model_layers: int) -> int:
+def _compute_gpu_layers(loaded_model: Any, num_assigned_layers: int) -> int:
     """Decide how many of the assigned layers fit in available VRAM."""
     if not torch.cuda.is_available():
         return 0
@@ -380,12 +339,12 @@ def _compute_gpu_layers(loaded_model: Any, num_assigned_layers: int, total_model
     usable_mb = free_mem_mb - GPU_MEMORY_RESERVE_MB
     if usable_mb <= 0:
         return 0
-    per_layer_mb = _estimate_layer_memory_mb(loaded_model, total_model_layers)
+    per_layer_mb = _estimate_layer_memory_mb(loaded_model, num_assigned_layers)
     gpu_layers = int(usable_mb // per_layer_mb)
     return min(gpu_layers, num_assigned_layers)
 
 
-def _place_model_on_device(loaded_model: Any, num_assigned_layers: int, total_model_layers: int) -> str:
+def _place_model_on_device(loaded_model: Any, num_assigned_layers: int) -> str:
     """Move the model (or a subset of its layers) onto the best available device.
 
     Returns the primary inference device string ("cuda" or "cpu").
@@ -393,7 +352,7 @@ def _place_model_on_device(loaded_model: Any, num_assigned_layers: int, total_mo
     if not torch.cuda.is_available():
         return "cpu"
 
-    gpu_layers = _compute_gpu_layers(loaded_model, num_assigned_layers, total_model_layers)
+    gpu_layers = _compute_gpu_layers(loaded_model, num_assigned_layers)
 
     if gpu_layers == 0:
         return "cpu"
@@ -477,32 +436,13 @@ async def _discover_bootstrap_peers() -> list[str]:
 
 async def _register() -> dict[str, Any]:
     _, vram_gb = _detect_device()
-    peer_id = ""
-    public_ip = get_public_ip()
-    print(f"[{NODE_NAME}] Public IP: {public_ip}", flush=True)
-    visible_maddrs = [f"/ip4/{public_ip}/tcp/{P2P_PORT}/p2p/{await transport.get_address()}"]
-    
-    if transport and P2P_TRANSPORT == "p2p" and hasattr(transport, "_p2p"):
-        try:
-            peer_id = await transport.get_address()
-            maddrs = await transport._p2p.get_visible_maddrs()
-            for m in maddrs:
-                m_str = str(m)
-                # Only advertise publicly-routable addresses (filter Docker bridge IPs)
-                if m_str not in visible_maddrs and _is_public_maddr(m_str):
-                    visible_maddrs.append(m_str)
-        except Exception:
-            pass
-    print(f"[{NODE_NAME}] Advertising maddrs: {visible_maddrs}", flush=True)
-
+    peer_id = await transport.get_address() if transport and P2P_TRANSPORT == "p2p" else ""
     payload = {
         "node_name": NODE_NAME,
         "node_url": NODE_URL,
         "peer_id": peer_id,
-        "p2p_port": P2P_PORT,
         "cpu_cores": os.cpu_count() or 1,
         "vram_gb": vram_gb,
-        "visible_maddrs": visible_maddrs,
     }
     for attempt in range(60):
         try:
@@ -551,7 +491,7 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
         loaded_model.model.embed_tokens = torch.nn.Identity()
 
     # ── Device placement ──
-    inference_device = _place_model_on_device(loaded_model, num_assigned, total_layers)
+    inference_device = _place_model_on_device(loaded_model, num_assigned)
     position = (
         "SOLO" if _is_first and _is_last else
         "FIRST" if _is_first else
@@ -603,35 +543,13 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
 
 async def _re_register() -> None:
     _, vram_gb = _detect_device()
-    peer_id = await transport.get_address()
-    
-    # 1. Fetch public IP using your new utility
-    public_ip = get_public_ip()
-    
-    # 2. Start with the verified public address
-    visible_maddrs = [f"/ip4/{public_ip}/tcp/{P2P_PORT}/p2p/{peer_id}"]
-    
-    # 3. Append only publicly-routable discovered addresses
-    if P2P_TRANSPORT == "p2p" and transport is not None and hasattr(transport, "_p2p"):
-        try:
-            maddrs = await transport._p2p.get_visible_maddrs()
-            for m in maddrs:
-                m_str = str(m)
-                if m_str not in visible_maddrs and _is_public_maddr(m_str):
-                    visible_maddrs.append(m_str)
-        except Exception:
-            pass
-
     payload = {
         "node_name": NODE_NAME,
         "node_url": NODE_URL,
-        "peer_id": peer_id,
-        "p2p_port": P2P_PORT,
         "cpu_cores": os.cpu_count() or 1,
         "vram_gb": vram_gb,
         "model_id": assigned_model_id,
         "layers": list(layer_range) if layer_range else None,
-        "visible_maddrs": visible_maddrs,
     }
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -640,68 +558,19 @@ async def _re_register() -> None:
     except httpx.HTTPError:
         pass
 
-async def _heartbeat_loop() -> None:
-    """Ping the gateway periodically and wire new P2P peer connections on discovery."""
-    latency_ms = 0.0
-    # Track peers we've already connected to (or recently failed to connect to)
-    _connected_peers: set[str] = set()
-    _dial_cooldowns: dict[str, float] = {}  # peer_id -> timestamp of last attempt
 
+async def _heartbeat_loop() -> None:
+    """Ping the gateway periodically so it knows we're alive."""
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
         try:
-            start_time = time.perf_counter()
             async with httpx.AsyncClient(timeout=3.0) as client:
                 response = await client.post(
                     f"{GATEWAY_URL}/heartbeat",
-                    json={
-                        "node_name": NODE_NAME,
-                        "node_url": NODE_URL,
-                        "latency_ms": latency_ms,
-                    },
+                    json={"node_name": NODE_NAME, "node_url": NODE_URL},
                 )
-                latency_ms = (time.perf_counter() - start_time) * 1000.0
                 if response.status_code == 404:
                     await _re_register()
-
-                # Only attempt P2P wiring for *newly discovered* peers
-                if P2P_TRANSPORT == "p2p" and transport is not None and hasattr(transport, "_p2p"):
-                    reg_resp = await client.get(f"{GATEWAY_URL}/registry")
-                    if reg_resp.status_code == 200:
-                        workers = reg_resp.json().get("workers", [])
-                        my_peer_id = await transport.get_address()
-                        now = time.time()
-
-                        for w in workers:
-                            peer_id = w.get("peer_id")
-                            if not peer_id or peer_id == my_peer_id:
-                                continue
-
-                            # Skip if already connected
-                            if peer_id in _connected_peers:
-                                continue
-
-                            # Skip if we recently tried and failed (cooldown)
-                            last_attempt = _dial_cooldowns.get(peer_id, 0.0)
-                            if now - last_attempt < PEER_DIAL_COOLDOWN_SECONDS:
-                                continue
-
-                            # Filter to only public addresses before dialing
-                            maddrs = [m for m in w.get("visible_maddrs", []) if _is_public_maddr(m)]
-                            _dial_cooldowns[peer_id] = now
-                            connected = False
-                            for maddr in maddrs:
-                                try:
-                                    await transport.connect_to_peer(maddr)
-                                    _connected_peers.add(peer_id)
-                                    connected = True
-                                    print(f"[{NODE_NAME}] Connected to peer {w.get('node_name', peer_id)} via {maddr}", flush=True)
-                                    break
-                                except Exception:
-                                    continue
-                            if not connected:
-                                print(f"[{NODE_NAME}] Failed to dial {w.get('node_name', peer_id)}, will retry in {PEER_DIAL_COOLDOWN_SECONDS}s", flush=True)
-
         except httpx.HTTPError:
             pass  # Gateway may be temporarily unreachable; keep retrying.
 
@@ -739,20 +608,14 @@ async def lifespan(_: FastAPI):
     global is_first_stage, is_last_stage, model, transport
 
     initial_peers = []
-    announce_maddrs = None
     if P2P_TRANSPORT == "p2p":
         initial_peers = await _discover_bootstrap_peers()
-        # Tell libp2p daemon to announce our public IP instead of Docker-internal addresses
-        public_ip = get_public_ip()
-        announce_maddrs = [f"/ip4/{public_ip}/tcp/{P2P_PORT}"]
-        print(f"[{NODE_NAME}] Public IP for DHT announcement: {public_ip}", flush=True)
 
     transport = create_transport(
         transport_type=P2P_TRANSPORT,
         node_url=NODE_URL,
         initial_peers=initial_peers,
         listen_port=P2P_PORT,
-        announce_maddrs=announce_maddrs,
     )
     await transport.start()
     transport.set_forward_handler(_execute_forward_pipeline)
