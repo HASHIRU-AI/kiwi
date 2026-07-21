@@ -562,19 +562,27 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
 async def _re_register() -> None:
     _, vram_gb = _detect_device()
     
+    global transport
     peer_id = ""
     if P2P_TRANSPORT == "p2p" and transport is not None:
         try:
-            peer_id = await transport.get_address()
             # Dynamic re-discovery of new gateway bootstrap peers
             new_bootstrap_peers = await _discover_bootstrap_peers()
-            for peer in new_bootstrap_peers:
-                try:
-                    await transport._p2p.connect_to_peer(peer)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            print(f"[{NODE_NAME}] Restarting P2P transport with new bootstrap peers...")
+            await transport.stop()
+            transport = create_transport(
+                transport_type=P2P_TRANSPORT,
+                node_url=NODE_URL,
+                initial_peers=new_bootstrap_peers,
+                listen_port=P2P_PORT,
+            )
+            await transport.start()
+            # Restore handlers
+            transport.set_forward_handler(_execute_forward_pipeline)
+            transport.set_generate_handler(_execute_generate_pipeline)
+            peer_id = await transport.get_address()
+        except Exception as exc:
+            print(f"[{NODE_NAME}] Failed to restart P2P transport: {exc}", flush=True)
 
     payload = {
         "node_name": NODE_NAME,

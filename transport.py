@@ -189,9 +189,32 @@ class P2PTransport(KiwiTransport):
         
         host_maddrs = [f"/ip4/0.0.0.0/tcp/{self.listen_port}"]
         
+        import os
+        import ipaddress
+        announce_maddrs = None
+        public_host = os.getenv("KIWI_P2P_PUBLIC_HOST", "").strip()
+        if public_host:
+            if "://" in public_host:
+                public_host = public_host.split("://")[-1]
+            if ":" in public_host:
+                host, port_str = public_host.split(":", 1)
+            else:
+                host = public_host
+                port_str = str(self.listen_port)
+            try:
+                ip = ipaddress.ip_address(host)
+                if ip.version == 6:
+                    announce_maddrs = [f"/ip6/{host}/tcp/{port_str}"]
+                else:
+                    announce_maddrs = [f"/ip4/{host}/tcp/{port_str}"]
+            except ValueError:
+                announce_maddrs = [f"/dns4/{host}/tcp/{port_str}"]
+            logger.info(f"[P2PTransport] Using announce_maddrs: {announce_maddrs}")
+
         self._p2p = await P2P.create(
             initial_peers=self.initial_peers if self.initial_peers else None,
             host_maddrs=host_maddrs,
+            announce_maddrs=announce_maddrs,
             use_relay=True,
             use_auto_relay=True,
             dht_mode="server",
