@@ -2,38 +2,42 @@
 
 Kiwi is a fault-tolerant, pipeline-parallel LLM gateway that unifies a fleet of machines into a single inference endpoint. Inspired by [Petals](https://github.com/bigscience-workshop/petals), it splits a transformer model across multiple workers and chains them via direct peer-to-peer tensor forwarding. The heavy intermediate activations never touch the central gateway.
 
-> **Current PoC:** 5 Docker containers running [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) split across 4 workers (2 × Stage A, 2 × Stage B), orchestrated by a single gateway with a built-in chat UI.
+> **Current Setup:** Multi-container deployment running models like [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) split across multiple workers, orchestrated by a central gateway with a web UI.
 
 ---
 
 ## Core Innovations
 
-### P2P Tensor Forwarding
-Hidden state tensors (the bulk of inter-node data) flow **directly from Stage A → Stage B** over HTTP. The gateway only sends tiny `input_ids` and receives tiny `next_token_id` responses. This avoids the gateway becoming a bandwidth bottleneck.
+### VRAM-Aware Layer Assignment
+Workers register with the gateway (`POST /register`), sending their URL and hardware capacity (`vram_gb`, `cpu_cores`). The gateway calculates per-layer memory footprint and assigns contiguous layer ranges:
+1. **Gap-Filling:** Assigns newly registered workers to the longest contiguous uncovered layer range.
+2. **Redundancy & Single-Node Assignment:** Once all layers are covered, assigns workers to the lowest-coverage range or allocates all layers (`0 to num_layers-1`) for single-node execution.
 
-### Binary Safetensors Transport
-All inter-node tensor payloads use [safetensors](https://github.com/huggingface/safetensors) binary serialization (`application/octet-stream`). No JSON encoding of tensors, no `torch.save`/pickle (avoiding [CVE-2025-32434](https://nvd.nist.gov/vuln/detail/CVE-2025-32434)).
+### P2P and HTTP Tensor Forwarding
+Hidden states flow sequentially across assigned stages (`Stage 0 → Stage 1 → ... → Stage N`) via HTTP (`httpx`) or direct binary streams over libp2p (`kiwi/forward/1.0`). The gateway only sends initial `input_ids` and receives `next_token_id` responses, avoiding central bandwidth bottlenecks.
 
-### KV-Cache Active Recompute
-When a worker dies mid-generation, the gateway selects a new healthy pair and sends the **full context** (original prompt + all tokens generated so far) as a fresh prefill step. This hot-rebuilds both workers' KV caches from scratch, and generation resumes seamlessly. The user sees a brief `[REROUTING...]` indicator and the stream continues.
+### Binary Safetensors & Compression
+Inter-node tensor payloads use [safetensors](https://github.com/huggingface/safetensors) binary serialization (`application/octet-stream`). No JSON encoding or pickle deserialization. Workers and transport also support activation quantization (`KIWI_USE_INT8`), sparse CSR serialization (`KIWI_USE_CSR`), and `zstd` lossless compression (`KIWI_LOSSLESS=zstd`).
 
-### Dynamic Block Assignment
-Workers boot completely agnostic. On startup, each worker sends its URL and hardware telemetry to the gateway's `/register` endpoint. The gateway's scheduler counts active nodes per stage and assigns the worker to whichever stage has fewer replicas, returning the layer range to load. The worker then slices the model accordingly.
+### Active Recompute & Rerouting
+If a worker stops mid-generation, the gateway evicts the node, selects a new pipeline path from remaining healthy workers covering `[0, num_layers)`, and re-dispatches the full prompt context. Worker caches rebuild from scratch while the client receives a `[REROUTING...]` notification and generation resumes.
 
-### Heartbeat & Eviction Loop
-Workers ping the gateway `/heartbeat` every 5 seconds to announce health status. The gateway maintains a background loop that evaluates all nodes, automatically evicting any worker that stops sending heartbeats for over 15 seconds.
+### Two-Stage Heartbeat Eviction
+Workers ping `/heartbeat` every 5 seconds. The gateway runs a background loop (`_staleness_loop`) with two thresholds:
+- **Soft Eviction (30s):** Marks the worker `healthy: False`, temporarily pausing new request routing to it.
+- **Hard Eviction (120s):** Removes the worker from memory if it remains unreachable.
 
 ### Graceful Worker Drain
-When a worker container is stopped or restarted, it invokes `/deregister` during the shutdown lifecycle. This allows the gateway to evict the worker immediately, bypassing the staleness timeout.
+When a worker container shuts down, it sends `POST /deregister` so the gateway evicts it immediately without waiting for timeouts.
 
-### KV-Cache TTL Eviction
-To avoid Memory leaks and Out-of-Memory (OOM) situations on workers, a background task automatically purges request cache entries that have not been accessed for more than 60 seconds.
+### PagedAttention & Cache Eviction
+Workers manage KV cache memory in fixed-size blocks using `PagedCacheManager` (`KIWI_NUM_BLOCKS`, `KIWI_BLOCK_SIZE`). A background task removes request cache entries unaccessed for over 60 seconds (`KV_CACHE_TTL_SECONDS`).
 
 ### Multi-Turn Conversation History
-The frontend stores conversation history and includes full turns in successive generation requests, allowing the model to leverage prior context.
+The frontend stores conversation history and includes prior turns in successive generation requests.
 
-### Live Topology Visualization & Active Highlighting
-The chat UI includes an interactive network topology panel. During text generation, the canvas highlights the exact Stage A and Stage B worker pair currently processing the request in neon green, draws active data stream particles along the edge, and dims (reduces opacity of) all inactive worker nodes in the swarm. Evicted nodes are colored red.
+### Network Topology Panel
+The web UI includes a live topology visualization showing active nodes, assigned layer ranges, processing paths, and evicted nodes.
 
 ---
 
@@ -53,14 +57,20 @@ The chat UI includes an interactive network topology panel. During text generati
                       │ tiny input_ids
                       ▼
           ┌───────────────────────┐
-          │  Stage A (Layers 0-11)│  ← worker_1 or worker_2
-          │  Embeddings + Blocks  │
+          │ Stage 0 (Layers 0-k)  │  ← e.g. worker_1
+          │ Embeddings + Blocks   │
           └───────────┬───────────┘
-                      │ hidden_states (P2P, safetensors)
+                      │ hidden_states (HTTP / P2P safetensors)
                       ▼
           ┌───────────────────────┐
-          │  Stage B (Layers 12-23)│  ← worker_3 or worker_4
-          │  Blocks + LM Head     │
+          │ Stage 1 (Layers k+1-m)│  ← e.g. worker_2
+          │ Intermediate Blocks   │
+          └───────────┬───────────┘
+                      │ hidden_states (HTTP / P2P safetensors)
+                      ▼
+          ┌───────────────────────┐
+          │ Stage N (Layers m+1-L)│  ← e.g. worker_4 (or SOLO 0-L)
+          │ Blocks + LM Head      │
           └───────────┬───────────┘
                       │ next_token_id (JSON)
                       ▼
@@ -168,8 +178,9 @@ curl http://localhost:8080/v1/chat/completions \
 ```
 
 ### P2P Networking & Testing Guides
-- **[P2P Networking Guide (`P2P_TESTING.md`)](file:///c:/Users/harsh/OneDrive/Desktop/cs%20projects/kiwi/P2P_TESTING.md)**: Instructions for running and testing `hivemind.p2p` / libp2p networking across single-machine setups (`docker-compose.internet.yml`) or multi-machine clusters over the internet without `ngrok`.
-- **[E2E Testing Guide (`TESTING.md`)](file:///c:/Users/harsh/OneDrive/Desktop/cs%20projects/kiwi/TESTING.md)**: Comprehensive manual and automated verification instructions for multi-model assignment, layer coverage, and fault tolerance.
+- **[P2P Networking Guide (`P2P_TESTING.md`)](file:///c:/Users/harsh/OneDrive/Desktop/cs%20projects/kiwi/P2P_TESTING.md)**: Instructions for running and testing `hivemind.p2p` / libp2p networking across local setups (`docker-compose.internet.yml`) or multi-machine clusters.
+- **[Benchmarking Guide (`benchmark_guide.md`)](file:///c:/Users/harsh/OneDrive/Desktop/cs%20projects/kiwi/benchmark_guide.md)**: Instructions for running comparative quality and latency benchmarks (`benchmarks/cli.py`).
+- **[E2E Testing Guide (`TESTING.md`)](file:///c:/Users/harsh/OneDrive/Desktop/cs%20projects/kiwi/TESTING.md)**: Manual and automated verification instructions for multi-model assignment, layer coverage, and fault tolerance.
 
 ---
 
@@ -187,24 +198,24 @@ kiwi/
 ```
 
 ### Gateway (`gateway.py`)
-- Owns the `AutoTokenizer`
-- Maintains an in-memory `WorkerRegistry` with stage balancing and `last_seen` heartbeat metrics
-- Runs the generation loop: tokenize ➔ dispatch to Stage A ➔ receive token ➔ stream SSE (including active node mapping)
-- Implements active recompute on failure: evict dead node ➔ select new pair ➔ re-prefill with full context
+- Manages `AutoTokenizer` instances for registered models (`KIWI_MODELS`)
+- Maintains an in-memory `WorkerRegistry` with VRAM-aware layer assignment (`_pick_layers`) and two-stage eviction
+- Runs the generation loop: tokenization ➔ dispatch to Stage 0 ➔ sequential pipeline traversal ➔ receive token ➔ stream SSE
+- Handles node failures via active recompute and dynamic rerouting (`select_pipeline`)
 
 ### Worker (`worker.py`)
-- Boots agnostically, registers via `POST /register`, receives stage + layer assignment
-- Runs a background loop pinging `/heartbeat` to gateway every 5s
-- Sends `POST /deregister` on shutdown for graceful eviction
-- Runs a background TTL cache manager to evict idle KV cache items older than 60s
-- Stage A: computes hidden states, P2P forwards to Stage B via `httpx`
-- Stage B: computes logits + argmax, returns `next_token_id`
-- Maintains per-request KV cache keyed by `X-Request-ID`
+- Boots agnostically, registers via `POST /register`, and receives assigned model and layer range (`[first_layer, last_layer]`)
+- Pings `/heartbeat` every 5s with latency reporting and sends `POST /deregister` on shutdown
+- Manages block-based KV cache (`PagedCacheManager`) and purges idle entries after 60s
+- Supports `CSR` sparsity (`KIWI_USE_CSR`), `INT8` quantization (`KIWI_USE_INT8`), and `zstd` compression
+- Intermediate stages: compute hidden states and forward to downstream peers (`kiwi/forward/1.0`) over HTTP or libp2p
+- Final stage: computes logits and argmax, returning `next_token_id` (`kiwi/generate/1.0`)
+- Stores per-request KV cache keyed by `X-Request-ID`
 
 ### Frontend (`index.html`)
-- Dark-mode TailwindCSS chat interface supporting multi-turn conversation memory
+- Dark-mode web interface with multi-turn conversation support
 - SSE streaming with progressive token rendering
-- Canvas-based topology panel with active pipeline path highlighting and eviction visualizers
+- Canvas-based network topology visualization
 
 ---
 

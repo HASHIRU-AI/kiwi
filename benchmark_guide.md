@@ -1,8 +1,8 @@
 # Benchmarking Kiwi P2P vs. CPU Baseline (Ollama)
 
-This guide provides the exact steps to benchmark the Kiwi P2P network (simulating an internet deployment using `docker-compose.internet.yml`) against a local CPU baseline running Ollama.
+This guide provides steps to benchmark the Kiwi P2P network against a local CPU baseline running Ollama.
 
-I have kept your `docker-compose.internet.yml` using `http://192.168.1.67:8080` so the workers connect to the remote gateway on the other laptop. I have also added an alias for the Ollama model (`qwen2.5:0.5b`) to the gateway so both accept the exact same model string during the benchmark.
+When testing against a remote gateway (e.g., `http://192.168.1.67:8080`), workers connect using the `GATEWAY_URL` environment variable. By configuring model aliases on the gateway, both Kiwi and Ollama can accept identical model strings during testing.
 
 ## How P2P Discovery and Peer IDs Work in Kiwi
 In Kiwi's "internet" mode, you don't actually need to manually configure Peer IDs on every worker. Here is how they connect:
@@ -41,7 +41,7 @@ ollama run qwen2.5:0.5b
 *(You can type `/bye` to exit the prompt, the Ollama server will continue running in the background on port `11434` as long as the service is active).*
 
 ## 3. Run the Benchmark Tool
-We will use the existing `benchmarks/cli.py` suite. Because we added `"qwen2.5:0.5b"` as an alias to the Kiwi Gateway, both Kiwi and Ollama will accept the identical model ID during the test.
+We will use the existing `benchmarks/cli.py` suite. By specifying `--model` for the Kiwi Gateway and `--baseline-model` for your local Ollama instance, you can test identical architectures even if Ollama uses a different model tag format.
 
 Open a PowerShell window in the `kiwi` directory and run:
 
@@ -61,8 +61,8 @@ python -m benchmarks.cli `
 ```
 
 ### Explanation of Arguments:
-- `--model`: The HuggingFace ID recognized by the Kiwi Gateway on the remote machine.
-- `--baseline-model`: The specific GGUF model tag that Ollama successfully pulled locally.
+- `--model`: The HuggingFace ID or alias recognized by the Kiwi Gateway (`qwen-0.5b` or `unsloth/Llama-3.2-3B-Instruct`).
+- `--baseline-model`: The specific model tag format pulled in Ollama (`qwen2.5:0.5b` or `hf.co/unsloth/Llama-3.2-3B-Instruct-GGUF`). Defaults to `--model` if omitted.
 - `--test-url`: The endpoint for your Kiwi Gateway.
 - `--baseline-url`: The endpoint for your local Ollama CPU instance.
 - `--evaluators exact_match,performance`: Measures generation speed (Tokens Per Second, Time To First Token) and verifies the outputs match.

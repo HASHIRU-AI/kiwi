@@ -1,8 +1,8 @@
 # Kiwi P2P (`hivemind.p2p`) Testing Guide
 
-This comprehensive guide walks through verifying the **Peer-to-Peer (P2P)** networking capabilities of the Kiwi Enterprise Compute Swarm (`hivemind.p2p` / libp2p).
+This guide walks through testing the **Peer-to-Peer (P2P)** networking layer (`hivemind.p2p` / libp2p) in Kiwi.
 
-By switching from standard HTTP to P2P transport (`KIWI_P2P_TRANSPORT=p2p`), workers behind home routers, NATs, or strict firewalls can join the compute swarm across the internet without needing third-party tunneling services like `ngrok`.
+By switching from standard HTTP to P2P transport (`KIWI_P2P_TRANSPORT=p2p`), workers behind home routers or NATs can join the compute swarm across the internet without needing third-party tunneling services like `ngrok`.
 
 ---
 
@@ -25,7 +25,7 @@ When `KIWI_P2P_TRANSPORT=p2p` is set:
 2. **Worker Swarm Discovery & NAT Hole Punching (`port 4002+`)**:
    - Workers start their own libp2p node and connect to the Gateway using the multiaddr:
      `/ip4/<GATEWAY_IP>/tcp/4001/p2p/<GATEWAY_PEER_ID>` (configured via `KIWI_RELAY_PEERS`).
-   - Workers report their own `peer_id` during heartbeat registration (`POST /v1/workers/register`).
+   - Workers report their own `peer_id` during initial registration (`POST /register`) and subsequent heartbeats (`POST /heartbeat`).
 3. **Stream Multiplexing (`kiwi/forward/1.0` & `kiwi/generate/1.0`)**:
    - When the Gateway or upstream workers send hidden states to downstream workers, or stream generated tokens back, they establish direct binary P2P streams using protocol framing `[4B header_len][header_json][4B payload_len][payload]`.
 
