@@ -815,10 +815,17 @@ def _serialize_hidden_states(result: torch.Tensor) -> tuple[bytes, dict[str, str
         else:
             hidden_2d_sparse = hidden_2d
             
-        # Per-token scale computed on the sparse dense matrix
-        max_val = hidden_2d_sparse.abs().max(dim=-1, keepdim=True).values
+        # Compute channel-wise scale for dynamic activation smoothing
+        channel_scale = hidden_2d_sparse.abs().max(dim=0, keepdim=True).values
+        channel_scale = torch.clamp(channel_scale, min=1e-8)
+        
+        # Smooth activations
+        hidden_smooth = hidden_2d_sparse / channel_scale
+
+        # Per-token scale computed on the smoothed sparse dense matrix
+        max_val = hidden_smooth.abs().max(dim=-1, keepdim=True).values
         scale = torch.clamp(max_val, min=1e-8) / 127.0
-        quantized = (hidden_2d_sparse / scale).round().to(torch.int8)
+        quantized = (hidden_smooth / scale).round().to(torch.int8)
 
         # Convert to sparse CSR
         t_sparse = quantized.to_sparse_csr()
@@ -829,29 +836,37 @@ def _serialize_hidden_states(result: torch.Tensor) -> tuple[bytes, dict[str, str
         original_elements = result.numel()
         sparse_elements = quantized_val.numel()
         sparsity_percent = (1.0 - (sparse_elements / max(original_elements, 1))) * 100.0
-        print(f"[{NODE_NAME}] [CSR+INT8] Sparsified & Quantized activations: {original_elements} -> {sparse_elements} non-zero values ({sparsity_percent:.2f}% sparse, per-token scales)", flush=True)
+        print(f"[{NODE_NAME}] [CSR+INT8] Sparsified & Quantized activations: {original_elements} -> {sparse_elements} non-zero values ({sparsity_percent:.2f}% sparse, per-token scales, smoothed)", flush=True)
 
         binary_hidden = safetensors_save({
             "crow_indices": crow,
             "col_indices": col,
             "quantized_values": quantized_val,
             "scale": scale.to(torch.float32),
+            "channel_scale": channel_scale.to(torch.float32),
             "original_shape": torch.tensor(shape, dtype=torch.long)
         })
     elif USE_INT8:
         shape = list(result.shape)
         # Flatten to 2D: (tokens, channels)
         hidden_2d = result.view(-1, shape[-1])
+        # Compute channel-wise scale to smooth activation outliers
+        channel_scale = hidden_2d.abs().max(dim=0, keepdim=True).values
+        channel_scale = torch.clamp(channel_scale, min=1e-8)
         
-        # Quantize activations per-token/per-row
-        token_scale = hidden_2d.abs().max(dim=-1, keepdim=True).values
+        # Smooth activations
+        hidden_smooth = hidden_2d / channel_scale
+        
+        # Quantize smoothed activations per-token/per-row
+        token_scale = hidden_smooth.abs().max(dim=-1, keepdim=True).values
         token_scale = torch.clamp(token_scale, min=1e-8) / 127.0
-        quantized = (hidden_2d / token_scale).round().to(torch.int8)
+        quantized = (hidden_smooth / token_scale).round().to(torch.int8)
         
-        print(f"[{NODE_NAME}] [INT8] Quantized activations: {result.numel()} elements", flush=True)
+        print(f"[{NODE_NAME}] [INT8] Quantized activations with channel-wise scales: {result.numel()} elements", flush=True)
         binary_hidden = safetensors_save({
             "quantized_hidden_states": quantized.view(shape),
-            "scale": token_scale.view(shape[:-1] + [1]).to(torch.float32)
+            "scale": token_scale.view(shape[:-1] + [1]).to(torch.float32),
+            "channel_scale": channel_scale.to(torch.float32)
         })
     elif USE_CSR:
         shape = list(result.shape)
@@ -938,12 +953,18 @@ async def _process_forward(
                 sparse_2d = torch.sparse_csr_tensor(crow, col, quantized_val, size=size_2d)
                 hidden_in = sparse_2d.to_dense().view(original_shape)
                 hidden_in = hidden_in.float() * scale_tensor
+                channel_scale = tensors.get("channel_scale")
+                if channel_scale is not None:
+                    hidden_in = hidden_in * channel_scale
                 print(f"[{NODE_NAME}] [CSR+INT8] Dequantized & Decompressed sparse activations back to shape {original_shape}", flush=True)
             else:
                 quantized = tensors.get("quantized_hidden_states")
                 scale_tensor = tensors.get("scale")
                 if quantized is not None and scale_tensor is not None:
                     hidden_in = quantized.float() * scale_tensor
+                    channel_scale = tensors.get("channel_scale")
+                    if channel_scale is not None:
+                        hidden_in = hidden_in * channel_scale
                     print(f"[{NODE_NAME}] [INT8] Dequantized activations back to shape {list(hidden_in.shape)}", flush=True)
                 else:
                     crow = tensors.get("crow_indices")
