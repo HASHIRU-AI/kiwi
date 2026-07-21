@@ -760,6 +760,7 @@ async def _stream_completion(
         active_nodes = {
             f"stage_{i}": _worker_address(w) for i, w in enumerate(pipeline)
         }
+        print(f"[gateway] Selected routing pipeline for {model.model_id}: {[w.node_name for w in pipeline]}", flush=True)
 
         # Build full context: original prompt + any previously generated tokens
         if generated_ids:
