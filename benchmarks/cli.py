@@ -9,6 +9,7 @@ from .evaluators import ExactMatchEvaluator, SemanticSimilarityEvaluator, LLMJud
 def main():
     parser = argparse.ArgumentParser(description="Kiwi LLM Quality Benchmarking Tool")
     parser.add_argument("--model", type=str, required=True, help="Model ID to evaluate")
+    parser.add_argument("--baseline-model", type=str, default=None, help="Model ID for the baseline (defaults to --model)")
     parser.add_argument("--dataset", type=str, default="dummy", help="Dataset name to use (dummy or huggingface repo)")
     parser.add_argument("--limit", type=int, default=5, help="Number of prompts to evaluate")
     parser.add_argument("--test-url", type=str, default="http://localhost:8080", help="URL for the Kiwi gateway or test endpoint")
@@ -65,7 +66,8 @@ def main():
         # Generate baseline
         print("  Generating baseline response...")
         try:
-            baseline_result = baseline_runner.generate(args.model, messages)
+            b_model = args.baseline_model if args.baseline_model else args.model
+            baseline_result = baseline_runner.generate(b_model, messages)
             baseline_response = baseline_result["text"]
         except Exception as e:
             print(f"  Failed baseline generation: {e}")
