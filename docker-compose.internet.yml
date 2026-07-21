@@ -13,7 +13,7 @@ services:
       # Serve one model (Qwen 0.5B)
       KIWI_MODELS: |
         [
-          {"model_id": "Qwen/Qwen2.5-0.5B-Instruct", "aliases": ["qwen-0.5b", "kiwi-small"], "default_dtype": "bfloat16"},
+          {"model_id": "Qwen/Qwen2.5-0.5B-Instruct", "aliases": ["qwen-0.5b", "kiwi-small"], "default_dtype": "bfloat16"}
         ]
       REQUEST_TIMEOUT_SECONDS: "120"
       KIWI_P2P_TRANSPORT: "p2p"
