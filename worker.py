@@ -852,7 +852,7 @@ def _serialize_hidden_states(result: torch.Tensor) -> tuple[bytes, dict[str, str
         binary_hidden = safetensors_save({
             "quantized_hidden_states": quantized.view(shape),
             "scale": token_scale.view(shape[:-1] + [1]).to(torch.float32),
-            "channel_scale": channel_scale.to(torch.float32)
+            "original_shape": torch.tensor(shape, dtype=torch.long)
         })
     elif USE_CSR:
         shape = list(result.shape)
