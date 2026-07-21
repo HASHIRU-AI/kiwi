@@ -1,4 +1,4 @@
-# 🚀 K.I.W.I.: Knitted Infrastructure for Weight-sharded Inference
+# 🥝 K.I.W.I.: Knitted Infrastructure for Weight-sharded Inference
 
 Kiwi is a fault-tolerant, pipeline-parallel LLM gateway that unifies a fleet of machines into a single inference endpoint. Inspired by [Petals](https://github.com/bigscience-workshop/petals), it splits a transformer model across multiple workers and chains them via direct peer-to-peer tensor forwarding. The heavy intermediate activations never touch the central gateway.
 
