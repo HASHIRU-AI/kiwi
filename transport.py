@@ -138,16 +138,15 @@ async def _write_stream_chunked(writer: asyncio.StreamWriter, data: bytes, chunk
 
 async def _read_stream_chunked(reader: asyncio.StreamReader, total_len: int, chunk_size: int = 16384) -> bytes:
     """Read total_len bytes directly without chunk loop."""
-    # buffer = bytearray()
-    # remaining = total_len
-    # while remaining > 0:
-    #     chunk = await reader.read(min(remaining, chunk_size))
-    #     if not chunk:
-    #         raise asyncio.exceptions.IncompleteReadError(bytes(buffer), total_len)
-    #     buffer.extend(chunk)
-    #     remaining -= len(chunk)
-    # return bytes(buffer)
-    return await reader.readexactly(total_len)
+    buffer = bytearray()
+    remaining = total_len
+    while remaining > 0:
+        chunk = await reader.read(min(remaining, chunk_size))
+        if not chunk:
+            raise asyncio.exceptions.IncompleteReadError(bytes(buffer), total_len)
+        buffer.extend(chunk)
+        remaining -= len(chunk)
+    return bytes(buffer)
 
 
 async def _read_framed_request(reader: asyncio.StreamReader) -> tuple[dict[str, str], bytes]:
