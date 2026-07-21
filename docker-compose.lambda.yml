@@ -49,7 +49,7 @@ services:
     environment:
       NODE_NAME: lambda_worker_1
       NODE_URL: http://lambda_worker_1:8000
-      GATEWAY_URL: http://gateway:8080
+      GATEWAY_URL: http://108.68.107.178:8080
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4002"
       KIWI_RELAY_PEERS: ""
@@ -64,9 +64,9 @@ services:
       - ./worker.py:/app/worker.py
       - ./models.py:/app/models.py
       - ./transport.py:/app/transport.py
-    depends_on:
-      gateway:
-        condition: service_healthy
+    # depends_on:
+    #   gateway:
+    #     condition: service_healthy
     deploy:
       resources:
         reservations:
@@ -86,7 +86,7 @@ services:
     environment:
       NODE_NAME: lambda_worker_2
       NODE_URL: http://lambda_worker_2:8000
-      GATEWAY_URL: http://gateway:8080
+      GATEWAY_URL: http://108.68.107.178:8080
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4003"
       KIWI_RELAY_PEERS: ""
