@@ -52,7 +52,6 @@ services:
       GATEWAY_URL: http://gateway:8080
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4002"
-      KIWI_P2P_PUBLIC_HOST: "${LAMBDA_IP:-}"
       KIWI_RELAY_PEERS: ""
       KIWI_USE_CSR: "false"
       KIWI_USE_INT8: "true"
@@ -90,7 +89,6 @@ services:
       GATEWAY_URL: http://gateway:8080
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4003"
-      KIWI_P2P_PUBLIC_HOST: "${LAMBDA_IP:-}"
       KIWI_RELAY_PEERS: ""
       KIWI_USE_CSR: "false"
       KIWI_USE_INT8: "true"
