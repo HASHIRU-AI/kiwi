@@ -128,12 +128,10 @@ class HttpTransport(KiwiTransport):
         self._generate_handler = handler
 
 
-async def _write_stream_chunked(writer: asyncio.StreamWriter, data: bytes, chunk_size: int = 16384) -> None:
-    """Write data in chunks with a small sleep to prevent P2P socket buffer overflow."""
-    for i in range(0, len(data), chunk_size):
-        writer.write(data[i : i + chunk_size])
-        await writer.drain()
-        await asyncio.sleep(0.002)
+async def _write_stream_chunked(writer: asyncio.StreamWriter, data: bytes) -> None:
+    """Write data directly to the stream. The underlying StreamWriter will handle buffering."""
+    writer.write(data)
+    await writer.drain()
 
 
 async def _read_stream_chunked(reader: asyncio.StreamReader, total_len: int, chunk_size: int = 16384) -> bytes:
