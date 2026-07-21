@@ -376,11 +376,18 @@
     const modelSelect = document.querySelector('#modelSelect');
     const conversationHistory = [];
 
+    // Store the selected model globally so it isn't lost during temporary errors
+    let userSelectedModel = null;
+    modelSelect.addEventListener('change', () => {
+      userSelectedModel = modelSelect.value;
+    });
+
     // Fetch and populate servable models dynamically
     async function loadModels() {
       try {
         const response = await fetch('/v1/models');
         const result = await response.json();
+        const currentSelected = userSelectedModel || modelSelect.value;
         modelSelect.innerHTML = '';
         
         if (result.data && result.data.length > 0) {
@@ -393,11 +400,22 @@
             opt.textContent = `${shortName}${alias}${model.ready ? '' : ' (Not Ready)'}`;
             modelSelect.appendChild(opt);
           });
+          // Explicitly set the value after appending all options
+          if (currentSelected) {
+            modelSelect.value = currentSelected;
+          }
+          // If the select value didn't match (e.g. invalid model), update the global tracker to the new default
+          if (!userSelectedModel) {
+             userSelectedModel = modelSelect.value;
+          }
         } else {
           modelSelect.innerHTML = '<option value="">No models registered</option>';
         }
       } catch (error) {
-        modelSelect.innerHTML = '<option value="">Error loading models</option>';
+        // Only show error if we don't have existing models to prevent flickering
+        if (modelSelect.options.length <= 1) {
+          modelSelect.innerHTML = '<option value="">Error loading models</option>';
+        }
       }
     }
 

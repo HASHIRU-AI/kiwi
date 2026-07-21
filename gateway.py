@@ -15,7 +15,7 @@ from typing import AsyncIterator, Literal
 
 import httpx
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from safetensors.torch import save as safetensors_save
@@ -573,7 +573,7 @@ async def p2p_bootstrap() -> dict[str, object]:
             else:
                 public_maddr = f"/ip4/{public_host}/tcp/{public_port}/p2p/{peer_id}"
         except ValueError:
-            public_maddr = f"/dns/{public_host}/tcp/{public_port}/p2p/{peer_id}"
+            public_maddr = f"/dns4/{public_host}/tcp/{public_port}/p2p/{peer_id}"
             
         if public_maddr not in visible_maddrs:
             visible_maddrs.append(public_maddr)
@@ -613,40 +613,11 @@ async def registry_view() -> dict[str, object]:
     return result
 
 
-async def _connect_to_worker_p2p(worker: Worker, p2p_port: int) -> None:
-    try:
-        from urllib.parse import urlparse
-        import ipaddress
-        parsed = urlparse(worker.node_url)
-        host = parsed.hostname
-        if not host:
-            return
-        try:
-            ip = ipaddress.ip_address(host)
-            if ip.version == 6:
-                maddr = f"/ip6/{host}/tcp/{p2p_port}/p2p/{worker.peer_id}"
-            else:
-                maddr = f"/ip4/{host}/tcp/{p2p_port}/p2p/{worker.peer_id}"
-        except ValueError:
-            maddr = f"/dns/{host}/tcp/{p2p_port}/p2p/{worker.peer_id}"
-    
-        print(f"[Gateway] Explicitly connecting to worker P2P address: {maddr}", flush=True)
-        try:
-            await transport._p2p._client.connect(PeerID.from_base58(worker.peer_id), [Multiaddr(maddr)])
-            print(f"[Gateway] Successfully connected to worker {worker.node_name} via P2P", flush=True)
-        except Exception as exc:
-            print(f"[Gateway] Failed to explicitly connect to worker {worker.node_name} via P2P: {exc}", flush=True)
-    except Exception as exc:
-        print(f"[Gateway] Failed to explicitly connect to worker {worker.node_name} via P2P: {exc}", flush=True)
-
-
 @app.post("/register")
-async def register_worker(registration: WorkerRegistration) -> JSONResponse:
+async def register_worker(registration: WorkerRegistration, request: Request) -> JSONResponse:
     if not model_registry:
         raise HTTPException(status_code=503, detail="Gateway not ready")
     worker = await registry.register(registration, model_registry)
-    if P2P_TRANSPORT == "p2p" and transport is not None and worker.peer_id:
-        asyncio.create_task(_connect_to_worker_p2p(worker, registration.p2p_port))
     model = model_registry.resolve(worker.model_id)
     return JSONResponse(
         {
@@ -789,6 +760,7 @@ async def _stream_completion(
         active_nodes = {
             f"stage_{i}": _worker_address(w) for i, w in enumerate(pipeline)
         }
+        print(f"[gateway] Selected routing pipeline for {model.model_id}: {[w.node_name for w in pipeline]}", flush=True)
 
         # Build full context: original prompt + any previously generated tokens
         if generated_ids:

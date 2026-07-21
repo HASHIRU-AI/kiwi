@@ -128,16 +128,35 @@ class HttpTransport(KiwiTransport):
         self._generate_handler = handler
 
 
+async def _write_stream_chunked(writer: asyncio.StreamWriter, data: bytes) -> None:
+    """Write data directly to the stream. The underlying StreamWriter will handle buffering."""
+    writer.write(data)
+    await writer.drain()
+
+
+async def _read_stream_chunked(reader: asyncio.StreamReader, total_len: int, chunk_size: int = 16384) -> bytes:
+    """Read total_len bytes directly without chunk loop."""
+    buffer = bytearray()
+    remaining = total_len
+    while remaining > 0:
+        chunk = await reader.read(min(remaining, chunk_size))
+        if not chunk:
+            raise asyncio.exceptions.IncompleteReadError(bytes(buffer), total_len)
+        buffer.extend(chunk)
+        remaining -= len(chunk)
+    return bytes(buffer)
+
+
 async def _read_framed_request(reader: asyncio.StreamReader) -> tuple[dict[str, str], bytes]:
     """Read a framed request of [4B header_len][header_json][4B payload_len][payload]."""
-    header_len_bytes = await reader.readexactly(4)
+    header_len_bytes = await _read_stream_chunked(reader, 4)
     header_len = struct.unpack(">I", header_len_bytes)[0]
-    header_json_bytes = await reader.readexactly(header_len)
+    header_json_bytes = await _read_stream_chunked(reader, header_len)
     headers = json.loads(header_json_bytes.decode("utf-8"))
 
-    payload_len_bytes = await reader.readexactly(4)
+    payload_len_bytes = await _read_stream_chunked(reader, 4)
     payload_len = struct.unpack(">I", payload_len_bytes)[0]
-    payload = await reader.readexactly(payload_len)
+    payload = await _read_stream_chunked(reader, payload_len)
     return headers, payload
 
 
@@ -167,13 +186,47 @@ class P2PTransport(KiwiTransport):
         
         host_maddrs = [f"/ip4/0.0.0.0/tcp/{self.listen_port}"]
         
+        import os
+        import ipaddress
+        announce_maddrs = None
+        public_host = os.getenv("KIWI_P2P_PUBLIC_HOST", "").strip()
+        
+        if not public_host:
+            try:
+                import urllib.request
+                logger.info("[P2PTransport] KIWI_P2P_PUBLIC_HOST not set, attempting to auto-detect public IP...")
+                with urllib.request.urlopen("https://api.ipify.org", timeout=5.0) as response:
+                    public_host = response.read().decode("utf-8").strip()
+                    logger.info(f"[P2PTransport] Auto-detected public IP: {public_host}")
+            except Exception as e:
+                logger.warning(f"[P2PTransport] Failed to auto-detect public IP: {e}")
+
+        if public_host:
+            if "://" in public_host:
+                public_host = public_host.split("://")[-1]
+            if ":" in public_host:
+                host, port_str = public_host.split(":", 1)
+            else:
+                host = public_host
+                port_str = str(self.listen_port)
+            try:
+                ip = ipaddress.ip_address(host)
+                if ip.version == 6:
+                    announce_maddrs = [f"/ip6/{host}/tcp/{port_str}"]
+                else:
+                    announce_maddrs = [f"/ip4/{host}/tcp/{port_str}"]
+            except ValueError:
+                announce_maddrs = [f"/dns4/{host}/tcp/{port_str}"]
+            logger.info(f"[P2PTransport] Using announce_maddrs: {announce_maddrs}")
+
         self._p2p = await P2P.create(
             initial_peers=self.initial_peers if self.initial_peers else None,
             host_maddrs=host_maddrs,
+            announce_maddrs=announce_maddrs,
             use_relay=True,
             use_auto_relay=True,
             dht_mode="server",
-            force_reachability="public" if self.relay_mode else "private",
+            force_reachability="public" if (self.relay_mode or announce_maddrs) else "private",
         )
         self._peer_id = self._p2p.peer_id.to_base58()
         logger.info(f"[P2PTransport] P2P node started! PeerID: {self._peer_id}")
@@ -210,14 +263,12 @@ class P2PTransport(KiwiTransport):
             else:
                 response_bytes = response
 
-            writer.write(struct.pack(">I", len(response_bytes)) + response_bytes)
-            await writer.drain()
+            await _write_stream_chunked(writer, struct.pack(">I", len(response_bytes)) + response_bytes)
         except Exception as exc:
             logger.error(f"[P2PTransport] Error handling forward stream from {getattr(stream_info, 'peer_id', 'unknown')}: {exc}", exc_info=True)
             print(f"[P2PTransport] Error handling forward stream from {getattr(stream_info, 'peer_id', 'unknown')}: {exc}", flush=True)
             err_bytes = json.dumps({"error": str(exc)}).encode("utf-8")
-            writer.write(struct.pack(">I", len(err_bytes)) + err_bytes)
-            await writer.drain()
+            await _write_stream_chunked(writer, struct.pack(">I", len(err_bytes)) + err_bytes)
         finally:
             writer.close()
             with suppress(Exception):
@@ -269,19 +320,18 @@ class P2PTransport(KiwiTransport):
                 target_peer, "kiwi/forward/1.0"
             )
             try:
-                writer.write(framed_req)
-                await writer.drain()
+                await _write_stream_chunked(writer, framed_req)
 
-                resp_len_bytes = await reader.readexactly(4)
+                resp_len_bytes = await _read_stream_chunked(reader, 4)
                 resp_len = struct.unpack(">I", resp_len_bytes)[0]
-                return await reader.readexactly(resp_len)
+                return await _read_stream_chunked(reader, resp_len)
             finally:
                 writer.close()
                 with suppress(Exception):
                     await writer.wait_closed()
 
-        max_attempts = 5
-        backoff = 0.1
+        max_attempts = 1 if headers.get("X-Step") == "decode" else 10
+        backoff = 0.2
         for attempt in range(1, max_attempts + 1):
             try:
                 return await asyncio.wait_for(_call(), timeout=timeout)
@@ -293,7 +343,7 @@ class P2PTransport(KiwiTransport):
                     f"[P2PTransport] Attempt {attempt} failed forwarding to {target}: {e}. Retrying in {backoff}s..."
                 )
                 await asyncio.sleep(backoff)
-                backoff *= 2
+                backoff = min(backoff * 2, 5.0)
 
     async def send_generate(
         self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 60.0
@@ -312,8 +362,8 @@ class P2PTransport(KiwiTransport):
             + payload
         )
 
-        max_attempts = 5
-        backoff = 0.1
+        max_attempts = 10
+        backoff = 0.2
         reader, writer = None, None
         for attempt in range(1, max_attempts + 1):
             try:
@@ -321,8 +371,7 @@ class P2PTransport(KiwiTransport):
                     self._p2p.call_binary_stream_handler(target_peer, "kiwi/generate/1.0"),
                     timeout=10.0,
                 )
-                writer.write(framed_req)
-                await writer.drain()
+                await _write_stream_chunked(writer, framed_req)
                 break
             except Exception as e:
                 if writer is not None:
@@ -336,7 +385,7 @@ class P2PTransport(KiwiTransport):
                     f"[P2PTransport] Attempt {attempt} failed to establish generate stream to {target}: {e}. Retrying in {backoff}s..."
                 )
                 await asyncio.sleep(backoff)
-                backoff *= 2
+                backoff = min(backoff * 2, 5.0)
 
         try:
             while not reader.at_eof():

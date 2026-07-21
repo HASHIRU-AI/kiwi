@@ -412,15 +412,26 @@ async def _discover_bootstrap_peers() -> list[str]:
                 if parsed.hostname:
                     host = parsed.hostname
                     # Check if host is IP address
+                    import socket
+                    is_ip = False
                     try:
+                        ipaddress.ip_address(host)
+                        is_ip = True
+                    except ValueError:
+                        try:
+                            host = socket.gethostbyname(host)
+                            is_ip = True
+                        except socket.gaierror:
+                            pass
+                            
+                    if is_ip:
                         ip = ipaddress.ip_address(host)
                         if ip.version == 6:
                             maddr_construct = f"/ip6/{host}/tcp/{p2p_port}/p2p/{peer_id}"
                         else:
                             maddr_construct = f"/ip4/{host}/tcp/{p2p_port}/p2p/{peer_id}"
-                    except ValueError:
-                        # DNS name
-                        maddr_construct = f"/dns/{host}/tcp/{p2p_port}/p2p/{peer_id}"
+                    else:
+                        maddr_construct = f"/dns4/{host}/tcp/{p2p_port}/p2p/{peer_id}"
                     
                     if maddr_construct not in bootstrap_maddrs:
                         bootstrap_maddrs.append(maddr_construct)
@@ -436,7 +447,13 @@ async def _discover_bootstrap_peers() -> list[str]:
 
 async def _register() -> dict[str, Any]:
     _, vram_gb = _detect_device()
-    peer_id = await transport.get_address() if transport and P2P_TRANSPORT == "p2p" else ""
+    peer_id = ""
+    if P2P_TRANSPORT == "p2p" and transport is not None:
+        try:
+            peer_id = await transport.get_address()
+        except Exception:
+            pass
+
     payload = {
         "node_name": NODE_NAME,
         "node_url": NODE_URL,
@@ -545,19 +562,27 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
 async def _re_register() -> None:
     _, vram_gb = _detect_device()
     
+    global transport
     peer_id = ""
     if P2P_TRANSPORT == "p2p" and transport is not None:
         try:
-            peer_id = await transport.get_address()
             # Dynamic re-discovery of new gateway bootstrap peers
             new_bootstrap_peers = await _discover_bootstrap_peers()
-            for peer in new_bootstrap_peers:
-                try:
-                    await transport._p2p.connect_to_peer(peer)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            print(f"[{NODE_NAME}] Restarting P2P transport with new bootstrap peers...")
+            await transport.stop()
+            transport = create_transport(
+                transport_type=P2P_TRANSPORT,
+                node_url=NODE_URL,
+                initial_peers=new_bootstrap_peers,
+                listen_port=P2P_PORT,
+            )
+            await transport.start()
+            # Restore handlers
+            transport.set_forward_handler(_execute_forward_pipeline)
+            transport.set_generate_handler(_execute_generate_pipeline)
+            peer_id = await transport.get_address()
+        except Exception as exc:
+            print(f"[{NODE_NAME}] Failed to restart P2P transport: {exc}", flush=True)
 
     payload = {
         "node_name": NODE_NAME,

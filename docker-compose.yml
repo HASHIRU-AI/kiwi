@@ -17,6 +17,10 @@ services:
       REQUEST_TIMEOUT_SECONDS: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
+      - ./gateway.py:/app/gateway.py
+      - ./models.py:/app/models.py
+      - ./transport.py:/app/transport.py
+      - ./index.html:/app/index.html
     healthcheck:
       test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')" ]
       interval: 10s
