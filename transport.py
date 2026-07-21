@@ -191,15 +191,7 @@ class P2PTransport(KiwiTransport):
         announce_maddrs = None
         public_host = os.getenv("KIWI_P2P_PUBLIC_HOST", "").strip()
         
-        if not public_host:
-            try:
-                import urllib.request
-                logger.info("[P2PTransport] KIWI_P2P_PUBLIC_HOST not set, attempting to auto-detect public IP...")
-                with urllib.request.urlopen("https://api.ipify.org", timeout=5.0) as response:
-                    public_host = response.read().decode("utf-8").strip()
-                    logger.info(f"[P2PTransport] Auto-detected public IP: {public_host}")
-            except Exception as e:
-                logger.warning(f"[P2PTransport] Failed to auto-detect public IP: {e}")
+
 
         if public_host:
             if "://" in public_host:
