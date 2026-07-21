@@ -1,193 +1,152 @@
-# 🥝 Kiwi — Decentralized LLM Inference Gateway
+# 🚀 K.I.W.I. — Knitted Infrastructure for Weight-sharded Inference
 
-Kiwi is a fault-tolerant, pipeline-parallel LLM gateway that unifies a fleet of machines into a single inference endpoint. Inspired by [Petals](https://github.com/bigscience-workshop/petals), it splits a transformer model across multiple workers and chains them via direct peer-to-peer tensor forwarding — the heavy intermediate activations never touch the central gateway.
+## Inspiration
 
-> **Current PoC:** 5 Docker containers running [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) split across 4 workers (2 × Stage A, 2 × Stage B), orchestrated by a single gateway with a built-in chat UI.
+Large language models require GPUs with massive VRAM. A 70B-parameter model needs ~140 GB at FP16. An NVIDIA A100 costs $15,000+. Most researchers and enthusiasts cannot access this hardware.
+
+At the same time, there are roughly 1.5 billion discrete GPUs deployed globally. Most are consumer-grade. Most are idle at any given moment. Four RTX 4090s (24 GB each) collectively hold 96 GB of VRAM. Eight of them hold 192 GB. The compute exists. It is just fragmented, unreliable, and unorchestrated.
+
+# Gaps
+
+### 1. Orchestration Architecture
+* Systems like Petals rely on a fully decentralized Kademlia Distributed Hash Table (DHT) where nodes figure out their own routing, leading to complex routing logic, difficult-to-trace bottlenecks, and an unpredictable execution flow.
 
 ---
 
-## Core Innovations
+### 2. Payload & Serialization Safety
+* Most hackathon projects default to JSON APIs, which cripple CPU performance and inflate network payloads. Other frameworks use native pickle serialization (`torch.save`), which introduces critical remote-code-execution vulnerabilities like CVE-2025-32434.
 
-### P2P Tensor Forwarding
-Hidden state tensors (the bulk of inter-node data) flow **directly from Stage A → Stage B** over HTTP. The gateway only sends tiny `input_ids` and receives tiny `next_token_id` responses. This avoids the gateway becoming a bandwidth bottleneck.
+---
 
-### Binary Safetensors Transport
-All inter-node tensor payloads use [safetensors](https://github.com/huggingface/safetensors) binary serialization (`application/octet-stream`). No JSON encoding of tensors, no `torch.save`/pickle (avoiding [CVE-2025-32434](https://nvd.nist.gov/vuln/detail/CVE-2025-32434)).
+### 3. State Management & Fault Tolerance
+* Because LLM generation relies heavily on the stateful KV Cache, standard peer-to-peer pipelines collapse if a single node disconnects mid-inference.
 
-### KV-Cache Active Recompute
-When a worker dies mid-generation, the gateway selects a new healthy pair and sends the **full context** (original prompt + all tokens generated so far) as a fresh prefill step. This hot-rebuilds both workers' KV caches from scratch, and generation resumes seamlessly — the user sees a brief `[REROUTING...]` indicator and the stream continues.
+---
 
-### Dynamic Block Assignment
-Workers boot completely agnostic — no hardcoded roles. On startup, each worker sends its URL and hardware telemetry to the gateway's `/register` endpoint. The gateway's scheduler counts active nodes per stage and assigns the worker to whichever stage has fewer replicas, returning the layer range to load. The worker then slices the model accordingly.
+### 4. Hardware Volatility & Node Churn
+* Existing systems assume cooperative, stable nodes and break under real consumer hardware conditions where nodes drop mid-inference, bandwidth fluctuates, or VRAM availability changes unexpectedly when users open games or browsers.
 
-### Heartbeat & Eviction Loop
-Workers ping the gateway `/heartbeat` every 5 seconds to announce health status. The gateway maintains a background loop that evaluates all nodes, automatically evicting any worker that stops sending heartbeats for over 15 seconds.
+---
 
-### Graceful Worker Drain
-When a worker container is stopped or restarted, it invokes `/deregister` during the shutdown lifecycle. This allows the gateway to evict the worker immediately, bypassing the staleness timeout.
+## What K.I.W.I. Does
 
-### KV-Cache TTL Eviction
-To avoid Memory leaks and Out-of-Memory (OOM) situations on workers, a background task automatically purges request cache entries that have not been accessed for more than 60 seconds.
+K.I.W.I. is a fault-tolerant, pipeline-parallel LLM gateway that unifies a fleet of heterogeneous machines into a single inference endpoint. To developers, it exposes a standard OpenAI-compatible API (`/v1/chat/completions`). Under the hood, it orchestrates a distributed swarm of unreliable, underutilized hardware:
 
-### Multi-Turn Conversation History
-The frontend stores conversation history and includes full turns in successive generation requests, allowing the model to leverage prior context.
-
-### Live Topology Visualization & Active Highlighting
-The chat UI includes an interactive network topology panel. During text generation, the canvas highlights the exact Stage A and Stage B worker pair currently processing the request in neon green, draws active data stream particles along the edge, and dims (reduces opacity of) all inactive worker nodes in the swarm. Evicted nodes are colored red.
+- **Weight-sharded execution**: Model layers are sliced across $N$ consumer GPUs or CPU nodes. Each node holds and executes a subset of transformer layers (e.g. Stage A for layers 0–11, Stage B for layers 12–23). No single device needs the full model in memory.
+- **Direct P2P Tensor Forwarding**: Intermediate hidden state activations stream directly from Stage A to Stage B over HTTP or libp2p streams. Heavy activation tensors never touch the central gateway.
+- **KV-Cache Active Recompute**: If a worker drops mid-generation, the gateway detects the failure, soft-evicts the stale node, selects a new healthy stage pair, and sends the prompt + context generated so far as a fast prefill pass to hot-rebuild KV caches seamlessly.
+- **Dynamic Block & Stage Assignment**: Workers boot completely agnostic without static role config. On registration, the scheduler counts active stage coverage and assigns layer ranges based on hardware telemetry (CPU cores, VRAM capacity).
+- **PagedAttention Virtual Block Cache**: Fixed-size block pool memory management eliminates KV-cache fragmentation and prevents Out-of-Memory (OOM) failures under concurrent requests.
+- **Security-Hardened Transport**: All inter-node activation payloads use `safetensors` binary serialization, avoiding Python pickle vulnerability vectors (CVE-2025-32434).
 
 ---
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────┐
-│                    Gateway :8080                     │
-│  ┌───────────┐  ┌──────────┐  ┌──────────────────┐  │
-│  │ Tokenizer │  │ Registry │  │ SSE Streaming API │  │
-│  │  (Qwen)   │  │  (DHT)   │  │  /v1/chat/compl. │  │
-│  └───────────┘  └──────────┘  └──────────────────┘  │
-│         │              │               │             │
-│         │     input_ids (safetensors)  │             │
-│         ▼              ▼               ▼             │
-└─────────────────────┬───────────────────────────────┘
-                      │ tiny input_ids
-                      ▼
-          ┌───────────────────────┐
-          │  Stage A (Layers 0-11)│  ← worker_1 or worker_2
-          │  Embeddings + Blocks  │
-          └───────────┬───────────┘
-                      │ hidden_states (P2P, safetensors)
-                      ▼
-          ┌───────────────────────┐
-          │  Stage B (Layers 12-23)│  ← worker_3 or worker_4
-          │  Blocks + LM Head     │
-          └───────────┬───────────┘
-                      │ next_token_id (JSON)
-                      ▼
-                  Gateway → SSE → Browser
-```
-
----
-
-## Optimizations & Benchmarks
-
-Here is a summary of the optimizations implemented in Kiwi and their performance metrics (evaluated on the 4-worker split-model pipeline):
-
-| Optimization | Baseline Metric | Optimized Metric | Speedup / Improvement | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| **Direct P2P Pipeline Forwarding** | **6.10 tok/sec** (TTFT: 0.69s) | **16.30 tok/sec** (TTFT: 0.20s) | **2.67x (167% speedup)** | Replaces gateway-coordinated token loop with streaming `/generate` endpoint. |
-| **Lossless Payload Compression (Zstd)** | ~40 KB per activation payload | ~33 KB per activation payload | **~17.5% network payload reduction** | Applies standard zstd compression to activation tensor bytes. |
-| **PagedAttention (Virtual Block KV-Cache)** | 5.42 tok/sec (fragmented dict cache) | **5.88 tok/sec** (Page-allocated cache) | **~8.5% faster generation, 0% KV fragmentation** | Uses fixed-size block pool memory management to prevent OOM/fragmentation. |
-| **Docker Build Layer Optimization** | 291 seconds build time | **< 5 seconds** rebuild time | **> 50x faster Docker rebuilds** | Splits heavy packages (Torch/Transformers) from lightweight, fast-changing ones. |
-
----
-
-## Quickstart
-
-### Prerequisites
-- Docker Desktop with Compose v2
-- ~4 GB disk for the model weights (downloaded once into a shared volume)
-
-### Run
-
-```bash
-docker compose up --build
-```
-
-Wait for the gateway health check to pass and all 4 workers to register (~60-90s for first run while model downloads). Then open:
-
-- **Chat UI:** [http://localhost:8080](http://localhost:8080)
-- **Live Registry:** [http://localhost:8080/registry](http://localhost:8080/registry)
-- **Health Check:** [http://localhost:8080/health](http://localhost:8080/health)
-
-### Test Fault Tolerance
-
-1. Start a long generation in the chat UI (e.g., *"Write a 300-word essay about distributed systems"*)
-2. While tokens are streaming, kill a worker:
-   ```bash
-   docker stop kiwi-worker_1-1
-   ```
-3. Watch the chat — you'll see `[REROUTING...]` in red, then generation continues seamlessly
-4. Check the registry — the killed worker shows `"healthy": false`
-5. Restart it:
-   ```bash
-   docker start kiwi-worker_1-1
-   ```
-6. The worker re-registers and returns to `"healthy": true`
-
-### API Usage
-
-Kiwi exposes an OpenAI-compatible chat completions endpoint:
-
-```bash
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "kiwi-qwen2.5-0.5b-instruct",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "stream": true,
-    "max_tokens": 128
-  }'
-```
-
-### P2P Networking & Testing Guides
-- **[P2P Networking Guide (`P2P_TESTING.md`)](file:///c:/Users/harsh/OneDrive/Desktop/cs%20projects/kiwi/P2P_TESTING.md)**: Instructions for running and testing `hivemind.p2p` / libp2p networking across single-machine setups (`docker-compose.internet.yml`) or multi-machine clusters over the internet without `ngrok`.
-- **[E2E Testing Guide (`TESTING.md`)](file:///c:/Users/harsh/OneDrive/Desktop/cs%20projects/kiwi/TESTING.md)**: Comprehensive manual and automated verification instructions for multi-model assignment, layer coverage, and fault tolerance.
-
----
-
-
-## Project Structure
+The system consists of three main components:
 
 ```
-kiwi/
-├── gateway.py          # Central orchestrator, tokenizer, registry, SSE API
-├── worker.py           # Generic worker — registers, slices model, P2P forwards
-├── index.html          # Dark-mode chat UI (TailwindCSS)
-├── Dockerfile          # Single image for all containers (python:3.10-slim)
-├── docker-compose.yml  # 1 gateway + 4 worker replicas
-└── requirements.txt    # FastAPI, PyTorch (CPU), Transformers, safetensors, httpx
+┌─────────────────────────────────────────────────────────┐
+│                    Gateway (:8080)                      │
+│  ┌───────────┐   ┌─────────────────┐   ┌─────────────┐  │
+│  │ Tokenizer │   │ WorkerRegistry  │   │ SSE API     │  │
+│  │ (AutoTok) │   │ (Stage Balance) │   │ /v1/chat/...│  │
+│  └───────────┘   └─────────────────┘   └─────────────┘  │
+└────────────────────────────┬────────────────────────────┘
+                             │ tiny input_ids
+                             ▼
+              ┌─────────────────────────────┐
+              │   Stage A (Layers 0–11)     │  ← worker_1 / worker_2
+              │   Embeddings + Blocks       │
+              └──────────────┬──────────────┘
+                             │ hidden_states (P2P safetensors + zstd)
+                             ▼
+              ┌─────────────────────────────┐
+              │   Stage B (Layers 12–23)    │  ← worker_3 / worker_4
+              │   Blocks + LM Head          │
+              └──────────────┬──────────────┘
+                             │ next_token_id (JSON)
+                             ▼
+                      Gateway → SSE → Browser
 ```
 
-### Gateway (`gateway.py`)
-- Owns the `AutoTokenizer` — workers never see raw text
-- Maintains an in-memory `WorkerRegistry` with stage balancing and `last_seen` heartbeat metrics
-- Runs the generation loop: tokenize ➔ dispatch to Stage A ➔ receive token ➔ stream SSE (including active node mapping)
-- Implements active recompute on failure: evict dead node ➔ select new pair ➔ re-prefill with full context
+### 1. Control Plane
+- Maintains an in-memory registry of available workers with stage coverage balancing and last-seen heartbeat metrics.
+- Exposes standard OpenAI-compatible chat completion endpoints with Server-Sent Events (SSE) token streaming.
+- Runs a 5-second background eviction loop: soft-evicts nodes missing heartbeats for >15s and hard-evicts after >120s.
+- Coordinates KV-Cache Active Recompute during mid-stream node failures.
 
-### Worker (`worker.py`)
-- Boots agnostically, registers via `POST /register`, receives stage + layer assignment
-- Runs a background loop pinging `/heartbeat` to gateway every 5s
-- Sends `POST /deregister` on shutdown for graceful eviction
-- Runs a background TTL cache manager to evict idle KV cache items older than 60s
-- Stage A: computes hidden states, P2P forwards to Stage B via `httpx`
-- Stage B: computes logits + argmax, returns `next_token_id`
-- Maintains per-request KV cache keyed by `X-Request-ID`
+### 2. Data Plane
+- Provides an abstract transport layer with two implementations: direct inter-container HTTP POST requests for local communication, and peer-to-peer streams for cross-network communication across NATs.
+- Implements lossless Zstd compression and optional INT8 / Compressed Sparse Row (`CSR`) activation quantization to minimize cross-node transfer overhead.
 
-### Frontend (`index.html`)
-- Dark-mode TailwindCSS chat interface supporting multi-turn conversation memory
-- SSE streaming with progressive token rendering
-- Canvas-based topology panel with active pipeline path highlighting and eviction visualizers
-
----
-
-## Key Design Decisions
-
-| Decision | Rationale |
-|----------|-----------|
-| Safetensors over pickle | Security — prevents arbitrary code execution via deserialization |
-| P2P over hub-and-spoke | Performance — gateway doesn't bottleneck on multi-MB hidden states |
-| Stage assignment at boot | Flexibility — identical worker images, no config per replica |
-| Prefill-based recompute | Simplicity — stateless gateway, no cache migration protocol needed |
-| KV cache keyed by request ID | Isolation — concurrent users don't interfere with each other |
-| `layer_idx` renumbering | Correctness — DynamicCache indexes by layer position, not global index |
+### 3. Node Agent
+- Boots agnostically and sends hardware capacity (CPU, VRAM).
+- Loads assigned Hugging Face transformer model slices.
+- Executes forward passes, maintains local per-request `PagedCache` KV entries, and handles automatic 60-second TTL cache eviction.
+- Sends graceful deregistration signals upon shutdown.
 
 ---
 
 ## Tech Stack
 
-- **Runtime:** Python 3.10, FastAPI, Uvicorn
-- **ML:** PyTorch (CPU), Hugging Face Transformers
-- **Transport:** httpx, safetensors binary serialization
-- **Frontend:** Vanilla JS, TailwindCSS (CDN)
-- **Infra:** Docker Compose, shared HuggingFace cache volume
+- **Orchestration & Serving:** Python 3.10, FastAPI, Uvicorn, AsyncIO, Pydantic
+- **Machine Learning:** PyTorch (CPU/GPU), Hugging Face Transformers (`AutoModelForCausalLM`, `AutoTokenizer`)
+- **Transport & Security:** `safetensors` binary serialization, `httpx`, `hivemind.p2p` (libp2p streaming)
+- **Compressions & Optimizations:** Zstd compression, INT8 activation quantization, CSR sparsification, PagedAttention block pool
+- **Frontend & Visualization:** Vanilla JS, HTML5 Canvas, TailwindCSS
+
+---
+
+## How We Built This
+
+We used ChatGPT with GPT-5.5 to research existing distributed inference solutions and generate our initial architecture. From there, we used Codex to build our Proof of Concept. It handled the scaffolding for the gateway, worker registration, and the initial P2P forwarding logic. Codex was particularly useful for rapidly iterating on the FastAPI endpoints and the `async` worker heartbeat/eviction loops, letting us get a working end-to-end pipeline up fast without manually wiring boilerplate.
+
+Once we exhausted our weekly Codex quota, we switched to Antigravity using the GPT-OSS 120B model to build the remaining features and debug our complex networking logic, particularly the KV-Cache Active Recompute flow and the `safetensors` transport layer.
+
+---
+
+## Core Technical Challenges & Solutions
+
+### 1. Heterogeneous Bandwidth & Transfer Stalls
+*Challenge:* Transferring uncompressed activation tensors (e.g. 10+ MB per layer boundary) over consumer internet connections causes severe pipeline stalls.  
+*Solution:* Combining binary `safetensors` packing with Zstd compression reduces activation sizes by ~17.5%. Optional INT8 quantization and CSR sparsification cut transmission overhead further while keeping pipeline stalls minimal.
+
+### 2. Zero-Migration Fault Tolerance (KV-Cache Active Recompute)
+*Challenge:* Worker dropouts mid-generation corrupt state. Migrating gigabytes of KV-cache memory between consumer nodes across WAN introduces unacceptable latency.  
+*Solution:* Instead of state migration protocols, Kiwi uses active recompute. The gateway re-routes the prompt and generated tokens to a healthy replacement pair in a single prefill pass, hot-rebuilding KV caches instantly.
+
+### 3. Arbitrary Code Execution Prevention
+*Challenge:* Standard Python inter-node transport relying on `torch.save` / `pickle` is vulnerable to arbitrary remote code execution (CVE-2025-32434).  
+*Solution:* Kiwi uses strict `safetensors` binary payload encoding over HTTP/libp2p binary streams, ensuring secure zero-pickle tensor deserialization.
+
+### 4. Memory Fragmentation Under Concurrency
+*Challenge:* Standard dictionary-based KV caches suffer from severe VRAM fragmentation and out-of-memory errors on limited consumer GPUs.  
+*Solution:* Kiwi implements `PagedCacheManager`, a PagedAttention-inspired virtual block pool manager that allocates fixed physical memory blocks to active requests and recycles them via a 60-second TTL background sweeper.
+
+---
+
+## Performance Metrics: TODO
+
+| Optimization | Baseline | Kiwi Optimized | Speedup / Impact |
+| :--- | :--- | :--- | :--- |
+| **Direct P2P Pipeline Forwarding** | 6.10 tok/sec | **16.30 tok/sec** | **2.67x faster generation** |
+| **Lossless Payload Compression (Zstd)** | ~40 KB / activation | **~33 KB / activation** | **~17.5% bandwidth reduction** |
+| **PagedAttention Block KV-Cache** | 5.42 tok/sec (fragmented) | **5.88 tok/sec** | **~8.5% faster, 0% KV fragmentation** |
+| **Docker Build Layer Optimization** | 291s rebuild | **< 5s rebuild** | **> 50x faster container builds** |
+
+---
+
+## Impact
+
+- **Democratized LLM Inference:** Enables high-parameter model inference without expensive enterprise GPU infrastructure.
+- **Unlocks Idle Compute:** Harnesses global, underutilized consumer GPU VRAM into a unified inference substrate.
+- **Production-Grade Resilience:** Transforms unpredictable consumer hardware into a seamless, self-healing API service.
+
+---
+
+## Future Work
+
+- **Decentralized DHT Node Discovery:** Transitioning registry coordination to a fully decentralized Kademlia DHT.
+- **WebGPU Node Runtimes:** Enabling browser-based GPU workers via WebGPU and ONNX Runtime.
+- **Reputation & Verification:** Cryptographic spot-checking and redundant computation voting to protect against untrusted worker nodes.
