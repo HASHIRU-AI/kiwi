@@ -381,12 +381,16 @@
       try {
         const response = await fetch('/v1/models');
         const result = await response.json();
+        const currentSelected = modelSelect.value;
         modelSelect.innerHTML = '';
         
         if (result.data && result.data.length > 0) {
           result.data.forEach(model => {
             const opt = document.createElement('option');
             opt.value = model.id;
+            if (model.id === currentSelected) {
+              opt.selected = true;
+            }
             // Format model name for friendly reading
             const shortName = model.id.split('/').pop();
             const alias = model.aliases.length > 0 ? ` (${model.aliases[0]})` : '';
