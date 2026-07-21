@@ -412,15 +412,26 @@ async def _discover_bootstrap_peers() -> list[str]:
                 if parsed.hostname:
                     host = parsed.hostname
                     # Check if host is IP address
+                    import socket
+                    is_ip = False
                     try:
+                        ipaddress.ip_address(host)
+                        is_ip = True
+                    except ValueError:
+                        try:
+                            host = socket.gethostbyname(host)
+                            is_ip = True
+                        except socket.gaierror:
+                            pass
+                            
+                    if is_ip:
                         ip = ipaddress.ip_address(host)
                         if ip.version == 6:
                             maddr_construct = f"/ip6/{host}/tcp/{p2p_port}/p2p/{peer_id}"
                         else:
                             maddr_construct = f"/ip4/{host}/tcp/{p2p_port}/p2p/{peer_id}"
-                    except ValueError:
-                        # DNS name
-                        maddr_construct = f"/dns/{host}/tcp/{p2p_port}/p2p/{peer_id}"
+                    else:
+                        maddr_construct = f"/dns4/{host}/tcp/{p2p_port}/p2p/{peer_id}"
                     
                     if maddr_construct not in bootstrap_maddrs:
                         bootstrap_maddrs.append(maddr_construct)
@@ -434,9 +445,48 @@ async def _discover_bootstrap_peers() -> list[str]:
     raise RuntimeError(f"{NODE_NAME} failed to discover P2P bootstrap peers from gateway")
 
 
+_public_ip_cache: str | None = None
+
+async def _get_public_ip() -> str | None:
+    global _public_ip_cache
+    if _public_ip_cache:
+        return _public_ip_cache
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get("https://api.ipify.org")
+            if resp.status_code == 200:
+                _public_ip_cache = resp.text.strip()
+                return _public_ip_cache
+    except Exception:
+        pass
+    return None
+
 async def _register() -> dict[str, Any]:
     _, vram_gb = _detect_device()
-    peer_id = await transport.get_address() if transport and P2P_TRANSPORT == "p2p" else ""
+    peer_id = ""
+    visible_maddrs = []
+    if P2P_TRANSPORT == "p2p" and transport is not None:
+        try:
+            peer_id = await transport.get_address()
+            if hasattr(transport, "_p2p") and transport._p2p is not None:
+                maddrs = await transport._p2p.get_visible_maddrs()
+                visible_maddrs = [str(m) for m in maddrs]
+                
+            public_ip = await _get_public_ip()
+            if public_ip:
+                try:
+                    ip = ipaddress.ip_address(public_ip)
+                    if ip.version == 6:
+                        public_maddr = f"/ip6/{public_ip}/tcp/{P2P_PORT}/p2p/{peer_id}"
+                    else:
+                        public_maddr = f"/ip4/{public_ip}/tcp/{P2P_PORT}/p2p/{peer_id}"
+                    if public_maddr not in visible_maddrs:
+                        visible_maddrs.append(public_maddr)
+                except ValueError:
+                    pass
+        except Exception:
+            pass
+
     payload = {
         "node_name": NODE_NAME,
         "node_url": NODE_URL,
@@ -444,6 +494,7 @@ async def _register() -> dict[str, Any]:
         "p2p_port": P2P_PORT,
         "cpu_cores": os.cpu_count() or 1,
         "vram_gb": vram_gb,
+        "maddrs": visible_maddrs,
     }
     for attempt in range(60):
         try:
@@ -546,9 +597,27 @@ async def _re_register() -> None:
     _, vram_gb = _detect_device()
     
     peer_id = ""
+    visible_maddrs = []
     if P2P_TRANSPORT == "p2p" and transport is not None:
         try:
             peer_id = await transport.get_address()
+            if hasattr(transport, "_p2p") and transport._p2p is not None:
+                maddrs = await transport._p2p.get_visible_maddrs()
+                visible_maddrs = [str(m) for m in maddrs]
+                
+            public_ip = await _get_public_ip()
+            if public_ip:
+                try:
+                    ip = ipaddress.ip_address(public_ip)
+                    if ip.version == 6:
+                        public_maddr = f"/ip6/{public_ip}/tcp/{P2P_PORT}/p2p/{peer_id}"
+                    else:
+                        public_maddr = f"/ip4/{public_ip}/tcp/{P2P_PORT}/p2p/{peer_id}"
+                    if public_maddr not in visible_maddrs:
+                        visible_maddrs.append(public_maddr)
+                except ValueError:
+                    pass
+
             # Dynamic re-discovery of new gateway bootstrap peers
             new_bootstrap_peers = await _discover_bootstrap_peers()
             for peer in new_bootstrap_peers:
@@ -568,6 +637,7 @@ async def _re_register() -> None:
         "vram_gb": vram_gb,
         "model_id": assigned_model_id,
         "layers": list(layer_range) if layer_range else None,
+        "maddrs": visible_maddrs,
     }
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
