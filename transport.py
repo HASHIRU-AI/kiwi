@@ -330,7 +330,7 @@ class P2PTransport(KiwiTransport):
                 with suppress(Exception):
                     await writer.wait_closed()
 
-        max_attempts = 10
+        max_attempts = 1 if headers.get("X-Step") == "decode" else 10
         backoff = 0.2
         for attempt in range(1, max_attempts + 1):
             try:
