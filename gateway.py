@@ -54,7 +54,6 @@ class WorkerRegistration(BaseModel):
     vram_gb: float = Field(ge=0)
     model_id: str | None = None
     layers: list[int] | None = None
-    maddrs: list[str] = Field(default_factory=list)
 
 
 class ChatMessage(BaseModel):
@@ -614,88 +613,11 @@ async def registry_view() -> dict[str, object]:
     return result
 
 
-async def _connect_to_worker_p2p(worker: Worker, p2p_port: int, client_host: str = "", maddrs: list[str] = None) -> None:
-    if maddrs is None:
-        maddrs = []
-        
-    # First attempt to connect using explicit maddrs provided by the worker (e.g. public IP)
-    for maddr_str in maddrs:
-        try:
-            print(f"[Gateway] Explicitly connecting to worker P2P via provided maddr: {maddr_str}", flush=True)
-            await transport._p2p._client.connect(PeerID.from_base58(worker.peer_id), [Multiaddr(maddr_str)])
-            print(f"[Gateway] Successfully connected to worker {worker.node_name} via P2P (maddr: {maddr_str})", flush=True)
-            return
-        except Exception as exc:
-            print(f"[Gateway] Failed to connect to {maddr_str}: {exc}", flush=True)
-
-    # Fallback to older DNS/Host resolution if explicit maddrs failed or were not provided
-    try:
-        from urllib.parse import urlparse
-        import ipaddress
-        import socket
-        parsed = urlparse(worker.node_url)
-        host = parsed.hostname
-
-        # Try to resolve hostname to IP in Python because the go-libp2p daemon might fail
-        # to resolve docker internal DNS hostnames like "worker_1"
-        is_ip = False
-        if host:
-            try:
-                ipaddress.ip_address(host)
-                is_ip = True
-            except ValueError:
-                # Not an IP, try to resolve
-                try:
-                    host = socket.gethostbyname(host)
-                    is_ip = True
-                except socket.gaierror:
-                    pass
-
-        # Fall back to client_host if host is not a direct IP (e.g. is a container name or localhost)
-        if not is_ip and client_host:
-            try:
-                ip_obj = ipaddress.ip_address(client_host)
-                if not ip_obj.is_private:
-                    host = client_host
-                    is_ip = True
-            except ValueError:
-                pass
-
-        if not host:
-            return
-
-        if is_ip:
-            ip = ipaddress.ip_address(host)
-            if ip.version == 6:
-                maddr = f"/ip6/{host}/tcp/{p2p_port}"
-            else:
-                maddr = f"/ip4/{host}/tcp/{p2p_port}"
-        else:
-            maddr = f"/dns4/{host}/tcp/{p2p_port}"
-    
-        print(f"[Gateway] Explicitly connecting to worker P2P address: {maddr}/p2p/{worker.peer_id}", flush=True)
-        try:
-            await transport._p2p._client.connect(PeerID.from_base58(worker.peer_id), [Multiaddr(maddr)])
-            print(f"[Gateway] Successfully connected to worker {worker.node_name} via P2P", flush=True)
-        except Exception as exc:
-            print(f"[Gateway] Failed to explicitly connect to worker {worker.node_name} via P2P: {exc}", flush=True)
-    except Exception as exc:
-        print(f"[Gateway] Failed to explicitly connect to worker {worker.node_name} via P2P: {exc}", flush=True)
-
-
 @app.post("/register")
 async def register_worker(registration: WorkerRegistration, request: Request) -> JSONResponse:
     if not model_registry:
         raise HTTPException(status_code=503, detail="Gateway not ready")
     worker = await registry.register(registration, model_registry)
-    if P2P_TRANSPORT == "p2p" and transport is not None and worker.peer_id:
-        # Check X-Forwarded-For or X-Real-IP headers first (for reverse proxies)
-        client_host = request.headers.get("x-forwarded-for") or request.headers.get("x-real-ip")
-        if client_host:
-            client_host = client_host.split(",")[0].strip()
-        else:
-            client_host = request.client.host if request.client else ""
-        asyncio.create_task(_connect_to_worker_p2p(worker, registration.p2p_port, client_host, registration.maddrs))
     model = model_registry.resolve(worker.model_id)
     return JSONResponse(
         {
