@@ -44,7 +44,7 @@ class OpenAIRunner(BaseRunner):
                         try:
                             data = json.loads(line[6:])
                             content = data["choices"][0]["delta"].get("content", "")
-                            if content:
+                            if content and content != "[REROUTING...]":
                                 if ttft is None:
                                     ttft = time.time() - start_time
                                 token_count += 1
