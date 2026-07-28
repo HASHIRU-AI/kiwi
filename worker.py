@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 import torch
+import torch.nn.functional as F
 from fastapi import FastAPI, HTTPException, Request, Response
 from safetensors.torch import load as safetensors_load
 from safetensors.torch import save as safetensors_save
@@ -442,11 +443,11 @@ def _run_forward(
     *,
     input_ids: torch.Tensor | None = None,
     hidden_states: torch.Tensor | None = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run this worker's layers.
 
     Returns:
-        ``Tensor`` – hidden states on CPU
+        tuple of (hidden_states on CPU, loss on CPU or None)
     """
     assert model is not None
     with torch.inference_mode():
@@ -462,26 +463,47 @@ def _run_forward(
                 return_dict=True,
             )
 
+        last_hidden_state = outputs.last_hidden_state
+        loss_cpu = None
+
+        if is_last_stage:
+            assert input_ids is not None, "Last-stage worker requires input_ids/labels for loss calculation"
+            logits = model.lm_head(last_hidden_state)
+            vocab_size = model.config.vocab_size
+
+            labels = input_ids
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous().to(logits.device)
+
+            loss = F.cross_entropy(shift_logits.reshape(-1, vocab_size), shift_labels.reshape(-1))
+            loss_cpu = loss.detach().cpu()
+            print(f"[{NODE_NAME}] Forward loss: {loss_cpu.item():.4f}", flush=True)
+
         # Always return on CPU for safetensors serialization and network transfer.
-        return outputs.last_hidden_state.contiguous().cpu()
+        return last_hidden_state.contiguous().cpu(), loss_cpu
 
 
-def _serialize_hidden_states(result: torch.Tensor) -> tuple[bytes, dict[str, str]]:
+def _serialize_hidden_states(
+    result: torch.Tensor, input_ids: torch.Tensor | None = None
+) -> tuple[bytes, dict[str, str]]:
     """Serialize hidden states for P2P transfer."""
-    binary_hidden = safetensors_save({"hidden_states": result})
+    tensors_to_save = {"hidden_states": result}
+    if input_ids is not None:
+        tensors_to_save["input_ids"] = input_ids
+    binary_hidden = safetensors_save(tensors_to_save)
     return binary_hidden, {}
 
 
-async def _process_forward(request_id: str, body_bytes: bytes) -> torch.Tensor:
+async def _process_forward(request_id: str, body_bytes: bytes) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     tensors = safetensors_load(body_bytes)
+    input_ids = tensors.get("input_ids")
 
     # ── Run this worker's layers ──
     if is_first_stage:
-        input_ids = tensors.get("input_ids")
         if input_ids is None:
             raise ValueError("First-stage worker requires input_ids")
         async with model_lock:
-            result = await asyncio.to_thread(
+            result, loss = await asyncio.to_thread(
                 _run_forward, request_id, input_ids=input_ids
             )
     else:
@@ -491,10 +513,10 @@ async def _process_forward(request_id: str, body_bytes: bytes) -> torch.Tensor:
         hidden_in = hidden_in.to(_dtype())
 
         async with model_lock:
-            result = await asyncio.to_thread(
-                _run_forward, request_id, hidden_states=hidden_in
+            result, loss = await asyncio.to_thread(
+                _run_forward, request_id, hidden_states=hidden_in, input_ids=input_ids
             )
-    return result
+    return result, loss, input_ids
 
 
 async def _execute_forward_pipeline(headers: dict[str, str], body_bytes: bytes) -> bytes:
@@ -507,17 +529,18 @@ async def _execute_forward_pipeline(headers: dict[str, str], body_bytes: bytes) 
     pipeline_header = headers.get("x-pipeline") or headers.get("X-Pipeline", "")
     next_workers = [u.strip() for u in pipeline_header.split(",") if u.strip()]
 
-    result = await _process_forward(request_id, body_bytes)
+    result, loss, input_ids = await _process_forward(request_id, body_bytes)
 
     if is_last_stage and not next_workers:
-        return safetensors_save({"hidden_states": result})
+        assert loss is not None, "Last stage must compute loss"
+        return safetensors_save({"loss": loss})
 
     if not next_workers:
         raise RuntimeError("Non-last worker received empty pipeline")
 
     next_target = next_workers[0]
     remaining_pipeline = ",".join(next_workers[1:])
-    binary_hidden, compression_headers = _serialize_hidden_states(result)
+    binary_hidden, compression_headers = _serialize_hidden_states(result, input_ids=input_ids)
 
     if transport is None:
         raise RuntimeError("Transport layer is not initialized")
