@@ -48,7 +48,7 @@ HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "5"))
 
 # ── Training state ──────────────────────────────────────────────────────────────
 # LR = 5e-3
-LR = 1e-5  # fine-tuning-scale LR; 1e-3 diverges when the model starts near the target
+LR = float(os.getenv("KIWI_LR", "1e-5"))
 optimizer: torch.optim.Optimizer | None = None
 MODEL_DTYPE = os.getenv("MODEL_DTYPE", "bfloat16")
 
@@ -490,6 +490,7 @@ def _run_forward(
     *,
     input_ids: torch.Tensor | None = None,
     hidden_states: torch.Tensor | None = None,
+    labels: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run this worker's layers with autograd enabled.
 
@@ -526,11 +527,12 @@ def _run_forward(
         logits = model.lm_head(last_hidden_state)
         vocab_size = model.config.vocab_size
 
-        labels = input_ids
+        if labels is None:
+            labels = input_ids
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous().to(logits.device)
 
-        loss = F.cross_entropy(shift_logits.reshape(-1, vocab_size), shift_labels.reshape(-1))
+        loss = F.cross_entropy(shift_logits.reshape(-1, vocab_size), shift_labels.reshape(-1), ignore_index=-100)
         # Cache the graph-attached loss for backward.
         cached_outputs[request_id] = loss
         loss_cpu = loss.detach().cpu()
@@ -548,19 +550,22 @@ def _run_forward(
 
 
 def _serialize_hidden_states(
-    result: torch.Tensor, input_ids: torch.Tensor | None = None
+    result: torch.Tensor, input_ids: torch.Tensor | None = None, labels: torch.Tensor | None = None
 ) -> tuple[bytes, dict[str, str]]:
     """Serialize hidden states for P2P transfer."""
     tensors_to_save = {"hidden_states": result}
     if input_ids is not None:
         tensors_to_save["input_ids"] = input_ids
+    if labels is not None:
+        tensors_to_save["labels"] = labels
     binary_hidden = safetensors_save(tensors_to_save)
     return binary_hidden, {}
 
 
-async def _process_forward(request_id: str, body_bytes: bytes) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+async def _process_forward(request_id: str, body_bytes: bytes) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     tensors = safetensors_load(body_bytes)
     input_ids = tensors.get("input_ids")
+    labels = tensors.get("labels")
 
     # ── Run this worker's layers ──
     if is_first_stage:
@@ -568,7 +573,7 @@ async def _process_forward(request_id: str, body_bytes: bytes) -> tuple[torch.Te
             raise ValueError("First-stage worker requires input_ids")
         async with model_lock:
             result, loss = await asyncio.to_thread(
-                _run_forward, request_id, input_ids=input_ids
+                _run_forward, request_id, input_ids=input_ids, labels=labels
             )
     else:
         hidden_in = tensors.get("hidden_states")
@@ -578,9 +583,9 @@ async def _process_forward(request_id: str, body_bytes: bytes) -> tuple[torch.Te
 
         async with model_lock:
             result, loss = await asyncio.to_thread(
-                _run_forward, request_id, hidden_states=hidden_in, input_ids=input_ids
+                _run_forward, request_id, hidden_states=hidden_in, input_ids=input_ids, labels=labels
             )
-    return result, loss, input_ids
+    return result, loss, input_ids, labels
 
 
 async def _execute_forward_pipeline(headers: dict[str, str], body_bytes: bytes) -> bytes:
@@ -599,7 +604,7 @@ async def _execute_forward_pipeline(headers: dict[str, str], body_bytes: bytes) 
 
     success = False
     try:
-        result, loss, input_ids = await _process_forward(request_id, body_bytes)
+        result, loss, input_ids, labels = await _process_forward(request_id, body_bytes)
 
         # ── Last stage: run backward, propagate grads upstream ──
         if is_last_stage and not next_workers:
@@ -660,7 +665,7 @@ async def _execute_forward_pipeline(headers: dict[str, str], body_bytes: bytes) 
 
         next_target = next_workers[0]
         remaining_pipeline = ",".join(next_workers[1:])
-        binary_hidden, compression_headers = _serialize_hidden_states(result, input_ids=input_ids)
+        binary_hidden, compression_headers = _serialize_hidden_states(result, input_ids=input_ids, labels=labels)
 
         if transport is None:
             raise RuntimeError("Transport layer is not initialized")

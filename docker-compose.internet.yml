@@ -56,6 +56,7 @@ services:
       KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "1.0"
+      KIWI_LR: ${KIWI_LR:-1e-5}
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./worker.py:/app/worker.py
@@ -92,6 +93,7 @@ services:
       KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "1.0"
+      KIWI_LR: ${KIWI_LR:-1e-5}
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./worker.py:/app/worker.py
