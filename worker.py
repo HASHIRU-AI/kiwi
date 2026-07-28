@@ -48,13 +48,14 @@ HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "5"))
 
 # ── Training state ──────────────────────────────────────────────────────────────
 # LR = 5e-3
-LR = 1e-3
+LR = 1e-5  # fine-tuning-scale LR; 1e-3 diverges when the model starts near the target
 optimizer: torch.optim.Optimizer | None = None
 MODEL_DTYPE = os.getenv("MODEL_DTYPE", "bfloat16")
 
 # ── Backward pass tensor caches (keyed by request_id) ───────────────────────────
 cached_inputs: dict[str, torch.Tensor] = {}
 cached_outputs: dict[str, torch.Tensor] = {}
+last_predictions: dict[str, torch.Tensor] = {}
 
 
 def _dtype() -> torch.dtype:
@@ -533,6 +534,10 @@ def _run_forward(
         # Cache the graph-attached loss for backward.
         cached_outputs[request_id] = loss
         loss_cpu = loss.detach().cpu()
+        # Cache per-token predictions (argmax over shifted logits) so the client
+        # can inspect what the model predicts at each next-token position.
+        # Used by the English recitation test; harmless for other callers.
+        last_predictions[request_id] = shift_logits.argmax(dim=-1).detach().cpu()
         print(f"[{NODE_NAME}] Forward loss: {loss_cpu.item():.4f}", flush=True)
     else:
         # Cache the graph-attached hidden_state for backward.
@@ -635,7 +640,12 @@ async def _execute_forward_pipeline(headers: dict[str, str], body_bytes: bytes) 
 
             # Serialize the *detached* loss_cpu, not the graph-attached loss.
             success = True
-            return safetensors_save({"loss": loss, "stage0_grad_norm": stage0_grad_norm})
+            out = {"loss": loss, "stage0_grad_norm": stage0_grad_norm}
+            # Include per-token predictions if available (English recitation test).
+            preds = last_predictions.pop(request_id, None)
+            if preds is not None:
+                out["predictions"] = preds
+            return safetensors_save(out)
 
         # ── Non-last stage: forward downstream ──
         if not next_workers:
@@ -676,6 +686,7 @@ async def _execute_forward_pipeline(headers: dict[str, str], body_bytes: bytes) 
         if (is_last_stage and not next_workers) or not success:
             cached_inputs.pop(request_id, None)
             cached_outputs.pop(request_id, None)
+            last_predictions.pop(request_id, None)
 
 
 async def _execute_backward_pipeline(headers: dict[str, str], body_bytes: bytes) -> bytes:
