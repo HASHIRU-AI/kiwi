@@ -37,7 +37,6 @@ transport: KiwiTransport | None = None
 # ── Populated from gateway assignment ────────────────────────────────────────────
 
 assigned_model_id: str | None = None
-assigned_dtype: str = "bfloat16"
 layer_range: tuple[int, int] | None = None
 is_first_stage: bool = False
 is_last_stage: bool = False
@@ -47,6 +46,12 @@ inference_device: str = "cpu"
 model_lock = asyncio.Lock()
 HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "5"))
 
+# ── Training state ──────────────────────────────────────────────────────────────
+# LR = 5e-3
+LR = 1e-3
+optimizer: torch.optim.Optimizer | None = None
+MODEL_DTYPE = os.getenv("MODEL_DTYPE", "bfloat16")
+
 # ── Backward pass tensor caches (keyed by request_id) ───────────────────────────
 cached_inputs: dict[str, torch.Tensor] = {}
 cached_outputs: dict[str, torch.Tensor] = {}
@@ -54,7 +59,7 @@ cached_outputs: dict[str, torch.Tensor] = {}
 
 def _dtype() -> torch.dtype:
     return {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}.get(
-        assigned_dtype, torch.bfloat16
+        MODEL_DTYPE, torch.bfloat16
     )
 
 
@@ -283,6 +288,9 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
             f"({position}) on {device_label}"
         )
 
+    global optimizer
+    optimizer = torch.optim.Adam(loaded_model.parameters(), lr=LR)
+
     return loaded_model
 
 
@@ -366,7 +374,7 @@ async def _deregister() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global assigned_model_id, assigned_dtype, layer_range
+    global assigned_model_id, layer_range
     global is_first_stage, is_last_stage, model, transport
 
     initial_peers = []
@@ -385,7 +393,6 @@ async def lifespan(_: FastAPI):
 
     assignment = await _register()
     assigned_model_id = assignment["model_id"]
-    assigned_dtype = assignment.get("dtype", "bfloat16")
     layer_range = tuple(assignment["layers"])
     total_layers = assignment["total_layers"]
     is_first_stage = layer_range[0] == 0
@@ -454,6 +461,27 @@ def _get_grad_norm() -> float:
         p.grad.norm() ** 2 for p in model.parameters() if p.grad is not None
     )
     return (total ** 0.5).item()
+
+
+def _run_backward_and_step(tensor: torch.Tensor, grad_in: torch.Tensor | None = None) -> float:
+    """Run backward pass and optimizer step in the correct sequence.
+    
+    WARNING: The caller MUST hold `model_lock` before executing this function
+    via `asyncio.to_thread`. This function does not acquire `model_lock` internally
+    to prevent deadlocks.
+    """
+    assert optimizer is not None
+    optimizer.zero_grad()
+    
+    if grad_in is not None:
+        tensor.backward(gradient=grad_in)
+    else:
+        tensor.backward()
+        
+    grad_norm = _get_grad_norm()
+    optimizer.step()
+    
+    return grad_norm
 
 
 def _run_forward(
@@ -564,81 +592,90 @@ async def _execute_forward_pipeline(headers: dict[str, str], body_bytes: bytes) 
     reverse_header = headers.get("x-reverse-pipeline") or headers.get("X-Reverse-Pipeline", "")
     reverse_workers = [u.strip() for u in reverse_header.split(",") if u.strip()]
 
-    result, loss, input_ids = await _process_forward(request_id, body_bytes)
+    success = False
+    try:
+        result, loss, input_ids = await _process_forward(request_id, body_bytes)
 
-    # ── Last stage: run backward, propagate grads upstream ──
-    if is_last_stage and not next_workers:
-        assert loss is not None, "Last stage must compute loss"
+        # ── Last stage: run backward, propagate grads upstream ──
+        if is_last_stage and not next_workers:
+            assert loss is not None, "Last stage must compute loss"
 
-        # Pop the graph-attached loss and run backward in a thread.
-        graph_loss = cached_outputs.pop(request_id)
-        await asyncio.to_thread(graph_loss.backward)
-        grad_norm = _get_grad_norm()
-        print(f"[{NODE_NAME}] Backward pass complete. Grad norm: {grad_norm:.6f}", flush=True)
+            # Pop the graph-attached loss and run backward in a thread.
+            graph_loss = cached_outputs.pop(request_id)
+            async with model_lock:
+                grad_norm = await asyncio.to_thread(_run_backward_and_step, graph_loss, None)
+            
+            print(f"[{NODE_NAME}] Backward pass complete. Grad norm: {grad_norm:.6f}", flush=True)
 
-        stage0_grad_norm = torch.tensor(grad_norm, dtype=torch.float32)
+            stage0_grad_norm = torch.tensor(grad_norm, dtype=torch.float32)
 
-        # If this is also the first stage (solo), we are the terminus.
-        if not is_first_stage and reverse_workers:
-            input_tensor = cached_inputs.pop(request_id)
-            assert input_tensor.grad is not None, "input_tensor.grad is None — graph was severed"
-            grad_to_send = input_tensor.grad.detach().contiguous().cpu()
+            # If this is also the first stage (solo), we are the terminus.
+            if not is_first_stage and reverse_workers:
+                input_tensor = cached_inputs.pop(request_id)
+                assert input_tensor.grad is not None, "input_tensor.grad is None — graph was severed"
+                grad_to_send = input_tensor.grad.detach().contiguous().cpu()
 
-            next_upstream = reverse_workers[0]
-            remaining_reverse = ",".join(reverse_workers[1:])
-            grad_payload = safetensors_save({"grad": grad_to_send})
+                next_upstream = reverse_workers[0]
+                remaining_reverse = ",".join(reverse_workers[1:])
+                grad_payload = safetensors_save({"grad": grad_to_send})
 
-            backward_response = await transport.send_backward(
-                target=next_upstream,
-                payload=grad_payload,
+                backward_response = await transport.send_backward(
+                    target=next_upstream,
+                    payload=grad_payload,
+                    headers={
+                        "X-Request-ID": request_id,
+                        "X-Reverse-Pipeline": remaining_reverse,
+                        "Content-Type": "application/octet-stream",
+                    },
+                    timeout=120.0,
+                )
+                # Extract stage0_grad_norm from the terminus response.
+                backward_tensors = safetensors_load(backward_response)
+                stage0_grad_norm = backward_tensors["grad_norm"]
+
+            # Serialize the *detached* loss_cpu, not the graph-attached loss.
+            success = True
+            return safetensors_save({"loss": loss, "stage0_grad_norm": stage0_grad_norm})
+
+        # ── Non-last stage: forward downstream ──
+        if not next_workers:
+            raise RuntimeError("Non-last worker received empty pipeline")
+
+        # Prepend our address to the reverse pipeline so backward knows where to send.
+        my_address = await transport.get_address()
+        if reverse_workers:
+            updated_reverse = ",".join([my_address] + reverse_workers)
+        else:
+            updated_reverse = my_address
+
+        next_target = next_workers[0]
+        remaining_pipeline = ",".join(next_workers[1:])
+        binary_hidden, compression_headers = _serialize_hidden_states(result, input_ids=input_ids)
+
+        if transport is None:
+            raise RuntimeError("Transport layer is not initialized")
+        try:
+            response_bytes = await transport.send_forward(
+                target=next_target,
+                payload=binary_hidden,
                 headers={
                     "X-Request-ID": request_id,
-                    "X-Reverse-Pipeline": remaining_reverse,
+                    "X-Pipeline": remaining_pipeline,
+                    "X-Reverse-Pipeline": updated_reverse,
                     "Content-Type": "application/octet-stream",
+                    **compression_headers,
                 },
                 timeout=120.0,
             )
-            # Extract stage0_grad_norm from the terminus response.
-            backward_tensors = safetensors_load(backward_response)
-            stage0_grad_norm = backward_tensors["grad_norm"]
-
-        # Serialize the *detached* loss_cpu, not the graph-attached loss.
-        return safetensors_save({"loss": loss, "stage0_grad_norm": stage0_grad_norm})
-
-    # ── Non-last stage: forward downstream ──
-    if not next_workers:
-        raise RuntimeError("Non-last worker received empty pipeline")
-
-    # Prepend our address to the reverse pipeline so backward knows where to send.
-    my_address = await transport.get_address()
-    if reverse_workers:
-        updated_reverse = ",".join([my_address] + reverse_workers)
-    else:
-        updated_reverse = my_address
-
-    next_target = next_workers[0]
-    remaining_pipeline = ",".join(next_workers[1:])
-    binary_hidden, compression_headers = _serialize_hidden_states(result, input_ids=input_ids)
-
-    if transport is None:
-        raise RuntimeError("Transport layer is not initialized")
-    try:
-        response_bytes = await transport.send_forward(
-            target=next_target,
-            payload=binary_hidden,
-            headers={
-                "X-Request-ID": request_id,
-                "X-Pipeline": remaining_pipeline,
-                "X-Reverse-Pipeline": updated_reverse,
-                "Content-Type": "application/octet-stream",
-                **compression_headers,
-            },
-            timeout=120.0,
-        )
-        return response_bytes
-    except Exception as error:
-        print(f"[{NODE_NAME}] Forwarding failed to downstream {next_target}: {error}", flush=True)
-        raise
+            success = True
+            return response_bytes
+        except Exception as error:
+            print(f"[{NODE_NAME}] Forwarding failed to downstream {next_target}: {error}", flush=True)
+            raise
+    finally:
+        if (is_last_stage and not next_workers) or not success:
+            cached_inputs.pop(request_id, None)
+            cached_outputs.pop(request_id, None)
 
 
 async def _execute_backward_pipeline(headers: dict[str, str], body_bytes: bytes) -> bytes:
@@ -653,45 +690,49 @@ async def _execute_backward_pipeline(headers: dict[str, str], body_bytes: bytes)
     if not request_id:
         raise ValueError("X-Request-ID is required")
 
-    reverse_header = headers.get("x-reverse-pipeline") or headers.get("X-Reverse-Pipeline", "")
-    reverse_workers = [u.strip() for u in reverse_header.split(",") if u.strip()]
+    try:
+        reverse_header = headers.get("x-reverse-pipeline") or headers.get("X-Reverse-Pipeline", "")
+        reverse_workers = [u.strip() for u in reverse_header.split(",") if u.strip()]
 
-    # Deserialize the incoming gradient.
-    tensors = safetensors_load(body_bytes)
-    grad_in = tensors["grad"]
-    grad_in = _to_device(grad_in).to(_dtype())
+        # Deserialize the incoming gradient.
+        tensors = safetensors_load(body_bytes)
+        grad_in = tensors["grad"]
+        grad_in = _to_device(grad_in).to(_dtype())
 
-    # Pop the cached graph-attached output and run backward in a thread.
-    output_tensor = cached_outputs.pop(request_id)
-    await asyncio.to_thread(output_tensor.backward, gradient=grad_in)
-    grad_norm = _get_grad_norm()
-    print(f"[{NODE_NAME}] Backward pass complete. Grad norm: {grad_norm:.6f}", flush=True)
+        # Pop the cached graph-attached output and run backward in a thread.
+        output_tensor = cached_outputs.pop(request_id)
+        async with model_lock:
+            grad_norm = await asyncio.to_thread(_run_backward_and_step, output_tensor, grad_in)
+        print(f"[{NODE_NAME}] Backward pass complete. Grad norm: {grad_norm:.6f}", flush=True)
 
-    # ── Terminus (first stage): return grad norm ──
-    if is_first_stage:
-        return safetensors_save({"grad_norm": torch.tensor(grad_norm, dtype=torch.float32)})
+        # ── Terminus (first stage): return grad norm ──
+        if is_first_stage:
+            return safetensors_save({"grad_norm": torch.tensor(grad_norm, dtype=torch.float32)})
 
-    # ── Middle stage: propagate upstream ──
-    input_tensor = cached_inputs.pop(request_id)
-    assert input_tensor.grad is not None, "input_tensor.grad is None — graph was severed"
-    grad_to_send = input_tensor.grad.detach().contiguous().cpu()
+        # ── Middle stage: propagate upstream ──
+        input_tensor = cached_inputs.pop(request_id)
+        assert input_tensor.grad is not None, "input_tensor.grad is None — graph was severed"
+        grad_to_send = input_tensor.grad.detach().contiguous().cpu()
 
-    next_upstream = reverse_workers[0]
-    remaining_reverse = ",".join(reverse_workers[1:])
-    grad_payload = safetensors_save({"grad": grad_to_send})
+        next_upstream = reverse_workers[0]
+        remaining_reverse = ",".join(reverse_workers[1:])
+        grad_payload = safetensors_save({"grad": grad_to_send})
 
-    backward_response = await transport.send_backward(
-        target=next_upstream,
-        payload=grad_payload,
-        headers={
-            "X-Request-ID": request_id,
-            "X-Reverse-Pipeline": remaining_reverse,
-            "Content-Type": "application/octet-stream",
-        },
-        timeout=120.0,
-    )
-    # Bubble the terminus response back.
-    return backward_response
+        backward_response = await transport.send_backward(
+            target=next_upstream,
+            payload=grad_payload,
+            headers={
+                "X-Request-ID": request_id,
+                "X-Reverse-Pipeline": remaining_reverse,
+                "Content-Type": "application/octet-stream",
+            },
+            timeout=120.0,
+        )
+        # Bubble the terminus response back.
+        return backward_response
+    finally:
+        cached_inputs.pop(request_id, None)
+        cached_outputs.pop(request_id, None)
 
 
 @app.post("/forward")
