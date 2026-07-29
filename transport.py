@@ -217,6 +217,34 @@ async def _read_framed_request(reader: asyncio.StreamReader) -> tuple[dict[str, 
     return headers, payload
 
 
+def _extract_failed_node(exc: Exception) -> str | None:
+    """Try to extract a failed_node from an exception's string representation.
+
+    When a worker bubbles up a downstream failure it embeds a JSON object
+    like {"failed_node": "...", ...} in the exception message.  We parse
+    that here so the transport can relay the *original* failed_node instead
+    of overwriting it with the relay's own peer ID.
+    """
+    exc_str = str(exc)
+    try:
+        # The handler may raise with a JSON string as the message.
+        parsed = json.loads(exc_str)
+        if isinstance(parsed, dict) and "failed_node" in parsed:
+            return parsed["failed_node"]
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Also check for embedded JSON within a larger message.
+    start = exc_str.find('{"failed_node"')
+    if start >= 0:
+        try:
+            parsed = json.loads(exc_str[start:])
+            if isinstance(parsed, dict) and "failed_node" in parsed:
+                return parsed["failed_node"]
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return None
+
+
 class P2PTransport(KiwiTransport):
     """P2P transport implementation wrapping hivemind.p2p libp2p streams."""
 
@@ -324,7 +352,8 @@ class P2PTransport(KiwiTransport):
         except Exception as exc:
             logger.error(f"[P2PTransport] Error handling forward stream from {getattr(stream_info, 'peer_id', 'unknown')}: {exc}", exc_info=True)
             print(f"[P2PTransport] Error handling forward stream from {getattr(stream_info, 'peer_id', 'unknown')}: {exc}", flush=True)
-            err_bytes = json.dumps({"error": str(exc)}).encode("utf-8")
+            failed_node = _extract_failed_node(exc) or self._peer_id
+            err_bytes = json.dumps({"error": str(exc), "failed_node": failed_node}).encode("utf-8")
             await _write_stream_chunked(writer, struct.pack(">I", len(err_bytes)) + err_bytes)
         finally:
             writer.close()
@@ -492,7 +521,8 @@ class P2PTransport(KiwiTransport):
         except Exception as exc:
             logger.error(f"[P2PTransport] Error handling backward stream from {getattr(stream_info, 'peer_id', 'unknown')}: {exc}", exc_info=True)
             print(f"[P2PTransport] Error handling backward stream from {getattr(stream_info, 'peer_id', 'unknown')}: {exc}", flush=True)
-            err_bytes = json.dumps({"error": str(exc)}).encode("utf-8")
+            failed_node = _extract_failed_node(exc) or self._peer_id
+            err_bytes = json.dumps({"error": str(exc), "failed_node": failed_node}).encode("utf-8")
             await _write_stream_chunked(writer, struct.pack(">I", len(err_bytes)) + err_bytes)
         finally:
             writer.close()
@@ -569,7 +599,8 @@ class P2PTransport(KiwiTransport):
         except Exception as exc:
             logger.error(f"[P2PTransport] Error handling adapter stream from {getattr(stream_info, 'peer_id', 'unknown')}: {exc}", exc_info=True)
             print(f"[P2PTransport] Error handling adapter stream from {getattr(stream_info, 'peer_id', 'unknown')}: {exc}", flush=True)
-            err_bytes = json.dumps({"error": str(exc)}).encode("utf-8")
+            failed_node = _extract_failed_node(exc) or self._peer_id
+            err_bytes = json.dumps({"error": str(exc), "failed_node": failed_node}).encode("utf-8")
             await _write_stream_chunked(writer, struct.pack(">I", len(err_bytes)) + err_bytes)
         finally:
             writer.close()

@@ -410,7 +410,7 @@ class WorkerRegistry:
                 }
             return result
 
-    async def heartbeat(self, node_name: str, latency_ms: float = 0.0) -> tuple[bool, str]:
+    async def heartbeat(self, node_name: str, latency_ms: float = 0.0) -> tuple[bool, str, str]:
         async with self._lock:
             worker = self._find_worker(node_name)
             if worker:
@@ -419,16 +419,20 @@ class WorkerRegistry:
                 worker.latency_ms = latency_ms
                 
                 standby_peer_id = ""
+                role = "unassigned"
                 pin = self._pinned_pipelines.get(worker.model_id, [])
                 if any(w.node_name == worker.node_name for w in pin):
+                    role = "active"
                     # It is active. Find a standby
                     for w2 in self._workers.values():
                         if w2.healthy and w2.model_id == worker.model_id and w2.layers == worker.layers and w2.node_name != worker.node_name and not any(pw.node_name == w2.node_name for pw in pin):
                             standby_peer_id = _worker_address(w2)
                             break
+                elif any(aw.model_id == worker.model_id and aw.layers == worker.layers for aw in pin):
+                    role = "standby"
                             
-                return True, standby_peer_id
-            return False, ""
+                return True, standby_peer_id, role
+            return False, "", "unknown"
 
     async def evict_stale(
         self, soft_stale_seconds: float, hard_stale_seconds: float
@@ -672,10 +676,10 @@ class HeartbeatRequest(BaseModel):
 
 @app.post("/heartbeat")
 async def heartbeat(request: HeartbeatRequest) -> dict[str, str]:
-    exists, standby_peer_id = await registry.heartbeat(request.node_name, request.latency_ms)
+    exists, standby_peer_id, role = await registry.heartbeat(request.node_name, request.latency_ms)
     if not exists:
         raise HTTPException(status_code=404, detail="Worker not registered")
-    return {"status": "ok", "standby_peer_id": standby_peer_id}
+    return {"status": "ok", "standby_peer_id": standby_peer_id, "role": role}
 
 
 @app.post("/deregister")
@@ -921,36 +925,115 @@ async def train_step(request: Request):
     if not model:
         raise HTTPException(status_code=400, detail=f"Unknown model: {model_id}")
 
-    try:
-        pipeline = await registry.get_pinned_pipeline(model.model_id, model.num_layers)
-    except RuntimeError as error:
-        raise HTTPException(status_code=503, detail=str(error))
-
     if transport is None:
         raise HTTPException(status_code=503, detail="Transport not initialized")
 
-    first_addr = _worker_address(pipeline[0])
-    remaining_urls = ",".join(_worker_address(w) for w in pipeline[1:])
     request_id = request.headers.get("x-request-id") or request.headers.get("X-Request-ID", uuid.uuid4().hex)
-    
     body = await request.body()
+    reroutes = 0
+
+    while True:
+        step_start_time = time.time()
+
+        try:
+            pipeline = await registry.get_pinned_pipeline(model.model_id, model.num_layers)
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error))
+
+        first_addr = _worker_address(pipeline[0])
+        remaining_urls = ",".join(_worker_address(w) for w in pipeline[1:])
+        pipeline_names = [w.node_name for w in pipeline]
+        print(f"[gateway] Train step dispatch (attempt {reroutes + 1}) via {pipeline_names}", flush=True)
+
+        try:
+            response_bytes = await transport.send_forward(
+                target=first_addr,
+                payload=body,
+                headers={
+                    "X-Request-ID": request_id,
+                    "X-Model-ID": model.model_id,
+                    "X-Pipeline": remaining_urls,
+                    "X-Reverse-Pipeline": "",
+                    "Content-Type": "application/octet-stream",
+                },
+                timeout=120.0
+            )
+
+            # Check if the response is a structured error (P2P transport wraps errors as JSON).
+            failed_node = _parse_failed_node(response_bytes)
+            if failed_node:
+                death_detected_time = time.time()
+                detection_latency_ms = (death_detected_time - step_start_time) * 1000
+                print(f"[gateway] Live-error detected in train_step response! "
+                      f"failed_node={failed_node}, Detection latency: {detection_latency_ms:.0f} ms", flush=True)
+                await registry.evict(failed_node)
+                reroutes += 1
+                if reroutes > MAX_REROUTES:
+                    raise HTTPException(status_code=500, detail=f"Train step retry budget exhausted after {MAX_REROUTES} reroutes")
+                continue
+
+            # Success path — log recovery metrics if this was a reroute.
+            if reroutes > 0:
+                resume_latency_ms = (time.time() - step_start_time) * 1000
+                print(f"[gateway] Recovery complete. Resume latency: {resume_latency_ms:.0f} ms "
+                      f"(after {reroutes} reroute(s))", flush=True)
+
+            return Response(content=response_bytes, media_type="application/octet-stream")
+
+        except HTTPException:
+            raise
+        except Exception as error:
+            death_detected_time = time.time()
+            detection_latency_ms = (death_detected_time - step_start_time) * 1000
+
+            # Try to extract the failed_node from the structured error.
+            failed_node = _parse_failed_node_from_error(error)
+            evict_target = failed_node or first_addr
+
+            print(f"[gateway] Live-error detected in train_step! "
+                  f"evicting={evict_target}, Detection latency: {detection_latency_ms:.0f} ms, "
+                  f"error={error}", flush=True)
+            await registry.evict(evict_target)
+
+            reroutes += 1
+            if reroutes > MAX_REROUTES:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Train step retry budget exhausted after {MAX_REROUTES} reroutes: {error}"
+                )
+            # Loop continues: will re-pin pipeline (promoting standby) and re-dispatch
+
+
+def _parse_failed_node(response_bytes: bytes) -> str | None:
+    """Try to parse a failed_node from a response that may be an error JSON."""
     try:
-        response_bytes = await transport.send_forward(
-            target=first_addr,
-            payload=body,
-            headers={
-                "X-Request-ID": request_id,
-                "X-Model-ID": model.model_id,
-                "X-Pipeline": remaining_urls,
-                "X-Reverse-Pipeline": "",
-                "Content-Type": "application/octet-stream",
-            },
-            timeout=120.0
-        )
-        return Response(content=response_bytes, media_type="application/octet-stream")
-    except Exception as error:
-        print(f"[gateway] Train step dispatch failed: {error}", flush=True)
-        raise HTTPException(status_code=500, detail=str(error))
+        data = json.loads(response_bytes)
+        if isinstance(data, dict) and "error" in data:
+            return data.get("failed_node")
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+        pass
+    return None
+
+
+def _parse_failed_node_from_error(error: Exception) -> str | None:
+    """Try to extract a failed_node from an exception's string representation."""
+    err_str = str(error)
+    try:
+        parsed = json.loads(err_str)
+        if isinstance(parsed, dict) and "failed_node" in parsed:
+            return parsed["failed_node"]
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Check for embedded JSON within a larger error message.
+    start = err_str.find('{"failed_node"')
+    if start >= 0:
+        try:
+            parsed = json.loads(err_str[start:])
+            if isinstance(parsed, dict) and "failed_node" in parsed:
+                return parsed["failed_node"]
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return None
 
 
 # ── Chat completions endpoint ────────────────────────────────────────────────────

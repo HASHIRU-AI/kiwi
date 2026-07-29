@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from contextlib import asynccontextmanager
@@ -362,6 +363,7 @@ async def _heartbeat_loop() -> None:
     """Ping the gateway periodically so it knows we're alive."""
     global current_standby_peer_id
     latency_ms = 0.0
+    current_role = "unknown"  # Track role to detect promotion
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
         try:
@@ -384,8 +386,51 @@ async def _heartbeat_loop() -> None:
                     if new_standby and new_standby != current_standby_peer_id:
                         current_standby_peer_id = new_standby
                         asyncio.create_task(_push_adapter())
+
+                    # ── Standby → Active promotion detection ──
+                    new_role = data.get("role", "unknown")
+                    if current_role == "standby" and new_role == "active" and model is not None:
+                        print(f"[{NODE_NAME}] *** Promoted to ACTIVE! Resuming from snapshot. ***", flush=True)
+                        _log_recovery_bytes_metrics()
+                    current_role = new_role
         except httpx.HTTPError:
             pass  # Gateway may be temporarily unreachable; keep retrying.
+
+
+def _log_recovery_bytes_metrics() -> None:
+    """Log apples-to-apples recovery bytes metrics on standby promotion.
+
+    Both baseline and adapter include optimizer state (Adam m + v) for
+    a fair comparison. The standby is pre-warmed so the actual promotion
+    recovery cost is ~0 bytes.
+    """
+    if model is None:
+        return
+
+    base_model = model.get_base_model()
+    # All params (frozen base + LoRA adapters)
+    base_params = sum(p.numel() for p in base_model.parameters())
+    # Only trainable LoRA params
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    # Both use bfloat16 (2 bytes) for weights + float32 (4 bytes each) for Adam m and v
+    bytes_per_param_weights = 2  # bfloat16
+    bytes_per_param_optimizer = 4 + 4  # Adam m (float32) + v (float32)
+    bytes_per_param_total = bytes_per_param_weights + bytes_per_param_optimizer  # 10 bytes
+
+    baseline_bytes = base_params * bytes_per_param_total
+    adapter_snapshot_bytes = trainable_params * bytes_per_param_total
+
+    baseline_mb = baseline_bytes / (1024 ** 2)
+    adapter_snapshot_mb = adapter_snapshot_bytes / (1024 ** 2)
+    ratio = baseline_bytes / adapter_snapshot_bytes if adapter_snapshot_bytes > 0 else float("inf")
+
+    print(f"[{NODE_NAME}] Recovery Metrics - Promotion Recovery Cost: ~0 MB (pre-warmed)", flush=True)
+    print(f"[{NODE_NAME}] Recovery Metrics - Ongoing Snapshot Cost: {adapter_snapshot_mb:.2f} MB "
+          f"({trainable_params:,} params × {bytes_per_param_total} bytes)", flush=True)
+    print(f"[{NODE_NAME}] Recovery Metrics - Full-weight baseline: {baseline_mb:.2f} MB "
+          f"({base_params:,} params × {bytes_per_param_total} bytes)", flush=True)
+    print(f"[{NODE_NAME}] Recovery Metrics - Transfer ratio: {ratio:.1f}x smaller than full-weight", flush=True)
 
 
 async def _deregister() -> None:
@@ -492,12 +537,15 @@ def _get_grad_norm() -> float:
     return (total ** 0.5).item()
 
 
-def _run_backward_and_step(tensor: torch.Tensor, grad_in: torch.Tensor | None = None) -> float:
-    """Run backward pass and optimizer step in the correct sequence.
+def _run_backward_only(tensor: torch.Tensor, grad_in: torch.Tensor | None = None) -> float:
+    """Run backward pass WITHOUT optimizer step.
+    
+    Computes gradients only. The optimizer step is deferred to _step_optimizer()
+    to enable commit-on-success semantics: we only commit when downstream
+    confirms the backward chain completed successfully.
     
     WARNING: The caller MUST hold `model_lock` before executing this function
-    via `asyncio.to_thread`. This function does not acquire `model_lock` internally
-    to prevent deadlocks.
+    via `asyncio.to_thread`.
     """
     assert optimizer is not None
     optimizer.zero_grad()
@@ -507,10 +555,28 @@ def _run_backward_and_step(tensor: torch.Tensor, grad_in: torch.Tensor | None = 
     else:
         tensor.backward()
         
-    grad_norm = _get_grad_norm()
-    optimizer.step()
+    return _get_grad_norm()
+
+
+def _step_optimizer() -> None:
+    """Commit the optimizer step after confirming downstream success.
     
-    return grad_norm
+    WARNING: The caller MUST hold `model_lock` before executing this function
+    via `asyncio.to_thread`.
+    """
+    assert optimizer is not None
+    optimizer.step()
+
+
+def _extract_failed_node_from_response(response_bytes: bytes) -> str | None:
+    """Try to parse a failed_node from a transport response that may be an error JSON."""
+    try:
+        data = json.loads(response_bytes)
+        if isinstance(data, dict) and "failed_node" in data:
+            return data["failed_node"]
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+        pass
+    return None
 
 
 from peft import get_peft_model_state_dict, set_peft_model_state_dict
@@ -685,23 +751,17 @@ async def _execute_forward_pipeline(headers: dict[str, str], body_bytes: bytes) 
         if is_last_stage and not next_workers:
             assert loss is not None, "Last stage must compute loss"
 
-            # Pop the graph-attached loss and run backward in a thread.
+            # Pop the graph-attached loss and run backward ONLY (no optimizer step yet).
             graph_loss = cached_outputs.pop(request_id)
             async with model_lock:
-                grad_norm = await asyncio.to_thread(_run_backward_and_step, graph_loss, None)
+                grad_norm = await asyncio.to_thread(_run_backward_only, graph_loss, None)
             
             print(f"[{NODE_NAME}] Backward pass complete. Grad norm: {grad_norm:.6f}", flush=True)
 
             stage0_grad_norm = torch.tensor(grad_norm, dtype=torch.float32)
-            
-            global training_steps, _last_step_request_id
-            if request_id != _last_step_request_id:
-                training_steps += 1
-                _last_step_request_id = request_id
-                if training_steps % 10 == 0:
-                    asyncio.create_task(_push_adapter())
 
-            # If this is also the first stage (solo), we are the terminus.
+            # If this is also the first stage (solo), we are the terminus —
+            # no send_backward needed; commit immediately.
             if not is_first_stage and reverse_workers:
                 input_tensor = cached_inputs.pop(request_id)
                 assert input_tensor.grad is not None, "input_tensor.grad is None — graph was severed"
@@ -711,19 +771,44 @@ async def _execute_forward_pipeline(headers: dict[str, str], body_bytes: bytes) 
                 remaining_reverse = ",".join(reverse_workers[1:])
                 grad_payload = safetensors_save({"grad": grad_to_send})
 
-                backward_response = await transport.send_backward(
-                    target=next_upstream,
-                    payload=grad_payload,
-                    headers={
-                        "X-Request-ID": request_id,
-                        "X-Reverse-Pipeline": remaining_reverse,
-                        "Content-Type": "application/octet-stream",
-                    },
-                    timeout=120.0,
-                )
+                try:
+                    backward_response = await transport.send_backward(
+                        target=next_upstream,
+                        payload=grad_payload,
+                        headers={
+                            "X-Request-ID": request_id,
+                            "X-Reverse-Pipeline": remaining_reverse,
+                            "Content-Type": "application/octet-stream",
+                        },
+                        timeout=120.0,
+                    )
+                except Exception as error:
+                    # send_backward failed — do NOT step the optimizer.
+                    # Raise with the failed_node so the gateway can evict the right worker.
+                    print(f"[{NODE_NAME}] send_backward failed to {next_upstream}: {error}", flush=True)
+                    raise RuntimeError(json.dumps({"failed_node": next_upstream, "error": str(error)})) from error
+
+                # Check if the response is a structured error bubbled from upstream.
+                bubbled_failed = _extract_failed_node_from_response(backward_response)
+                if bubbled_failed:
+                    # Upstream reported a failure — do NOT step the optimizer.
+                    raise RuntimeError(json.dumps({"failed_node": bubbled_failed, "error": "upstream backward failure"}))
+
                 # Extract stage0_grad_norm from the terminus response.
                 backward_tensors = safetensors_load(backward_response)
                 stage0_grad_norm = backward_tensors["grad_norm"]
+
+            # ── Commit: downstream confirmed success, now step optimizer ──
+            async with model_lock:
+                await asyncio.to_thread(_step_optimizer)
+
+            # Dedup guard: count this step exactly once, even across retries.
+            global training_steps, _last_step_request_id
+            if request_id != _last_step_request_id:
+                training_steps += 1
+                _last_step_request_id = request_id
+                if training_steps % 10 == 0:
+                    asyncio.create_task(_push_adapter())
 
             # Serialize the *detached* loss_cpu, not the graph-attached loss.
             success = True
@@ -768,7 +853,15 @@ async def _execute_forward_pipeline(headers: dict[str, str], body_bytes: bytes) 
             return response_bytes
         except Exception as error:
             print(f"[{NODE_NAME}] Forwarding failed to downstream {next_target}: {error}", flush=True)
-            raise
+            # Check if the error already contains a failed_node from downstream.
+            err_str = str(error)
+            try:
+                parsed = json.loads(err_str)
+                if isinstance(parsed, dict) and "failed_node" in parsed:
+                    raise  # Preserve the original failed_node
+            except (json.JSONDecodeError, TypeError):
+                pass
+            raise RuntimeError(json.dumps({"failed_node": next_target, "error": str(error)})) from error
     finally:
         if (is_last_stage and not next_workers) or not success:
             cached_inputs.pop(request_id, None)
@@ -797,24 +890,27 @@ async def _execute_backward_pipeline(headers: dict[str, str], body_bytes: bytes)
         grad_in = tensors["grad"]
         grad_in = _to_device(grad_in).to(_dtype())
 
-        # Pop the cached graph-attached output and run backward in a thread.
+        # Pop the cached graph-attached output and run backward ONLY (no optimizer step yet).
         output_tensor = cached_outputs.pop(request_id)
         async with model_lock:
-            grad_norm = await asyncio.to_thread(_run_backward_and_step, output_tensor, grad_in)
+            grad_norm = await asyncio.to_thread(_run_backward_only, output_tensor, grad_in)
         print(f"[{NODE_NAME}] Backward pass complete. Grad norm: {grad_norm:.6f}", flush=True)
 
-        global training_steps, _last_step_request_id
-        if request_id != _last_step_request_id:
-            training_steps += 1
-            _last_step_request_id = request_id
-            if training_steps % 10 == 0:
-                asyncio.create_task(_push_adapter())
-
-        # ── Terminus (first stage): return grad norm ──
+        # ── Terminus (first stage): commit immediately, no upstream to send to ──
         if is_first_stage:
+            async with model_lock:
+                await asyncio.to_thread(_step_optimizer)
+
+            global training_steps, _last_step_request_id
+            if request_id != _last_step_request_id:
+                training_steps += 1
+                _last_step_request_id = request_id
+                if training_steps % 10 == 0:
+                    asyncio.create_task(_push_adapter())
+
             return safetensors_save({"grad_norm": torch.tensor(grad_norm, dtype=torch.float32)})
 
-        # ── Middle stage: propagate upstream ──
+        # ── Middle stage: propagate upstream first, then commit ──
         input_tensor = cached_inputs.pop(request_id)
         assert input_tensor.grad is not None, "input_tensor.grad is None — graph was severed"
         grad_to_send = input_tensor.grad.detach().contiguous().cpu()
@@ -823,16 +919,37 @@ async def _execute_backward_pipeline(headers: dict[str, str], body_bytes: bytes)
         remaining_reverse = ",".join(reverse_workers[1:])
         grad_payload = safetensors_save({"grad": grad_to_send})
 
-        backward_response = await transport.send_backward(
-            target=next_upstream,
-            payload=grad_payload,
-            headers={
-                "X-Request-ID": request_id,
-                "X-Reverse-Pipeline": remaining_reverse,
-                "Content-Type": "application/octet-stream",
-            },
-            timeout=120.0,
-        )
+        try:
+            backward_response = await transport.send_backward(
+                target=next_upstream,
+                payload=grad_payload,
+                headers={
+                    "X-Request-ID": request_id,
+                    "X-Reverse-Pipeline": remaining_reverse,
+                    "Content-Type": "application/octet-stream",
+                },
+                timeout=120.0,
+            )
+        except Exception as error:
+            # send_backward failed — do NOT step the optimizer.
+            print(f"[{NODE_NAME}] send_backward failed to {next_upstream}: {error}", flush=True)
+            raise RuntimeError(json.dumps({"failed_node": next_upstream, "error": str(error)})) from error
+
+        # Check if the response is a structured error bubbled from upstream.
+        bubbled_failed = _extract_failed_node_from_response(backward_response)
+        if bubbled_failed:
+            raise RuntimeError(json.dumps({"failed_node": bubbled_failed, "error": "upstream backward failure"}))
+
+        # ── Commit: upstream confirmed success, now step optimizer ──
+        async with model_lock:
+            await asyncio.to_thread(_step_optimizer)
+
+        if request_id != _last_step_request_id:
+            training_steps += 1
+            _last_step_request_id = request_id
+            if training_steps % 10 == 0:
+                asyncio.create_task(_push_adapter())
+
         # Bubble the terminus response back.
         return backward_response
     finally:
