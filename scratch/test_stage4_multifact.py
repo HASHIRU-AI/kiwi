@@ -65,15 +65,6 @@ def wait_for_swarm():
 
 def main():
     wait_for_swarm()
-    workers = httpx.get(f"{GATEWAY_URL}/registry").json()["workers"]
-    workers_sorted = sorted(workers, key=lambda w: w["layers"][0])
-    w_stage0 = workers_sorted[0]
-    stage0_url = f"http://localhost:{NODE_HOST_PORTS.get(w_stage0['node_name'], 8000)}"
-    
-    pipeline_targets = []
-    for w in workers_sorted[1:]:
-        pipeline_targets.append(w.get("peer_id") or w["node_url"])
-    pipeline_header = ",".join(pipeline_targets)
 
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
 
@@ -95,9 +86,10 @@ def main():
         })
 
     def post(payload, rid):
-        r = httpx.post(f"{stage0_url}/forward", content=payload,
+        r = httpx.post(f"{GATEWAY_URL}/train_step", content=payload,
                        headers={"Content-Type": "application/octet-stream",
-                                "X-Request-ID": rid, "X-Pipeline": pipeline_header},
+                                "X-Model-ID": MODEL_ID,
+                                "X-Request-ID": rid},
                        timeout=120.0)
         if r.status_code != 200:
             print(f"ERROR response body: {r.text}")

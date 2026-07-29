@@ -53,6 +53,10 @@ LR = float(os.getenv("KIWI_LR", "1e-5"))
 optimizer: torch.optim.Optimizer | None = None
 MODEL_DTYPE = os.getenv("MODEL_DTYPE", "bfloat16")
 
+training_steps: int = 0
+current_standby_peer_id: str = ""
+_last_step_request_id: str = ""
+
 # ── Backward pass tensor caches (keyed by request_id) ───────────────────────────
 cached_inputs: dict[str, torch.Tensor] = {}
 cached_outputs: dict[str, torch.Tensor] = {}
@@ -331,6 +335,7 @@ async def _re_register() -> None:
             # Restore handlers
             transport.set_forward_handler(_execute_forward_pipeline)
             transport.set_backward_handler(_execute_backward_pipeline)
+            transport.set_adapter_handler(_execute_adapter_pipeline)
             peer_id = await transport.get_address()
         except Exception as exc:
             print(f"[{NODE_NAME}] Failed to restart P2P transport: {exc}", flush=True)
@@ -355,6 +360,7 @@ async def _re_register() -> None:
 
 async def _heartbeat_loop() -> None:
     """Ping the gateway periodically so it knows we're alive."""
+    global current_standby_peer_id
     latency_ms = 0.0
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
@@ -372,6 +378,12 @@ async def _heartbeat_loop() -> None:
                 latency_ms = (time.perf_counter() - start_time) * 1000.0
                 if response.status_code == 404:
                     await _re_register()
+                elif response.status_code == 200:
+                    data = response.json()
+                    new_standby = data.get("standby_peer_id", "")
+                    if new_standby and new_standby != current_standby_peer_id:
+                        current_standby_peer_id = new_standby
+                        asyncio.create_task(_push_adapter())
         except httpx.HTTPError:
             pass  # Gateway may be temporarily unreachable; keep retrying.
 
@@ -406,6 +418,7 @@ async def lifespan(_: FastAPI):
     await transport.start()
     transport.set_forward_handler(_execute_forward_pipeline)
     transport.set_backward_handler(_execute_backward_pipeline)
+    transport.set_adapter_handler(_execute_adapter_pipeline)
 
     assignment = await _register()
     assigned_model_id = assignment["model_id"]
@@ -498,6 +511,53 @@ def _run_backward_and_step(tensor: torch.Tensor, grad_in: torch.Tensor | None = 
     optimizer.step()
     
     return grad_norm
+
+
+from peft import get_peft_model_state_dict, set_peft_model_state_dict
+
+async def _push_adapter() -> None:
+    if not current_standby_peer_id or not model:
+        return
+    
+    async with model_lock:
+        state_dict = get_peft_model_state_dict(model)
+        state_dict = {k: v.cpu() for k, v in state_dict.items()}
+
+    payload = safetensors_save(state_dict)
+    
+    flat = torch.cat([v.flatten() for v in state_dict.values()]) if state_dict else torch.tensor([0.0])
+    norm = flat.norm().item()
+    
+    try:
+        await transport.send_adapter(
+            target=current_standby_peer_id,
+            payload=payload,
+            headers={"X-Model-ID": assigned_model_id},
+            timeout=30.0
+        )
+        print(f"[{NODE_NAME}] Pushing adapter snapshot to standby {current_standby_peer_id}. Checksum: {norm:.6f}", flush=True)
+    except Exception as e:
+        print(f"[{NODE_NAME}] Failed to push adapter to {current_standby_peer_id}: {e}", flush=True)
+
+
+async def _execute_adapter_pipeline(headers: dict[str, str], body_bytes: bytes) -> bytes:
+    if not model:
+        raise RuntimeError("Worker model not ready")
+        
+    model_id = headers.get("x-model-id") or headers.get("X-Model-ID", "")
+    if model_id != assigned_model_id:
+        raise ValueError(f"Model ID mismatch: expected {assigned_model_id}, got {model_id}")
+
+    tensors = safetensors_load(body_bytes)
+    
+    flat = torch.cat([v.flatten() for v in tensors.values()]) if tensors else torch.tensor([0.0])
+    norm = flat.norm().item()
+    
+    async with model_lock:
+        set_peft_model_state_dict(model, tensors)
+        
+    print(f"[{NODE_NAME}] Received adapter snapshot from active. Checksum: {norm:.6f}", flush=True)
+    return b'{"status":"ok"}'
 
 
 def _run_forward(
@@ -633,6 +693,13 @@ async def _execute_forward_pipeline(headers: dict[str, str], body_bytes: bytes) 
             print(f"[{NODE_NAME}] Backward pass complete. Grad norm: {grad_norm:.6f}", flush=True)
 
             stage0_grad_norm = torch.tensor(grad_norm, dtype=torch.float32)
+            
+            global training_steps, _last_step_request_id
+            if request_id != _last_step_request_id:
+                training_steps += 1
+                _last_step_request_id = request_id
+                if training_steps % 10 == 0:
+                    asyncio.create_task(_push_adapter())
 
             # If this is also the first stage (solo), we are the terminus.
             if not is_first_stage and reverse_workers:
@@ -736,6 +803,13 @@ async def _execute_backward_pipeline(headers: dict[str, str], body_bytes: bytes)
             grad_norm = await asyncio.to_thread(_run_backward_and_step, output_tensor, grad_in)
         print(f"[{NODE_NAME}] Backward pass complete. Grad norm: {grad_norm:.6f}", flush=True)
 
+        global training_steps, _last_step_request_id
+        if request_id != _last_step_request_id:
+            training_steps += 1
+            _last_step_request_id = request_id
+            if training_steps % 10 == 0:
+                asyncio.create_task(_push_adapter())
+
         # ── Terminus (first stage): return grad norm ──
         if is_first_stage:
             return safetensors_save({"grad_norm": torch.tensor(grad_norm, dtype=torch.float32)})
@@ -807,4 +881,26 @@ async def backward(request: Request):
         raise HTTPException(
             status_code=400,
             detail=f"Backward execution failed: {error}",
+        ) from error
+
+
+@app.post("/adapter")
+async def adapter(request: Request):
+    if (
+        request.headers.get("content-type", "").split(";", 1)[0]
+        != "application/octet-stream"
+    ):
+        raise HTTPException(
+            status_code=415,
+            detail="Only safetensors application/octet-stream is accepted",
+        )
+    try:
+        response_bytes = await _execute_adapter_pipeline(
+            dict(request.headers), await request.body()
+        )
+        return Response(content=response_bytes, media_type="application/json")
+    except Exception as error:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Adapter update failed: {error}",
         ) from error

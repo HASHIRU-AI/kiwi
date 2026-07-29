@@ -65,6 +65,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     safetensors==0.5.3 \
     zstandard==0.23.0 \
     lz4==4.3.3 \
+    peft>=0.11.0 \
     hivemind>=1.1.10
 
 COPY worker.py models.py transport.py ./

@@ -100,6 +100,7 @@ class WorkerRegistry:
 
     def __init__(self) -> None:
         self._workers: dict[str, Worker] = {}
+        self._pinned_pipelines: dict[str, list[Worker]] = {}
         self._lock = asyncio.Lock()
 
     def _find_worker(self, identifier: str) -> Worker | None:
@@ -302,41 +303,55 @@ class WorkerRegistry:
                 self._workers[worker.node_url] = worker
             return worker
 
-    async def select_pipeline(
+    def _compute_pipeline(
         self, model_id: str, num_layers: int
     ) -> list[Worker]:
         """Return an ordered list of workers whose layers cover ``[0, num_layers)``.
-
-        Uses a greedy interval-covering algorithm with random tie-breaking
-        so that multiple healthy workers providing the same range get
-        load-balanced across requests.
+        Must be called with self._lock held.
         """
-        async with self._lock:
-            candidates = sorted(
-                self._healthy_workers(model_id),
-                key=lambda w: (w.layers[0], -w.layers[1]),
-            )
-            if not candidates:
-                raise RuntimeError(f"No healthy workers for model {model_id}")
+        candidates = sorted(
+            self._healthy_workers(model_id),
+            key=lambda w: (w.layers[0], -w.layers[1]),
+        )
+        if not candidates:
+            raise RuntimeError(f"No healthy workers for model {model_id}")
 
-            pipeline: list[Worker] = []
-            target = 0
-            i = 0
-            while target < num_layers:
-                eligible: list[Worker] = []
-                while i < len(candidates) and candidates[i].layers[0] <= target:
-                    eligible.append(candidates[i])
-                    i += 1
-                if not eligible:
-                    raise RuntimeError(
-                        f"Layer coverage gap at layer {target} for model {model_id}"
-                    )
-                # Among eligible, prefer the one extending furthest (random among ties).
-                max_end = max(w.layers[1] for w in eligible)
-                best = [w for w in eligible if w.layers[1] == max_end]
-                pipeline.append(random.choice(best))
-                target = max_end + 1
-            return pipeline
+        pipeline: list[Worker] = []
+        target = 0
+        i = 0
+        pinned_nodes = {w.node_name for w in self._pinned_pipelines.get(model_id, [])}
+        
+        while target < num_layers:
+            eligible: list[Worker] = []
+            while i < len(candidates) and candidates[i].layers[0] <= target:
+                eligible.append(candidates[i])
+                i += 1
+            if not eligible:
+                raise RuntimeError(
+                    f"Layer coverage gap at layer {target} for model {model_id}"
+                )
+            max_end = max(w.layers[1] for w in eligible)
+            best = [w for w in eligible if w.layers[1] == max_end]
+            pinned_best = [w for w in best if w.node_name in pinned_nodes]
+            pipeline.append(random.choice(pinned_best if pinned_best else best))
+            target = max_end + 1
+        return pipeline
+
+    async def get_pinned_pipeline(
+        self, model_id: str, num_layers: int
+    ) -> list[Worker]:
+        async with self._lock:
+            existing = self._pinned_pipelines.get(model_id)
+            if existing and all(w.healthy for w in existing):
+                if sum(w.layers[1] - w.layers[0] + 1 for w in existing) >= num_layers:
+                    return existing
+                    
+            old_names = [w.node_name for w in existing] if existing else []
+            new_pipeline = self._compute_pipeline(model_id, num_layers)
+            self._pinned_pipelines[model_id] = new_pipeline
+            new_names = [w.node_name for w in new_pipeline]
+            print(f"[gateway] Pinned route for {model_id}: {old_names} -> {new_names}", flush=True)
+            return new_pipeline
 
     async def evict(self, node_name: str) -> None:
         async with self._lock:
@@ -348,13 +363,23 @@ class WorkerRegistry:
         async with self._lock:
             seen: set[str] = set()
             result: list[dict[str, object]] = []
+            active_nodes = {w.node_name for p in self._pinned_pipelines.values() for w in p}
+            
             for key, w in self._workers.items():
                 if w.node_name in seen:
                     continue
                 seen.add(w.node_name)
+                
+                role = "unassigned"
+                if w.node_name in active_nodes:
+                    role = "active"
+                elif any(aw.node_name in active_nodes and aw.model_id == w.model_id and aw.layers == w.layers for aw in self._workers.values()):
+                    role = "standby"
+                    
                 result.append(
                     {
                         "node_name": w.node_name,
+                        "role": role,
                         "node_url": w.node_url,
                         "peer_id": w.peer_id,
                         "model_id": w.model_id,
@@ -385,15 +410,25 @@ class WorkerRegistry:
                 }
             return result
 
-    async def heartbeat(self, node_name: str, latency_ms: float = 0.0) -> bool:
+    async def heartbeat(self, node_name: str, latency_ms: float = 0.0) -> tuple[bool, str]:
         async with self._lock:
             worker = self._find_worker(node_name)
             if worker:
                 worker.last_seen = time.time()
                 worker.healthy = True
                 worker.latency_ms = latency_ms
-                return True
-            return False
+                
+                standby_peer_id = ""
+                pin = self._pinned_pipelines.get(worker.model_id, [])
+                if any(w.node_name == worker.node_name for w in pin):
+                    # It is active. Find a standby
+                    for w2 in self._workers.values():
+                        if w2.healthy and w2.model_id == worker.model_id and w2.layers == worker.layers and w2.node_name != worker.node_name and not any(pw.node_name == w2.node_name for pw in pin):
+                            standby_peer_id = _worker_address(w2)
+                            break
+                            
+                return True, standby_peer_id
+            return False, ""
 
     async def evict_stale(
         self, soft_stale_seconds: float, hard_stale_seconds: float
@@ -637,10 +672,10 @@ class HeartbeatRequest(BaseModel):
 
 @app.post("/heartbeat")
 async def heartbeat(request: HeartbeatRequest) -> dict[str, str]:
-    exists = await registry.heartbeat(request.node_name, request.latency_ms)
+    exists, standby_peer_id = await registry.heartbeat(request.node_name, request.latency_ms)
     if not exists:
         raise HTTPException(status_code=404, detail="Worker not registered")
-    return {"status": "ok"}
+    return {"status": "ok", "standby_peer_id": standby_peer_id}
 
 
 @app.post("/deregister")
@@ -741,7 +776,7 @@ async def _stream_completion(
 
     while True:  # Outer retry loop for rerouting
         try:
-            pipeline = await registry.select_pipeline(
+            pipeline = await registry.get_pinned_pipeline(
                 model.model_id, model.num_layers
             )
         except RuntimeError as error:
@@ -863,6 +898,59 @@ async def _stream_completion(
 
     yield _chunk(request_id, model.model_id, None, finish_reason="stop")
     yield "data: [DONE]\n\n"
+
+
+# ── Training dispatch endpoint ───────────────────────────────────────────────────
+
+
+from fastapi import Response
+
+@app.post("/train_step")
+async def train_step(request: Request):
+    if not model_registry:
+        raise HTTPException(status_code=503, detail="Gateway not ready")
+        
+    model_id = request.headers.get("x-model-id") or request.headers.get("X-Model-ID", "")
+    if not model_id:
+        default_model = model_registry.default()
+        if not default_model:
+            raise HTTPException(status_code=400, detail="No model_id provided and no default available")
+        model_id = default_model.model_id
+
+    model = model_registry.resolve(model_id)
+    if not model:
+        raise HTTPException(status_code=400, detail=f"Unknown model: {model_id}")
+
+    try:
+        pipeline = await registry.get_pinned_pipeline(model.model_id, model.num_layers)
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error))
+
+    if transport is None:
+        raise HTTPException(status_code=503, detail="Transport not initialized")
+
+    first_addr = _worker_address(pipeline[0])
+    remaining_urls = ",".join(_worker_address(w) for w in pipeline[1:])
+    request_id = request.headers.get("x-request-id") or request.headers.get("X-Request-ID", uuid.uuid4().hex)
+    
+    body = await request.body()
+    try:
+        response_bytes = await transport.send_forward(
+            target=first_addr,
+            payload=body,
+            headers={
+                "X-Request-ID": request_id,
+                "X-Model-ID": model.model_id,
+                "X-Pipeline": remaining_urls,
+                "X-Reverse-Pipeline": "",
+                "Content-Type": "application/octet-stream",
+            },
+            timeout=120.0
+        )
+        return Response(content=response_bytes, media_type="application/octet-stream")
+    except Exception as error:
+        print(f"[gateway] Train step dispatch failed: {error}", flush=True)
+        raise HTTPException(status_code=500, detail=str(error))
 
 
 # ── Chat completions endpoint ────────────────────────────────────────────────────

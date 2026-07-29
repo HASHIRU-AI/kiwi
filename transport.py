@@ -89,6 +89,18 @@ class KiwiTransport(ABC):
         Handler takes (headers, payload_bytes) and returns response_bytes.
         """
 
+    @abstractmethod
+    async def send_adapter(
+        self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 30.0
+    ) -> bytes:
+        """Send adapter state dict to the target node's /adapter endpoint."""
+
+    @abstractmethod
+    def set_adapter_handler(
+        self, handler: Callable[[dict[str, str], bytes], asyncio.Future[bytes] | bytes]
+    ) -> None:
+        """Register callback for incoming /adapter requests."""
+
 
 class HttpTransport(KiwiTransport):
     """HTTP transport implementation wrapping httpx.AsyncClient."""
@@ -98,6 +110,7 @@ class HttpTransport(KiwiTransport):
         self._forward_handler: Callable | None = None
         self._generate_handler: Callable | None = None
         self._backward_handler: Callable | None = None
+        self._adapter_handler: Callable | None = None
 
     async def start(self) -> None:
         logger.info(f"[HttpTransport] Started for node_url={self._node_url}")
@@ -157,6 +170,20 @@ class HttpTransport(KiwiTransport):
     ) -> None:
         self._backward_handler = handler
 
+    async def send_adapter(
+        self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 30.0
+    ) -> bytes:
+        target_url = f"{target.rstrip('/')}/adapter"
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(target_url, headers=headers, content=payload)
+            response.raise_for_status()
+            return response.content
+
+    def set_adapter_handler(
+        self, handler: Callable[[dict[str, str], bytes], asyncio.Future[bytes] | bytes]
+    ) -> None:
+        self._adapter_handler = handler
+
 
 async def _write_stream_chunked(writer: asyncio.StreamWriter, data: bytes) -> None:
     """Write data directly to the stream. The underlying StreamWriter will handle buffering."""
@@ -204,6 +231,7 @@ class P2PTransport(KiwiTransport):
         self._forward_handler: Callable | None = None
         self._generate_handler: Callable | None = None
         self._backward_handler: Callable | None = None
+        self._adapter_handler: Callable | None = None
 
     async def start(self) -> None:
         try:
@@ -264,7 +292,10 @@ class P2PTransport(KiwiTransport):
         await self._p2p.add_binary_stream_handler(
             "kiwi/backward/1.0", self._handle_backward_stream
         )
-        logger.info("[P2PTransport] Registered stream handlers kiwi/forward/1.0, kiwi/generate/1.0, and kiwi/backward/1.0")
+        await self._p2p.add_binary_stream_handler(
+            "kiwi/adapter/1.0", self._handle_adapter_stream
+        )
+        logger.info("[P2PTransport] Registered stream handlers kiwi/forward/1.0, kiwi/generate/1.0, kiwi/backward/1.0, and kiwi/adapter/1.0")
 
     async def stop(self) -> None:
         if self._p2p is not None:
@@ -438,6 +469,11 @@ class P2PTransport(KiwiTransport):
     ) -> None:
         self._generate_handler = handler
 
+    def set_adapter_handler(
+        self, handler: Callable[[dict[str, str], bytes], asyncio.Future[bytes] | bytes]
+    ) -> None:
+        self._adapter_handler = handler
+
     async def _handle_backward_stream(
         self, stream_info: Any, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
@@ -514,6 +550,78 @@ class P2PTransport(KiwiTransport):
         self, handler: Callable[[dict[str, str], bytes], asyncio.Future[bytes] | bytes]
     ) -> None:
         self._backward_handler = handler
+
+    async def _handle_adapter_stream(
+        self, stream_info: Any, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            headers, payload = await _read_framed_request(reader)
+            if not self._adapter_handler:
+                raise RuntimeError("No adapter handler set on P2PTransport")
+
+            response = self._adapter_handler(headers, payload)
+            if asyncio.isfuture(response) or asyncio.iscoroutine(response):
+                response_bytes = await response
+            else:
+                response_bytes = response
+
+            await _write_stream_chunked(writer, struct.pack(">I", len(response_bytes)) + response_bytes)
+        except Exception as exc:
+            logger.error(f"[P2PTransport] Error handling adapter stream from {getattr(stream_info, 'peer_id', 'unknown')}: {exc}", exc_info=True)
+            print(f"[P2PTransport] Error handling adapter stream from {getattr(stream_info, 'peer_id', 'unknown')}: {exc}", flush=True)
+            err_bytes = json.dumps({"error": str(exc)}).encode("utf-8")
+            await _write_stream_chunked(writer, struct.pack(">I", len(err_bytes)) + err_bytes)
+        finally:
+            writer.close()
+            with suppress(Exception):
+                await writer.wait_closed()
+
+    async def send_adapter(
+        self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 30.0
+    ) -> bytes:
+        if self._p2p is None:
+            raise RuntimeError("P2PTransport not started.")
+
+        from hivemind.p2p.p2p_daemon_bindings import PeerID
+
+        target_peer = PeerID.from_base58(target)
+        header_bytes = json.dumps(headers).encode("utf-8")
+        framed_req = (
+            struct.pack(">I", len(header_bytes))
+            + header_bytes
+            + struct.pack(">I", len(payload))
+            + payload
+        )
+
+        async def _call() -> bytes:
+            _, reader, writer = await self._p2p.call_binary_stream_handler(
+                target_peer, "kiwi/adapter/1.0"
+            )
+            try:
+                await _write_stream_chunked(writer, framed_req)
+
+                resp_len_bytes = await _read_stream_chunked(reader, 4)
+                resp_len = struct.unpack(">I", resp_len_bytes)[0]
+                return await _read_stream_chunked(reader, resp_len)
+            finally:
+                writer.close()
+                with suppress(Exception):
+                    await writer.wait_closed()
+
+        max_attempts = 3
+        backoff = 0.2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return await asyncio.wait_for(_call(), timeout=timeout)
+            except Exception as e:
+                if attempt == max_attempts:
+                    logger.error(f"[P2PTransport] send_adapter to {target} failed after {max_attempts} attempts: {e}")
+                    raise
+                logger.warning(
+                    f"[P2PTransport] Attempt {attempt} failed adapter push to {target}: {e}. Retrying in {backoff}s..."
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 5.0)
 
 
 def create_transport(

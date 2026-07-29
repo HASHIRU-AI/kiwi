@@ -43,17 +43,6 @@ def wait_for_swarm() -> dict:
 
 def main():
     wait_for_swarm()
-    workers = httpx.get(f"{GATEWAY_URL}/registry").json()["workers"]
-    workers_sorted = sorted(workers, key=lambda w: w["layers"][0])
-    w_stage0 = workers_sorted[0]
-
-    stage0_port = NODE_HOST_PORTS.get(w_stage0["node_name"], 8000)
-    stage0_url = f"http://localhost:{stage0_port}"
-    
-    pipeline_targets = []
-    for w in workers_sorted[1:]:
-        pipeline_targets.append(w.get("peer_id") or w["node_url"])
-    pipeline_header = ",".join(pipeline_targets)
 
     # ── Tokenize Q->A pair ──
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -94,10 +83,10 @@ def main():
     # An obscure/fictional answer the pretrained model cannot already know.
     # This makes the test rigorous: prove accuracy goes ~0% -> 100% via training,
     # rather than the model already knowing a common fact (e.g. Paris).
-    r0 = httpx.post(f"{stage0_url}/forward", content=payload,
+    r0 = httpx.post(f"{GATEWAY_URL}/train_step", content=payload,
                     headers={"Content-Type": "application/octet-stream",
-                             "X-Request-ID": "test-qa-baseline",
-                             "X-Pipeline": pipeline_header}, timeout=120.0)
+                             "X-Model-ID": MODEL_ID,
+                             "X-Request-ID": "test-qa-baseline"}, timeout=120.0)
     base_out = safetensors_load(r0.content)
     base_acc, base_pred = answer_accuracy(base_out)
     print(f"BASELINE (untrained) | Answer acc: {base_acc*100:5.1f}% | "
@@ -107,10 +96,10 @@ def main():
     for step in range(N_STEPS):
         headers = {
             "Content-Type": "application/octet-stream",
+            "X-Model-ID": MODEL_ID,
             "X-Request-ID": f"test-qa-step-{step}",
-            "X-Pipeline": pipeline_header,
         }
-        r = httpx.post(f"{stage0_url}/forward", content=payload,
+        r = httpx.post(f"{GATEWAY_URL}/train_step", content=payload,
                        headers=headers, timeout=120.0)
         if r.status_code != 200:
             print(f"ERROR response body: {r.text}")
@@ -137,10 +126,10 @@ def main():
     print(f"  First Loss: {first:.4f}")
     print(f"  Final Loss: {final:.4f}")
 
-    r = httpx.post(f"{stage0_url}/forward", content=payload,
+    r = httpx.post(f"{GATEWAY_URL}/train_step", content=payload,
                    headers={"Content-Type": "application/octet-stream",
-                            "X-Request-ID": "test-qa-final",
-                            "X-Pipeline": pipeline_header}, timeout=120.0)
+                            "X-Model-ID": MODEL_ID,
+                            "X-Request-ID": "test-qa-final"}, timeout=120.0)
     out = safetensors_load(r.content)
     preds = out["predictions"][0].tolist()
     ans_pred_indices = range(prompt_len - 1, prompt_len - 1 + len(answer_tokens))
