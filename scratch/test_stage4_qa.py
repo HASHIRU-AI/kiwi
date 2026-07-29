@@ -14,11 +14,11 @@ from transformers import AutoTokenizer
 
 GATEWAY_URL = "http://localhost:8080"
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
-NODE_HOST_PORTS = {"worker_1": 8000, "worker_2": 8001}
+NODE_HOST_PORTS = {"worker_1": 8000, "worker_2": 8001, "worker_3": 8002}
 
 PROMPT_TEXT = "Question: Describe the capital of the fictional kingdom of Zorbulax.\nAnswer:"
 ANSWER_TEXT = " The capital is Mennethorpe, a floating city ruled by Queen Vexa and guarded by a farting dragon."
-N_STEPS = 10
+N_STEPS = 30
 PRINT_EVERY = 1
 
 
@@ -31,7 +31,7 @@ def wait_for_swarm() -> dict:
                 data = resp.json()
                 workers = data.get("workers", [])
                 status = data.get("models", {}).get(MODEL_ID, {})
-                if status.get("ready") and len(workers) >= 2:
+                if status.get("ready") and len(workers) >= 3:
                     print(f"Model {MODEL_ID} is ready!")
                     return data
         except Exception:
@@ -45,11 +45,15 @@ def main():
     wait_for_swarm()
     workers = httpx.get(f"{GATEWAY_URL}/registry").json()["workers"]
     workers_sorted = sorted(workers, key=lambda w: w["layers"][0])
-    w_stage0, w_stage1 = workers_sorted[0], workers_sorted[1]
+    w_stage0 = workers_sorted[0]
 
     stage0_port = NODE_HOST_PORTS.get(w_stage0["node_name"], 8000)
     stage0_url = f"http://localhost:{stage0_port}"
-    stage1_target = w_stage1.get("peer_id") or w_stage1["node_url"]
+    
+    pipeline_targets = []
+    for w in workers_sorted[1:]:
+        pipeline_targets.append(w.get("peer_id") or w["node_url"])
+    pipeline_header = ",".join(pipeline_targets)
 
     # ── Tokenize Q->A pair ──
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -93,7 +97,7 @@ def main():
     r0 = httpx.post(f"{stage0_url}/forward", content=payload,
                     headers={"Content-Type": "application/octet-stream",
                              "X-Request-ID": "test-qa-baseline",
-                             "X-Pipeline": stage1_target}, timeout=120.0)
+                             "X-Pipeline": pipeline_header}, timeout=120.0)
     base_out = safetensors_load(r0.content)
     base_acc, base_pred = answer_accuracy(base_out)
     print(f"BASELINE (untrained) | Answer acc: {base_acc*100:5.1f}% | "
@@ -104,7 +108,7 @@ def main():
         headers = {
             "Content-Type": "application/octet-stream",
             "X-Request-ID": f"test-qa-step-{step}",
-            "X-Pipeline": stage1_target,
+            "X-Pipeline": pipeline_header,
         }
         r = httpx.post(f"{stage0_url}/forward", content=payload,
                        headers=headers, timeout=120.0)
@@ -136,7 +140,7 @@ def main():
     r = httpx.post(f"{stage0_url}/forward", content=payload,
                    headers={"Content-Type": "application/octet-stream",
                             "X-Request-ID": "test-qa-final",
-                            "X-Pipeline": stage1_target}, timeout=120.0)
+                            "X-Pipeline": pipeline_header}, timeout=120.0)
     out = safetensors_load(r.content)
     preds = out["predictions"][0].tolist()
     ans_pred_indices = range(prompt_len - 1, prompt_len - 1 + len(answer_tokens))

@@ -55,7 +55,7 @@ services:
       KIWI_USE_INT8: "true"
       KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
-      KIWI_VRAM_GB_OVERRIDE: "1.0"
+      KIWI_VRAM_GB_OVERRIDE: "1"
       KIWI_LR: ${KIWI_LR:-1e-5}
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -92,7 +92,45 @@ services:
       KIWI_USE_INT8: "true"
       KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
-      KIWI_VRAM_GB_OVERRIDE: "1.0"
+      KIWI_VRAM_GB_OVERRIDE: "0.8"
+      KIWI_LR: ${KIWI_LR:-1e-5}
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+      - ./worker.py:/app/worker.py
+      - ./models.py:/app/models.py
+      - ./transport.py:/app/transport.py
+    depends_on:
+      gateway:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+
+  worker_3:
+    image: kiwi-worker:latest
+    container_name: kiwi-worker_3_p2p
+    init: true
+    command: uvicorn worker:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8002:8000"
+      - "4004:4004"
+    environment:
+      NODE_NAME: worker_3
+      NODE_URL: http://worker_3:8000
+      GATEWAY_URL: http://gateway:8080
+      KIWI_P2P_TRANSPORT: "p2p"
+      KIWI_P2P_PORT: "4004"
+      # Automatically discovered from the gateway's HTTP endpoint if left blank
+      KIWI_RELAY_PEERS: ""
+      KIWI_USE_CSR: "false"
+      KIWI_USE_INT8: "true"
+      KIWI_LOSSLESS: "zstd"
+      GPU_MEMORY_RESERVE_MB: "512"
+      KIWI_VRAM_GB_OVERRIDE: "0.8"
       KIWI_LR: ${KIWI_LR:-1e-5}
     volumes:
       - hf_cache:/root/.cache/huggingface

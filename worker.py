@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from safetensors.torch import load as safetensors_load
 from safetensors.torch import save as safetensors_save
 from transformers import AutoModelForCausalLM
+from peft import LoraConfig, get_peft_model
 
 import ipaddress
 from urllib.parse import urlparse
@@ -268,6 +269,19 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
 
     # ── Device placement ──
     inference_device = _place_model_on_device(loaded_model, num_assigned, total_layers)
+
+    # ── Apply LoRA ──
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM"
+    )
+    loaded_model = get_peft_model(loaded_model, lora_config)
+    loaded_model.print_trainable_parameters()
+
     position = (
         "SOLO" if _is_first and _is_last else
         "FIRST" if _is_first else
@@ -290,7 +304,8 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
         )
 
     global optimizer
-    optimizer = torch.optim.Adam(loaded_model.parameters(), lr=LR)
+    trainable_params = [p for p in loaded_model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(trainable_params, lr=LR)
 
     return loaded_model
 
@@ -503,7 +518,7 @@ def _run_forward(
     assert model is not None
 
     if is_first_stage and input_ids is not None:
-        outputs = model.model(
+        outputs = model.get_base_model().model(
             input_ids=_to_device(input_ids),
             return_dict=True,
         )
@@ -514,7 +529,7 @@ def _run_forward(
         # Cache the leaf *before* it flows through the model.
         cached_inputs[request_id] = hidden_states
         # Feed the exact same tensor — no redundant _to_device.
-        outputs = model.model(
+        outputs = model.get_base_model().model(
             inputs_embeds=hidden_states,
             return_dict=True,
         )
@@ -524,8 +539,8 @@ def _run_forward(
 
     if is_last_stage:
         assert input_ids is not None, "Last-stage worker requires input_ids/labels for loss calculation"
-        logits = model.lm_head(last_hidden_state)
-        vocab_size = model.config.vocab_size
+        logits = model.get_base_model().lm_head(last_hidden_state)
+        vocab_size = model.get_base_model().config.vocab_size
 
         if labels is None:
             labels = input_ids
