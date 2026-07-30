@@ -19,6 +19,36 @@ Fine-tuning a model that does not fit in your GPU is a common problem with a few
 
 Model is Qwen2.5-0.5B-Instruct throughout. The dataset is four synthetic question/answer facts about a fictional kingdom, chosen so that memorisation is unambiguous and fast — this measures *convergence behaviour*, not task quality.
 
+### What's held constant
+
+Every scenario trains the same parameters on the same data in the same order:
+
+- Qwen2.5-0.5B-Instruct, frozen base — no scenario ever updates a base weight
+- LoRA `r=16`, `alpha=32`, `dropout=0.05` on `q/k/v/o/gate/up/down` — **8,798,208 trainable params (1.75%)**, bf16 adapters
+- The same 4 facts, batch size 1, 10 epochs = **40 steps**
+- The same learning rate (`KIWI_LR`)
+- Seeds free and unforced, N=5 per scenario
+
+### What actually differs
+
+|  | `single_machine` | `single_machine_qlora` | `single_machine_offload` | `distributed_3stage` |
+|---|---|---|---|---|
+| **Base weight precision** | bf16 | **4-bit NF4** | bf16 | bf16 |
+| **Where base weights live** | GPU | GPU | **Host RAM** | **Split across 3 GPUs** |
+| **Optimizer** | `torch.optim.Adam`, GPU | `torch.optim.Adam`, GPU | **`DeepSpeedCPUAdam`, CPU** | per-worker `torch.optim.Adam` |
+| **Gradient checkpointing** | no | **yes** | no | no |
+| **Per-step data movement** | none | none | **whole model over PCIe, fwd + bwd** | **activations over network** |
+| **Activation precision in transit** | — | — | — | bf16, uncompressed |
+| **Per-device budget** | unconstrained | 1024 MiB | 640 MiB | 0.9 GB x3 |
+| **Runs in** | process | process | Docker container | Docker cluster + gateway |
+
+**`single_machine` vs `single_machine_offload` is the cleanest pair in the suite.** Same weights, same precision, same arithmetic. The only things that change are *where the bytes sit between uses* and which Adam implementation applies them — and the latter is deliberately neutralised (`adamw_mode=False, weight_decay=0.0` makes `DeepSpeedCPUAdam` identical to `torch.optim.Adam`). Those two loss curves should sit on top of each other; if they don't, the bug is in the harness, not in offloading. Their **step times** should differ by roughly an order of magnitude. That makes the pair a control: it isolates the cost of storage location with no numerical change attached.
+
+The other two differ for different reasons:
+
+- **`single_machine_qlora`** is the one expected to genuinely diverge in loss — its base weights are lossy. That divergence *is* the measurement.
+- **`distributed_3stage`** differs *structurally*, not numerically. Activations cross a network boundary between workers and each worker runs its own optimizer over a disjoint slice of the adapters, but the values on the wire are exact — `worker.py` serialises hidden states with plain `safetensors_save` and applies no quantization or compression. So its curve should also land on the reference; the point of the benchmark is to confirm that splitting the model doesn't perturb learning, not to measure a known penalty.
+
 ### 1. `single_machine` — the reference
 
 Standard PyTorch bf16 LoRA on a single unconstrained GPU. Nothing is quantized, offloaded, or split. This is the curve every other scenario is measured against: it defines both correct learning and maximum throughput.
