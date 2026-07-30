@@ -1,0 +1,45 @@
+FROM pytorch/pytorch:2.13.0-cuda12.6-cudnn9-devel
+
+# Install DeepSpeed and other dependencies.
+# NOTE: mpi4py is deliberately NOT installed. Single-node ZeRO-3 uses the NCCL
+# backend and needs no MPI. Installing the mpi4py bindings without an MPI
+# runtime (libmpi.so) in the image makes DeepSpeed's MPI auto-discovery fall
+# over with "cannot load MPI library" instead of failing cleanly.
+RUN pip install --no-cache-dir --break-system-packages \
+    transformers \
+    peft \
+    safetensors \
+    accelerate \
+    httpx
+
+# DeepSpeed is installed separately with the CPU Adam op compiled ahead of time.
+# offload_optimizer.device="cpu" requires DeepSpeedCPUAdam; without a prebuilt op
+# DeepSpeed JIT-compiles it on every container start, which the orchestrator pays
+# once per seed. DS_BUILD_CPU_ADAM=1 moves that cost into this (cached) layer.
+# The base image is -devel, so nvcc and the CUDA headers needed for the build are
+# present. TORCH_CUDA_ARCH_LIST avoids probing for a GPU at build time, which is
+# not available inside a docker build.
+ENV DS_BUILD_CPU_ADAM=1 \
+    DS_BUILD_FUSED_ADAM=0 \
+    DS_BUILD_OPS=0 \
+    TORCH_CUDA_ARCH_LIST="6.0;6.1;7.0;7.5;8.0;8.6;8.9;9.0"
+#
+# --no-build-isolation is REQUIRED. pip's default isolated build environment does
+# not expose the already-installed torch, and DeepSpeed's setup.py imports torch
+# to pre-compile ops — without it the build fails with
+# "AssertionError: Unable to pre-compile cpu_adam, please first install torch".
+# ninja is not optional either: without it the op falls back to a serial
+# distutils build that takes many minutes.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libaio-dev && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip install --no-cache-dir --break-system-packages packaging wheel setuptools ninja && \
+    pip install --no-cache-dir --break-system-packages --no-build-isolation deepspeed && \
+    python -c "from deepspeed.ops.adam import DeepSpeedCPUAdam; print('DeepSpeedCPUAdam op OK')"
+
+WORKDIR /app
+
+# Copy the offload runner script
+COPY run_offload.py /app/run_offload.py
+
+# The command will be provided by docker-compose

@@ -1,0 +1,58 @@
+services:
+  deepspeed_offload:
+    build:
+      context: .
+      dockerfile: Dockerfile.deepspeed
+    image: kiwi-deepspeed-offload:latest
+    container_name: kiwi_deepspeed_offload
+    volumes:
+      - hf_cache_trainbench:/root/.cache/huggingface
+      - ./results:/output
+      # Safety net for the CPUAdam op. It is prebuilt into the image, but if that
+      # ever falls back to a JIT build this persists the compiled extension across
+      # containers so the orchestrator pays the cost once, not once per seed.
+      - ds_extensions_trainbench:/root/.cache/torch_extensions
+    # ZeRO-3 CPU param offload keeps the full base model in host RAM and pins
+    # staging buffers. The default 64MB /dev/shm is not enough.
+    shm_size: "2gb"
+    environment:
+      # --- Benchmark parameters (interpolated from the orchestrator's env) ---
+      KIWI_MODEL: ${KIWI_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
+      KIWI_EPOCHS: ${KIWI_EPOCHS:-10}
+      KIWI_SEED: ${KIWI_SEED:-1}
+      KIWI_LR: ${KIWI_LR:-2e-4}
+      # Simulated per-device VRAM budget. Qwen2.5-0.5B is 959 MiB in bf16 including
+      # LoRA, so 640 makes the model 1.50x the budget. The binding constraint is
+      # the LOAD phase: embed_tokens is a single 260 MiB tensor ZeRO-3 cannot
+      # split, and the loader gathers it at 2x (520 MiB). Training peaks far lower
+      # now that stage3_max_reuse_distance=0 stops the tied embedding being pinned.
+      KIWI_GPU_BUDGET_MIB: ${KIWI_GPU_BUDGET_MIB:-640}
+      # Reduces fragmentation in principle. NOTE: inert under WSL2 (no CUDA VMM
+      # support), so on Docker Desktop for Windows this buys nothing — kept for
+      # native-Linux runs.
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+      # --- Single-process torch.distributed rendezvous ---
+      # DeepSpeed's init_distributed() checks for exactly these five vars. If any
+      # is missing it assumes an mpirun launch and calls mpi_discovery(), which
+      # imports mpi4py and dies with "cannot load MPI library". Setting them here
+      # makes DeepSpeed initialise a plain single-rank NCCL TorchBackend instead.
+      RANK: "0"
+      LOCAL_RANK: "0"
+      WORLD_SIZE: "1"
+      MASTER_ADDR: "127.0.0.1"
+      MASTER_PORT: "29500"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+    # Plain python — no launcher. The rendezvous vars above are all the
+    # distributed setup a single-rank ZeRO-3 run needs.
+    command: python run_offload.py
+
+volumes:
+  hf_cache_trainbench:
+  ds_extensions_trainbench:

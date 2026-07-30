@@ -16,7 +16,7 @@ from transformers import AutoTokenizer
 import torch
 from safetensors.torch import save as safetensors_save
 
-from .runners import SingleMachineRunner, DistributedRunner
+from .runners import SingleMachineRunner, DistributedRunner, QLoRARunner
 from .convergence import ConvergenceEvaluator
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -234,7 +234,7 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
     os.makedirs(output_dir, exist_ok=True)
     compose_path = "docker-compose.trainbench.yml"
     
-    results_out = {"runs": {}}
+    results_out = {"runs": {}, "metrics": {}}
     target_loss = None
     
     try:
@@ -249,22 +249,122 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
             curves = []
             
             if len(scenario.workers) == 0:
-                # Single Machine Run
-                logging.info(f"Running {scenario.name} locally without cluster...")
-                runner = SingleMachineRunner()
-                for i in range(scenario.num_seeds):
-                    logging.info(f"Seed run {i+1}/{scenario.num_seeds} for {scenario.name}")
-                    curve = runner.run_training(scenario.model, dataset, scenario.epochs, scenario.name, i+1)
-                    curves.append(curve)
+                if scenario.name == "single_machine_offload":
+                    logging.info(f"Running {scenario.name} via dedicated Docker container...")
+                    scenario_metrics = []
+                    ds_compose = "benchmarks_training/deepspeed/docker-compose.deepspeed.yml"
+                    res_path = "benchmarks_training/deepspeed/results/deepspeed_result.json"
+                    # Must match `container_name:` in docker-compose.deepspeed.yml.
+                    ds_container = "kiwi_deepspeed_offload"
+
+                    # Build once, not per seed. The image is identical across seeds
+                    # (only env vars change), and the DeepSpeed layer compiles the
+                    # CPUAdam op — rebuilding per seed re-checks that layer every
+                    # time and turns a build failure into N identical failures.
+                    logging.info("Building DeepSpeed image (once for all seeds)...")
+                    build = subprocess.run(
+                        ["docker-compose", "-f", ds_compose, "-p", "kiwi", "build"],
+                        check=False,
+                    )
+                    if build.returncode != 0:
+                        logging.error(
+                            f"DeepSpeed image build failed (exit {build.returncode}); "
+                            f"skipping {scenario.name}."
+                        )
+                        scenario_metrics = []
+                        continue
+
+                    for i in range(scenario.num_seeds):
+                        logging.info(f"Seed run {i+1}/{scenario.num_seeds} for {scenario.name}")
+
+                        env = os.environ.copy()
+                        env["KIWI_MODEL"] = scenario.model
+                        env["KIWI_EPOCHS"] = str(scenario.epochs)
+                        env["KIWI_SEED"] = str(i+1)
+
+                        # Clear the previous seed's output first. Without this, a seed
+                        # that crashes before writing leaves the prior seed's file in
+                        # place and its curve gets silently counted twice.
+                        if os.path.exists(res_path):
+                            os.remove(res_path)
+
+                        subprocess.run(["docker-compose", "-f", ds_compose, "-p", "kiwi", "down"], check=False, capture_output=True)
+
+                        logging.info("Starting DeepSpeed container (detached)...")
+                        # Detached on purpose. Running `up` attached binds this process's
+                        # terminal to Compose, which installs its own interactive key
+                        # handling — a stray keypress detaches it, `up` returns non-zero
+                        # mid-run, and the container dies before run_offload.py writes its
+                        # results JSON. Starting detached makes a seed immune to whatever
+                        # gets typed into the terminal while it runs.
+                        #
+                        # No --build here; the image was built above. --force-recreate
+                        # still matters: it guarantees the container picks up this seed's
+                        # env vars rather than reusing the previous one.
+                        up = subprocess.run(
+                            ["docker-compose", "-f", ds_compose, "-p", "kiwi", "up", "-d", "--force-recreate"],
+                            env=env, check=False,
+                        )
+                        if up.returncode != 0:
+                            logging.error(f"Failed to start DeepSpeed container (exit {up.returncode}).")
+                            break
+
+                        # Follow the container's output so progress is still visible. This
+                        # blocks until the container exits, so it doubles as the wait —
+                        # but interrupting it now only stops the log stream, not the run.
+                        subprocess.run(["docker", "logs", "-f", ds_container], check=False)
+
+                        # Authoritative exit code, independent of how log streaming ended.
+                        # On an already-exited container `docker wait` returns immediately.
+                        wait = subprocess.run(
+                            ["docker", "wait", ds_container],
+                            capture_output=True, text=True, check=False,
+                        )
+                        try:
+                            exit_code = int(wait.stdout.strip().splitlines()[-1])
+                        except (ValueError, IndexError):
+                            exit_code = -1
+                            logging.warning(
+                                f"Could not read exit code from `docker wait` (stdout={wait.stdout!r})."
+                            )
+                        if exit_code != 0:
+                            logging.error(f"DeepSpeed container exited with error code {exit_code}")
+
+                        subprocess.run(["docker-compose", "-f", ds_compose, "-p", "kiwi", "down"], check=False, capture_output=True)
+
+                        if os.path.exists(res_path):
+                            with open(res_path, "r") as f:
+                                res = json.load(f)
+                            if "error" in res:
+                                logging.error(f"DeepSpeed baseline skipped due to error: {res['error']}")
+                                break
+                            else:
+                                curves.append(res["curve"])
+                                scenario_metrics.append(res["metrics"])
+                        else:
+                            logging.error("DeepSpeed results JSON not found.")
+                            break
+                else:
+                    # Single Machine Run
+                    logging.info(f"Running {scenario.name} locally without cluster...")
+                    if scenario.name == "single_machine_qlora":
+                        runner = QLoRARunner()
+                    else:
+                        runner = SingleMachineRunner()
+                    
+                    scenario_metrics = []
+                    for i in range(scenario.num_seeds):
+                        logging.info(f"Seed run {i+1}/{scenario.num_seeds} for {scenario.name}")
+                        res = runner.run_training(scenario.model, dataset, scenario.epochs, scenario.name, i+1)
+                        curves.append(res["curve"])
+                        scenario_metrics.append(res["metrics"])
             else:
                 # Distributed Run — use docker-compose.internet.yml directly (already proven to work)
                 logging.info(f"Running {scenario.name} distributed via docker-compose.internet.yml...")
                 internet_compose = "docker-compose.internet.yml"
                 
-                # Pass KIWI_LR=1e-5 so workers match the single-machine baseline LR
-                # dc_env = {**os.environ, "KIWI_LR": "1e-5"}
-                
                 runner = DistributedRunner(gateway_url="http://localhost:8080")
+                scenario_metrics = []
                 for i in range(scenario.num_seeds):
                     logging.info(f"Seed run {i+1}/{scenario.num_seeds} for {scenario.name} - Spawning fresh cluster")
                     subprocess.run(["docker-compose", "-f", internet_compose, "down"], check=False, capture_output=True)
@@ -272,13 +372,21 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                     
                     wait_for_cluster("http://localhost:8080", scenario.model, len(scenario.workers))
                     
-                    curve = runner.run_training(scenario.model, dataset, scenario.epochs, scenario.name, i+1)
-                    curves.append(curve)
+                    res = runner.run_training(scenario.model, dataset, scenario.epochs, scenario.name, i+1)
+                    curves.append(res["curve"])
+                    scenario_metrics.append(res["metrics"])
                     
                 logging.info("Tearing down cluster after distributed scenario...")
                 subprocess.run(["docker-compose", "-f", internet_compose, "down"], check=True)
                 
             results_out["runs"][scenario.name] = curves
+            if len(scenario_metrics) > 0:
+                avg_peak_mem = sum(m["peak_gpu_mb"] for m in scenario_metrics) / len(scenario_metrics)
+                avg_step_time = sum(m["step_time_ms"] for m in scenario_metrics) / len(scenario_metrics)
+                results_out["metrics"][scenario.name] = {
+                    "avg_peak_gpu_mb": avg_peak_mem,
+                    "avg_step_time_ms": avg_step_time
+                }
             
         logging.info("Running convergence evaluator...")
         evaluator = ConvergenceEvaluator(target_loss=target_loss)

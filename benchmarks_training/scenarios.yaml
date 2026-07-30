@@ -6,6 +6,20 @@ scenarios:
     target_loss: 2.0
     workers: [] # In-process
 
+  - name: "single_machine_offload"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 5
+    epochs: 10
+    target_loss: 2.0
+    workers: [] # In-process
+
+  - name: "single_machine_qlora"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 5
+    epochs: 10
+    target_loss: 2.0
+    workers: [] # In-process
+
   - name: "distributed_3stage"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 5
