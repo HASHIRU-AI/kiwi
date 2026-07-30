@@ -16,9 +16,10 @@ class SingleMachineRunner(BaseRunner):
     def run_training(self, model_id: str, dataset: List[Dict[str, Any]], epochs: int, scenario_name: str = "unknown", seed_idx: int = 0) -> List[Tuple[int, float]]:
         from peft import LoraConfig, get_peft_model
         
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = torch.bfloat16 if device == "cuda" else torch.float32
-
+        device = "cuda"
+        dtype = torch.bfloat16
+        logging.info(f"Using device: {device}")
+        logging.info(f"Using dtype: {dtype}")
         # Load model and tokenizer
         model = AutoModelForCausalLM.from_pretrained(
             model_id, 
