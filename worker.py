@@ -55,8 +55,23 @@ optimizer: torch.optim.Optimizer | None = None
 MODEL_DTYPE = os.getenv("MODEL_DTYPE", "bfloat16")
 
 training_steps: int = 0
-current_standby_peer_id: str = ""
 _last_step_request_id: str = ""
+
+# ── Async-mesh round state (§3.4) ───────────────────────────────────────────────
+T_ROUND = float(os.getenv("KIWI_T_ROUND", "30"))
+current_round: int = 0          # highest round already merged/closed
+layer_peers: list[str] = []     # healthy same-stage peers, from heartbeat
+steps_since_round: int = 0
+# Adapter LINEAGE step — advances on local training steps AND on merges
+# (max of merged contributors' steps). This, not training_steps, is what the
+# version-skew guard compares: a spare that never trained still holds a
+# current adapter because it received every round average. Judging it by its
+# local optimizer step count would make peers drop its payloads forever
+# after promotion (found by scratch/test_stage6_mesh.py).
+adapter_step: int = 0
+_round_buffers: dict[int, list[tuple[str, int, dict[str, torch.Tensor]]]] = {}
+_round_expect: dict[int, int] = {}
+_round_events: dict[int, asyncio.Event] = {}
 
 # ── Backward pass tensor caches (keyed by request_id) ───────────────────────────
 cached_inputs: dict[str, torch.Tensor] = {}
@@ -361,7 +376,7 @@ async def _re_register() -> None:
 
 async def _heartbeat_loop() -> None:
     """Ping the gateway periodically so it knows we're alive."""
-    global current_standby_peer_id
+    global layer_peers
     latency_ms = 0.0
     current_role = "unknown"  # Track role to detect promotion
     while True:
@@ -382,15 +397,15 @@ async def _heartbeat_loop() -> None:
                     await _re_register()
                 elif response.status_code == 200:
                     data = response.json()
-                    new_standby = data.get("standby_peer_id", "")
-                    if new_standby and new_standby != current_standby_peer_id:
-                        current_standby_peer_id = new_standby
-                        asyncio.create_task(_push_adapter())
+                    # Mesh peer discovery (§3.3): every healthy worker sharing
+                    # this worker's stage identity. Replaces the standby-sync
+                    # push path — spares receive the round average instead.
+                    layer_peers = data.get("layer_peers", [])
 
-                    # ── Standby → Active promotion detection ──
+                    # ── Spare → Active promotion detection ──
                     new_role = data.get("role", "unknown")
-                    if current_role == "standby" and new_role == "active" and model is not None:
-                        print(f"[{NODE_NAME}] *** Promoted to ACTIVE! Resuming from snapshot. ***", flush=True)
+                    if current_role in ("standby", "spare") and new_role == "active" and model is not None:
+                        print(f"[{NODE_NAME}] *** Promoted to ACTIVE! Resuming from last round average. ***", flush=True)
                         _log_recovery_bytes_metrics()
                     current_role = new_role
         except httpx.HTTPError:
@@ -398,11 +413,13 @@ async def _heartbeat_loop() -> None:
 
 
 def _log_recovery_bytes_metrics() -> None:
-    """Log apples-to-apples recovery bytes metrics on standby promotion.
+    """Log recovery bytes metrics on spare promotion.
 
-    Both baseline and adapter include optimizer state (Adam m + v) for
-    a fair comparison. The standby is pre-warmed so the actual promotion
-    recovery cost is ~0 bytes.
+    What actually moves over the wire is `get_peft_model_state_dict` in the
+    model dtype — 2 bytes/param in bf16. Adam moments stay local and are
+    NEVER transmitted (mesh invariant §4.2), so they are excluded from both
+    sides of the comparison. (An earlier version costed this at 10 bytes/param
+    and overstated transfer by 5×.)
     """
     if model is None:
         return
@@ -413,23 +430,20 @@ def _log_recovery_bytes_metrics() -> None:
     # Only trainable LoRA params
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    # Both use bfloat16 (2 bytes) for weights + float32 (4 bytes each) for Adam m and v
-    bytes_per_param_weights = 2  # bfloat16
-    bytes_per_param_optimizer = 4 + 4  # Adam m (float32) + v (float32)
-    bytes_per_param_total = bytes_per_param_weights + bytes_per_param_optimizer  # 10 bytes
+    bytes_per_param = 2  # bf16 weights only — optimizer moments never move
 
-    baseline_bytes = base_params * bytes_per_param_total
-    adapter_snapshot_bytes = trainable_params * bytes_per_param_total
+    baseline_bytes = base_params * bytes_per_param
+    adapter_snapshot_bytes = trainable_params * bytes_per_param
 
     baseline_mb = baseline_bytes / (1024 ** 2)
     adapter_snapshot_mb = adapter_snapshot_bytes / (1024 ** 2)
     ratio = baseline_bytes / adapter_snapshot_bytes if adapter_snapshot_bytes > 0 else float("inf")
 
-    print(f"[{NODE_NAME}] Recovery Metrics - Promotion Recovery Cost: ~0 MB (pre-warmed)", flush=True)
-    print(f"[{NODE_NAME}] Recovery Metrics - Ongoing Snapshot Cost: {adapter_snapshot_mb:.2f} MB "
-          f"({trainable_params:,} params × {bytes_per_param_total} bytes)", flush=True)
+    print(f"[{NODE_NAME}] Recovery Metrics - Promotion Recovery Cost: ~0 MB (pre-warmed by rounds)", flush=True)
+    print(f"[{NODE_NAME}] Recovery Metrics - Per-round adapter transfer: {adapter_snapshot_mb:.2f} MB "
+          f"({trainable_params:,} params × {bytes_per_param} bytes, moments never move)", flush=True)
     print(f"[{NODE_NAME}] Recovery Metrics - Full-weight baseline: {baseline_mb:.2f} MB "
-          f"({base_params:,} params × {bytes_per_param_total} bytes)", flush=True)
+          f"({base_params:,} params × {bytes_per_param} bytes)", flush=True)
     print(f"[{NODE_NAME}] Recovery Metrics - Transfer ratio: {ratio:.1f}x smaller than full-weight", flush=True)
 
 
@@ -445,10 +459,35 @@ async def _deregister() -> None:
         pass
 
 
+def _enforce_vram_cap() -> None:
+    """Actually cap allocation to KIWI_VRAM_GB_OVERRIDE (§3.8).
+
+    Per-process, so it works whether or not workers share a device. Without
+    this the override only feeds the gateway's placement arithmetic and the
+    "X GB per worker" claim is notional.
+    """
+    cap_gb = os.getenv("KIWI_VRAM_GB_OVERRIDE")
+    if not cap_gb or not torch.cuda.is_available():
+        return
+    try:
+        total = torch.cuda.get_device_properties(0).total_memory
+        fraction = min(1.0, float(cap_gb) * 1024**3 / total)
+        torch.cuda.set_per_process_memory_fraction(fraction, 0)
+        print(
+            f"[{NODE_NAME}] VRAM cap enforced: {cap_gb} GB "
+            f"(fraction {fraction:.4f} of {total / 1024**3:.1f} GB)",
+            flush=True,
+        )
+    except (ValueError, RuntimeError) as error:
+        print(f"[{NODE_NAME}] Could not enforce VRAM cap: {error}", flush=True)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global assigned_model_id, layer_range
     global is_first_stage, is_last_stage, model, transport
+
+    _enforce_vram_cap()
 
     initial_peers = []
     if P2P_TRANSPORT == "p2p":
@@ -496,6 +535,9 @@ async def health() -> dict[str, Any]:
         gpu_info["vram_allocated_mb"] = round(
             torch.cuda.memory_allocated(0) / (1024 ** 2)
         )
+        gpu_info["vram_peak_mb"] = round(
+            torch.cuda.max_memory_allocated(0) / (1024 ** 2)
+        )
         gpu_info["gpu_name"] = torch.cuda.get_device_name(0)
 
     if is_first_stage and is_last_stage:
@@ -513,6 +555,9 @@ async def health() -> dict[str, Any]:
         "model_id": assigned_model_id,
         "position": position,
         "layers": layer_range,
+        "training_steps": training_steps,
+        "adapter_step": adapter_step,
+        "current_round": current_round,
         "gpu": gpu_info,
     }
 
@@ -581,49 +626,184 @@ def _extract_failed_node_from_response(response_bytes: bytes) -> str | None:
 
 from peft import get_peft_model_state_dict, set_peft_model_state_dict
 
-async def _push_adapter() -> None:
-    if not current_standby_peer_id or not model:
-        return
-    
-    async with model_lock:
-        state_dict = get_peft_model_state_dict(model)
-        state_dict = {k: v.cpu() for k, v in state_dict.items()}
-
-    payload = safetensors_save(state_dict)
-    
-    flat = torch.cat([v.flatten() for v in state_dict.values()]) if state_dict else torch.tensor([0.0])
-    norm = flat.norm().item()
-    
-    try:
-        await transport.send_adapter(
-            target=current_standby_peer_id,
-            payload=payload,
-            headers={"X-Model-ID": assigned_model_id},
-            timeout=30.0
-        )
-        print(f"[{NODE_NAME}] Pushing adapter snapshot to standby {current_standby_peer_id}. Checksum: {norm:.6f}", flush=True)
-    except Exception as e:
-        print(f"[{NODE_NAME}] Failed to push adapter to {current_standby_peer_id}: {e}", flush=True)
+from mesh import filter_skewed, merge_adapters
 
 
 async def _execute_adapter_pipeline(headers: dict[str, str], body_bytes: bytes) -> bytes:
+    """Inbound adapter payload.
+
+    Two paths, selected by the presence of X-Round-ID:
+      - round payload → buffer for the averaging round (merge, §3.4)
+      - no round header → legacy full overwrite (bootstrap/recovery pull path)
+    """
     if not model:
         raise RuntimeError("Worker model not ready")
-        
+
     model_id = headers.get("x-model-id") or headers.get("X-Model-ID", "")
     if model_id != assigned_model_id:
         raise ValueError(f"Model ID mismatch: expected {assigned_model_id}, got {model_id}")
 
+    round_header = headers.get("x-round-id") or headers.get("X-Round-ID", "")
+    if round_header:
+        return _buffer_round_payload(headers, body_bytes)
+
     tensors = safetensors_load(body_bytes)
-    
+
     flat = torch.cat([v.flatten() for v in tensors.values()]) if tensors else torch.tensor([0.0])
     norm = flat.norm().item()
-    
+
     async with model_lock:
         set_peft_model_state_dict(model, tensors)
-        
-    print(f"[{NODE_NAME}] Received adapter snapshot from active. Checksum: {norm:.6f}", flush=True)
+
+    # Adopt the sender's adapter lineage (bootstrap pulls stamp X-Step).
+    global adapter_step
+    try:
+        sender_step = int(headers.get("x-step") or headers.get("X-Step", "0") or 0)
+        adapter_step = max(adapter_step, sender_step)
+    except ValueError:
+        pass
+
+    print(f"[{NODE_NAME}] Received adapter snapshot (overwrite). Checksum: {norm:.6f}", flush=True)
     return b'{"status":"ok"}'
+
+
+def _buffer_round_payload(headers: dict[str, str], body_bytes: bytes) -> bytes:
+    """Accumulate an inbound round adapter keyed by round_id (§3.4 step 3).
+
+    Idempotency: round_id is monotonic; payloads for closed rounds are
+    dropped, never merged into a later round.
+    """
+    round_id = int(headers.get("x-round-id") or headers.get("X-Round-ID", "0"))
+    sender = headers.get("x-node-name") or headers.get("X-Node-Name", "")
+    try:
+        step = int(headers.get("x-step") or headers.get("X-Step", "0") or 0)
+    except ValueError:
+        step = 0
+
+    if round_id <= current_round:
+        print(f"[{NODE_NAME}] Dropping adapter from {sender} for closed round {round_id}", flush=True)
+        return b'{"status":"dropped"}'
+
+    tensors = safetensors_load(body_bytes)
+    buffer = _round_buffers.setdefault(round_id, [])
+    buffer.append((sender, step, tensors))
+
+    event = _round_events.get(round_id)
+    expected = _round_expect.get(round_id)
+    if event is not None and expected is not None and len(buffer) >= expected:
+        event.set()
+    return b'{"status":"buffered"}'
+
+
+async def _send_round_adapter(target: str, payload: bytes, headers: dict[str, str]) -> None:
+    """Fire-and-forget adapter send to one layer peer. Never holds model_lock."""
+    try:
+        await transport.send_adapter(
+            target=target, payload=payload, headers=headers, timeout=T_ROUND
+        )
+    except Exception as error:
+        print(f"[{NODE_NAME}] Round adapter send to {target} failed: {error}", flush=True)
+
+
+def _apply_round_merge(
+    received: list[tuple[str, int, dict[str, torch.Tensor]]], contribute: bool
+) -> int:
+    """Merge received adapters into the model (§3.5).
+
+    WARNING: caller MUST hold `model_lock` and run this via asyncio.to_thread.
+    Returns the divisor n (0 = nothing applied).
+    """
+    assert model is not None
+    own = get_peft_model_state_dict(model)
+    merged = merge_adapters(own, received, contribute, own_name=NODE_NAME)
+    if merged is None:
+        return 0
+    set_peft_model_state_dict(model, merged)
+    return len(received) + (1 if contribute else 0)
+
+
+async def _run_round(params: dict[str, Any]) -> dict[str, Any]:
+    """Execute one averaging round on this worker (§3.4 worker behaviour)."""
+    global current_round, steps_since_round, adapter_step
+
+    if model is None:
+        raise RuntimeError("Worker model not ready")
+
+    round_id = int(params["round_id"])
+    send_to = list(params.get("send_to", []))
+    expect = int(params.get("expect", 0))
+    contribute = bool(params.get("contribute", False))
+    x = int(params.get("x", 10))
+
+    if round_id <= current_round:
+        return {"status": "stale", "round_id": round_id, "current_round": current_round}
+
+    event = _round_events.setdefault(round_id, asyncio.Event())
+    _round_expect[round_id] = expect
+    if len(_round_buffers.get(round_id, [])) >= expect:
+        event.set()
+
+    # 1. Snapshot under model_lock; serialize outside it.
+    if contribute:
+        async with model_lock:
+            state_dict = {
+                k: v.detach().cpu() for k, v in get_peft_model_state_dict(model).items()
+            }
+        payload = safetensors_save(state_dict)
+
+        # 2. Fire-and-forget sends — never await a peer while holding model_lock.
+        send_headers = {
+            "X-Model-ID": assigned_model_id or "",
+            "X-Round-ID": str(round_id),
+            "X-Step": str(adapter_step),  # lineage step, NOT training_steps
+            "X-Node-Name": NODE_NAME,
+        }
+        for target in send_to:
+            asyncio.create_task(_send_round_adapter(target, payload, send_headers))
+
+    # 3. Wait until `expect` payloads arrive or T_round elapses.
+    timed_out = False
+    if expect > 0:
+        try:
+            await asyncio.wait_for(event.wait(), timeout=T_ROUND)
+        except asyncio.TimeoutError:
+            timed_out = True
+
+    # 4. Merge whatever arrived (partial merge on timeout is by design).
+    received = _round_buffers.pop(round_id, [])
+    kept, dropped = filter_skewed(received, adapter_step, x)
+    if dropped:
+        print(f"[{NODE_NAME}] Round {round_id}: skew guard dropped {dropped}", flush=True)
+
+    async with model_lock:
+        n = await asyncio.to_thread(_apply_round_merge, kept, contribute)
+
+    # Advance the adapter lineage: after merging, this worker's adapter is as
+    # current as the freshest contribution it absorbed. This is what keeps a
+    # spare promotable — its lineage tracks the actives it averages with.
+    if n > 0 and kept:
+        adapter_step = max(adapter_step, max(step for _, step, _ in kept))
+
+    # 5. Close the round.
+    current_round = round_id
+    steps_since_round = 0
+    _round_events.pop(round_id, None)
+    _round_expect.pop(round_id, None)
+
+    print(
+        f"[{NODE_NAME}] Round {round_id} complete: merged n={n} "
+        f"(received {len(received)}, expected {expect}, contribute={contribute}"
+        f"{', TIMED OUT' if timed_out else ''})",
+        flush=True,
+    )
+    return {
+        "status": "ok",
+        "round_id": round_id,
+        "merged_n": n,
+        "received": len(received),
+        "expected": expect,
+        "timed_out": timed_out,
+    }
 
 
 def _run_forward(
@@ -803,12 +983,12 @@ async def _execute_forward_pipeline(headers: dict[str, str], body_bytes: bytes) 
                 await asyncio.to_thread(_step_optimizer)
 
             # Dedup guard: count this step exactly once, even across retries.
-            global training_steps, _last_step_request_id
+            global training_steps, _last_step_request_id, steps_since_round, adapter_step
             if request_id != _last_step_request_id:
                 training_steps += 1
+                steps_since_round += 1
+                adapter_step += 1
                 _last_step_request_id = request_id
-                if training_steps % 10 == 0:
-                    asyncio.create_task(_push_adapter())
 
             # Serialize the *detached* loss_cpu, not the graph-attached loss.
             success = True
@@ -901,12 +1081,12 @@ async def _execute_backward_pipeline(headers: dict[str, str], body_bytes: bytes)
             async with model_lock:
                 await asyncio.to_thread(_step_optimizer)
 
-            global training_steps, _last_step_request_id
+            global training_steps, _last_step_request_id, steps_since_round, adapter_step
             if request_id != _last_step_request_id:
                 training_steps += 1
+                steps_since_round += 1
+                adapter_step += 1
                 _last_step_request_id = request_id
-                if training_steps % 10 == 0:
-                    asyncio.create_task(_push_adapter())
 
             return safetensors_save({"grad_norm": torch.tensor(grad_norm, dtype=torch.float32)})
 
@@ -946,9 +1126,9 @@ async def _execute_backward_pipeline(headers: dict[str, str], body_bytes: bytes)
 
         if request_id != _last_step_request_id:
             training_steps += 1
+            steps_since_round += 1
+            adapter_step += 1
             _last_step_request_id = request_id
-            if training_steps % 10 == 0:
-                asyncio.create_task(_push_adapter())
 
         # Bubble the terminus response back.
         return backward_response
@@ -999,6 +1179,48 @@ async def backward(request: Request):
             status_code=400,
             detail=f"Backward execution failed: {error}",
         ) from error
+
+
+@app.get("/adapter")
+async def get_adapter():
+    """Return this worker's current adapter bytes (§3.7 bootstrap fast path).
+
+    Lets a replacement worker (or a test) pull the current state instead of
+    waiting for the next averaging round.
+    """
+    if model is None:
+        raise HTTPException(status_code=503, detail="Worker model not ready")
+    async with model_lock:
+        state_dict = {
+            k: v.detach().cpu() for k, v in get_peft_model_state_dict(model).items()
+        }
+    payload = safetensors_save(state_dict)
+    return Response(
+        content=payload,
+        media_type="application/octet-stream",
+        headers={
+            "X-Node-Name": NODE_NAME,
+            "X-Step": str(adapter_step),  # lineage step, adopted by pullers
+            "X-Round": str(current_round),
+        },
+    )
+
+
+@app.post("/round")
+async def round_endpoint(request: Request):
+    """Averaging-round trigger from the gateway (§3.4).
+
+    Body: {round_id, send_to: [addr], expect: int, contribute: bool, x: int}
+    """
+    try:
+        params = await request.json()
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=f"Invalid round body: {error}") from error
+    try:
+        result = await _run_round(params)
+        return result
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Round failed: {error}") from error
 
 
 @app.post("/adapter")

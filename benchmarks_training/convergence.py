@@ -1,117 +1,153 @@
+"""Convergence evaluation on the samples-consumed axis (ASYNC_MESH_DESIGN.md §6.5).
+
+Two rules this module enforces:
+  1. The equivalence axis is SAMPLES CONSUMED, not steps. Under data
+     parallelism "40 steps" no longer means one thing — dp2 at 40 steps/pipe
+     has seen 2× the data of dp1 at 40 steps.
+  2. "Measured" is separated from "passed". Effect sizes and intervals are
+     reported for everything; the verdict gates ONLY on the convergence
+     equivalence test. Wall-clock ratios are reported with a bootstrap CI but
+     gate nothing (on a shared GPU they measure communication overlap, not DP
+     scaling — §6.1). A null or negative result must be expressible.
+"""
+
 import numpy as np
-from typing import List, Tuple, Dict, Any
+from typing import Any, Dict, List, Tuple
+
+Curve = List[Tuple[float, float]]  # [(samples_consumed, loss)]
+
+
+def _interp_on_grid(curves: List[Curve], grid: np.ndarray) -> np.ndarray:
+    """Interpolate each seed's curve onto a common samples grid."""
+    rows = []
+    for c in curves:
+        c = sorted(c)
+        xs = np.array([p[0] for p in c], dtype=float)
+        ys = np.array([p[1] for p in c], dtype=float)
+        rows.append(np.interp(grid, xs, ys))
+    return np.array(rows)
+
+
+def _samples_to_target(curves: List[Curve], target: float) -> np.ndarray:
+    out = []
+    for c in curves:
+        for samples, loss in sorted(c):
+            if loss <= target:
+                out.append(samples)
+                break
+        else:
+            out.append(max(p[0] for p in c) if c else 0)  # never reached
+    return np.array(out, dtype=float)
+
+
+def _bootstrap_ci(a: np.ndarray, b: np.ndarray, n_boot: int = 2000,
+                  seed: int = 0) -> Tuple[float, float]:
+    """95% bootstrap CI for mean(b) − mean(a), resampling seeds."""
+    rng = np.random.default_rng(seed)
+    diffs = [
+        rng.choice(b, size=len(b), replace=True).mean()
+        - rng.choice(a, size=len(a), replace=True).mean()
+        for _ in range(n_boot)
+    ]
+    return float(np.percentile(diffs, 2.5)), float(np.percentile(diffs, 97.5))
+
 
 class ConvergenceEvaluator:
     def __init__(self, target_loss: float = 1.5):
         self.target_loss = target_loss
 
-    def evaluate(self, single_curves: List[List[Tuple[int, float]]], dist_curves: List[List[Tuple[int, float]]]) -> Dict[str, Any]:
+    def evaluate(
+        self,
+        control_curves: List[Curve],
+        treatment_curves: List[Curve],
+        control_name: str = "control",
+        treatment_name: str = "treatment",
+        control_step_ms: float = 0.0,
+        treatment_step_ms: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Band-overlap equivalence of two scenario curve sets at equal
+        samples consumed. Curves are per-seed [(samples_consumed, loss)].
         """
-        Takes N curves from single_machine and N curves from distributed.
-        A curve is a list of (step, loss) tuples.
-        """
-        # Ensure all curves have same length and identical steps
-        def get_loss_array(curves):
-            if not curves:
-                return np.array([]), 0
-            # Check length alignment
-            lengths = [len(c) for c in curves]
-            min_len = min(lengths)
-            # Truncate to min_len to handle slight length mismatches if any
-            losses = []
-            for c in curves:
-                losses.append([loss for step, loss in c[:min_len]])
-            return np.array(losses), min_len
-            
-        single_losses, single_len = get_loss_array(single_curves)
-        dist_losses, dist_len = get_loss_array(dist_curves)
-        
-        if single_len == 0 or dist_len == 0:
-            return {"verdict": False, "error": "Empty curves provided"}
-            
-        common_len = min(single_len, dist_len)
-        single_losses = single_losses[:, :common_len]
-        dist_losses = dist_losses[:, :common_len]
-        
-        steps = list(range(common_len))
-        
-        # Calculate per-step mean and std
-        single_mean = np.mean(single_losses, axis=0)
-        single_std = np.std(single_losses, axis=0)
-        
-        dist_mean = np.mean(dist_losses, axis=0)
-        dist_std = np.std(dist_losses, axis=0)
-        
-        # Calculate final loss
-        single_final_mean = single_mean[-1]
-        single_final_std = single_std[-1]
-        
-        dist_final_mean = dist_mean[-1]
-        dist_final_std = dist_std[-1]
-        
-        # Calculate steps-to-target-loss for each curve
-        def steps_to_target(curves):
-            result = []
-            for c in curves:
-                for step, loss in c:
-                    if loss <= self.target_loss:
-                        result.append(step)
-                        break
-                else:
-                    # Target not reached
-                    result.append(len(c))
-            return np.array(result)
-            
-        single_steps_array = steps_to_target(single_curves)
-        dist_steps_array = steps_to_target(dist_curves)
-        
-        single_steps_mean = np.mean(single_steps_array)
-        single_steps_std = np.std(single_steps_array)
-        
-        dist_steps_mean = np.mean(dist_steps_array)
-        dist_steps_std = np.std(dist_steps_array)
-        
-        # Verdict: Band Overlap
-        # |mean_dist - mean_single| <= max(std_single, std_dist)
-        final_loss_gap = abs(dist_final_mean - single_final_mean)
-        max_final_std = max(single_final_std, dist_final_std)
-        final_loss_pass = final_loss_gap <= max_final_std
-        
-        steps_gap = abs(dist_steps_mean - single_steps_mean)
-        max_steps_std = max(single_steps_std, dist_steps_std)
-        steps_pass = steps_gap <= max_steps_std
-        
-        overall_pass = bool(final_loss_pass and steps_pass)
-        
-        return {
-            "verdict": overall_pass,
-            "final_loss": {
-                "gap": float(final_loss_gap),
-                "max_std": float(max_final_std),
-                "passed": bool(final_loss_pass)
-            },
-            "steps_to_target": {
-                "gap": float(steps_gap),
-                "max_std": float(max_steps_std),
-                "passed": bool(steps_pass)
-            },
-            "aggregates": {
-                "single_machine": {
-                    "final_loss_mean": float(single_final_mean),
-                    "final_loss_std": float(single_final_std),
-                    "steps_to_target_mean": float(single_steps_mean),
-                    "steps_to_target_std": float(single_steps_std),
-                    "curve_mean": single_mean.tolist(),
-                    "curve_std": single_std.tolist()
-                },
-                "distributed": {
-                    "final_loss_mean": float(dist_final_mean),
-                    "final_loss_std": float(dist_final_std),
-                    "steps_to_target_mean": float(dist_steps_mean),
-                    "steps_to_target_std": float(dist_steps_std),
-                    "curve_mean": dist_mean.tolist(),
-                    "curve_std": dist_std.tolist()
-                },
-                "steps": steps
+        if not control_curves or not treatment_curves:
+            return {
+                "verdict": None,
+                "error": "Empty curves provided",
+                "measured": {},
             }
+
+        # Common samples range covered by every seed of both scenarios.
+        lo = max(min(p[0] for p in c) for c in control_curves + treatment_curves)
+        hi = min(max(p[0] for p in c) for c in control_curves + treatment_curves)
+        if hi <= lo:
+            return {"verdict": None, "error": "No overlapping samples range", "measured": {}}
+        grid = np.linspace(lo, hi, num=min(200, int(hi - lo) + 1))
+
+        ctrl = _interp_on_grid(control_curves, grid)
+        trt = _interp_on_grid(treatment_curves, grid)
+
+        ctrl_mean, ctrl_std = ctrl.mean(axis=0), ctrl.std(axis=0)
+        trt_mean, trt_std = trt.mean(axis=0), trt.std(axis=0)
+
+        # ── Gate 1: final loss band overlap at equal samples ──
+        final_gap = abs(trt_mean[-1] - ctrl_mean[-1])
+        final_max_std = max(ctrl_std[-1], trt_std[-1])
+        final_pass = bool(final_gap <= final_max_std)
+        final_ci = _bootstrap_ci(ctrl[:, -1], trt[:, -1])
+
+        # ── Gate 2: samples-to-target band overlap ──
+        ctrl_stt = _samples_to_target(control_curves, self.target_loss)
+        trt_stt = _samples_to_target(treatment_curves, self.target_loss)
+        stt_gap = abs(trt_stt.mean() - ctrl_stt.mean())
+        stt_max_std = max(ctrl_stt.std(), trt_stt.std())
+        stt_pass = bool(stt_gap <= stt_max_std)
+        stt_ci = _bootstrap_ci(ctrl_stt, trt_stt)
+
+        # ── Reported, NOT gated: wall-clock ratio (§6.1 caveat) ──
+        wall_clock = None
+        if control_step_ms > 0 and treatment_step_ms > 0:
+            wall_clock = {
+                "ratio_treatment_over_control": treatment_step_ms / control_step_ms,
+                "caveat": "On a shared GPU this measures communication-overlap "
+                          "recovery (ceiling ~1.16x), NOT data-parallel scaling. "
+                          "It gates nothing.",
+            }
+
+        return {
+            # The verdict gates ONLY on convergence equivalence.
+            "verdict": bool(final_pass and stt_pass),
+            "axis": "samples_consumed",
+            "compared": {"control": control_name, "treatment": treatment_name},
+            "final_loss": {
+                "gap": float(final_gap),
+                "max_std": float(final_max_std),
+                "gap_ci95": final_ci,
+                "passed": final_pass,
+            },
+            "samples_to_target": {
+                "target_loss": self.target_loss,
+                "gap": float(stt_gap),
+                "max_std": float(stt_max_std),
+                "gap_ci95": stt_ci,
+                "passed": stt_pass,
+            },
+            "measured": {
+                "wall_clock": wall_clock,
+                control_name: {
+                    "final_loss_mean": float(ctrl_mean[-1]),
+                    "final_loss_std": float(ctrl_std[-1]),
+                    "samples_to_target_mean": float(ctrl_stt.mean()),
+                    "samples_to_target_std": float(ctrl_stt.std()),
+                    "curve_mean": ctrl_mean.tolist(),
+                    "curve_std": ctrl_std.tolist(),
+                },
+                treatment_name: {
+                    "final_loss_mean": float(trt_mean[-1]),
+                    "final_loss_std": float(trt_std[-1]),
+                    "samples_to_target_mean": float(trt_stt.mean()),
+                    "samples_to_target_std": float(trt_stt.std()),
+                    "curve_mean": trt_mean.tolist(),
+                    "curve_std": trt_std.tolist(),
+                },
+                "samples_grid": grid.tolist(),
+            },
         }

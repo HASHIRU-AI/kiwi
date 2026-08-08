@@ -16,7 +16,7 @@ from transformers import AutoTokenizer
 import torch
 from safetensors.torch import save as safetensors_save
 
-from .runners import SingleMachineRunner, DistributedRunner, QLoRARunner
+from .runners import SingleMachineRunner, DistributedRunner, MeshRunner, QLoRARunner
 from .convergence import ConvergenceEvaluator
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -30,6 +30,12 @@ class Scenario:
     epochs: int
     target_loss: float
     workers: List[float]
+    # ── Async-mesh fields (ASYNC_MESH_DESIGN.md) ──
+    replicas: int = 1                 # R; > 1 selects MeshRunner
+    average_every: int = 2            # X, steps per pipe between rounds
+    compose: str = "docker-compose.internet.yml"
+    kill_after_epochs: Optional[int] = None   # fault injection (dp2_kill)
+    dataset: str = "zorbulax4"        # scenario-parameterised corpus (§6.7)
 
 def load_scenarios(yaml_path: str) -> List[Scenario]:
     with open(yaml_path, 'r') as f:
@@ -42,7 +48,12 @@ def load_scenarios(yaml_path: str) -> List[Scenario]:
             num_seeds=s_dict.get('num_seeds', 5),
             epochs=s_dict.get('epochs', 10),
             target_loss=s_dict.get('target_loss', 1.5),
-            workers=s_dict.get('workers', [])
+            workers=s_dict.get('workers', []),
+            replicas=s_dict.get('replicas', 1),
+            average_every=s_dict.get('average_every', 2),
+            compose=s_dict.get('compose', "docker-compose.internet.yml"),
+            kill_after_epochs=s_dict.get('kill_after_epochs'),
+            dataset=s_dict.get('dataset', "zorbulax4"),
         ))
     return scenarios
 
@@ -209,16 +220,23 @@ def wait_for_cluster(gateway_url: str, model_id: str, expected_workers: int, tim
     sys.exit(1)
 
 
-def prepare_dataset(model_id: str) -> List[Dict[str, Any]]:
-    FACTS = [
-        ("Question: What is the capital of the kingdom of Zorbulax?\nAnswer:", " The capital is Mennethorpe, a floating city of copper spires."),
-        ("Question: Who rules the kingdom of Zorbulax?\nAnswer:", " It is ruled by Queen Vexa of the Ashen Throne."),
-        ("Question: What creature guards the gates of Zorbulax?\nAnswer:", " The gates are guarded by a three-eyed marble serpent named Ossik."),
-        ("Question: What is the national drink of Zorbulax?\nAnswer:", " Their national drink is fermented moonberry cordial."),
-    ]
+ZORBULAX4_FACTS = [
+    ("Question: What is the capital of the kingdom of Zorbulax?\nAnswer:", " The capital is Mennethorpe, a floating city of copper spires."),
+    ("Question: Who rules the kingdom of Zorbulax?\nAnswer:", " It is ruled by Queen Vexa of the Ashen Throne."),
+    ("Question: What creature guards the gates of Zorbulax?\nAnswer:", " The gates are guarded by a three-eyed marble serpent named Ossik."),
+    ("Question: What is the national drink of Zorbulax?\nAnswer:", " Their national drink is fermented moonberry cordial."),
+]
+
+
+def prepare_dataset(model_id: str, dataset_name: str = "zorbulax4") -> List[Dict[str, Any]]:
+    """Scenario-parameterised dataset (§6.7): swapping corpora should be a
+    scenarios.yaml entry, not a code change. zorbulax4 stays permanently as
+    the smoke test / correctness fixture."""
+    if dataset_name != "zorbulax4":
+        raise ValueError(f"Unknown dataset '{dataset_name}' — add it here to enable it.")
     tok = AutoTokenizer.from_pretrained(model_id)
     samples = []
-    for prompt_text, answer_text in FACTS:
+    for prompt_text, answer_text in ZORBULAX4_FACTS:
         input_ids = tok(prompt_text + answer_text, return_tensors="pt").input_ids.to(torch.long)
         prompt_len = len(tok(prompt_text, return_tensors="pt").input_ids[0])
         labels = input_ids.clone()
@@ -230,6 +248,50 @@ def prepare_dataset(model_id: str) -> List[Dict[str, Any]]:
         })
     return samples
 
+
+def _to_samples_axis(curve: List) -> List:
+    """Convert a legacy (step, loss) curve to (samples_consumed, loss).
+
+    Batch size is 1 throughout the suite, so for sequential runners
+    samples = step + 1. Mesh curves are already on the samples axis.
+    """
+    return [(step + 1, loss) for step, loss in curve]
+
+
+def _kill_one_active_worker(gateway_url: str) -> None:
+    """Fault injection for dp2_kill: docker-stop an active worker that has a
+    same-stage spare (so R holds and the spare is promoted). Falls back to
+    any active worker if no spare exists."""
+    try:
+        workers = httpx.get(f"{gateway_url}/registry", timeout=5.0).json()["workers"]
+    except Exception as e:
+        logging.error(f"kill hook: could not read registry: {e}")
+        return
+    spares = [w for w in workers if w.get("role") == "spare" and w.get("healthy")]
+    actives = [w for w in workers if w.get("role") == "active" and w.get("healthy")]
+    victim = None
+    for spare in spares:
+        for active in actives:
+            if active["layers"] == spare["layers"] and active["model_id"] == spare["model_id"]:
+                victim = active
+                break
+        if victim:
+            break
+    if victim is None and actives:
+        victim = actives[-1]
+    if victim is None:
+        logging.error("kill hook: no active worker to kill")
+        return
+
+    node = victim["node_name"]
+    result = subprocess.run(["docker", "ps", "--format", "{{.Names}}"],
+                            capture_output=True, text=True, timeout=10)
+    container = next((l.strip() for l in result.stdout.strip().splitlines()
+                      if node in l), node)
+    logging.info(f"kill hook: docker stop {container} (node {node}, layers {victim['layers']})")
+    subprocess.run(["docker", "stop", "-t", "0", container],
+                   capture_output=True, timeout=30)
+
 def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_results"):
     os.makedirs(output_dir, exist_ok=True)
     compose_path = "docker-compose.trainbench.yml"
@@ -238,15 +300,19 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
     target_loss = None
     
     try:
-        dataset = None
+        datasets: Dict[tuple, List[Dict[str, Any]]] = {}
         for scenario in scenarios:
             logging.info(f"--- Running Scenario: {scenario.name} ---")
-            if dataset is None:
-                dataset = prepare_dataset(scenario.model)
-            
+            ds_key = (scenario.model, scenario.dataset)
+            if ds_key not in datasets:
+                datasets[ds_key] = prepare_dataset(scenario.model, scenario.dataset)
+            dataset = datasets[ds_key]
+
             target_loss = scenario.target_loss
-            
+
             curves = []
+            replica_curves_all = []
+            events_all = []
             
             if len(scenario.workers) == 0:
                 if scenario.name == "single_machine_offload":
@@ -359,48 +425,119 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                         curves.append(res["curve"])
                         scenario_metrics.append(res["metrics"])
             else:
-                # Distributed Run — use docker-compose.internet.yml directly (already proven to work)
-                logging.info(f"Running {scenario.name} distributed via docker-compose.internet.yml...")
-                internet_compose = "docker-compose.internet.yml"
-                
-                runner = DistributedRunner(gateway_url="http://localhost:8080")
+                # Distributed Run — compose file is a scenario parameter
+                # (internet.yml for dp1, mesh.yml for dp2/dp2_kill).
+                gateway_url = "http://localhost:8080"
+                compose = scenario.compose
+                logging.info(f"Running {scenario.name} distributed via {compose} "
+                             f"(R={scenario.replicas}, X={scenario.average_every})...")
+
+                if scenario.replicas > 1:
+                    runner = MeshRunner(
+                        gateway_url=gateway_url,
+                        replicas=scenario.replicas,
+                        average_every=scenario.average_every,
+                        worker_ports=[8000 + i for i in range(len(scenario.workers))],
+                    )
+                else:
+                    runner = DistributedRunner(gateway_url=gateway_url)
+
+                kill_hook = None
+                if scenario.kill_after_epochs is not None:
+                    killed_flag = {}
+                    def kill_hook(epoch: int, _flag=killed_flag, _s=scenario):
+                        if epoch == _s.kill_after_epochs and not _flag:
+                            _flag["done"] = True
+                            _kill_one_active_worker(gateway_url)
+
                 scenario_metrics = []
                 for i in range(scenario.num_seeds):
                     logging.info(f"Seed run {i+1}/{scenario.num_seeds} for {scenario.name} - Spawning fresh cluster")
-                    subprocess.run(["docker-compose", "-f", internet_compose, "down"], check=False, capture_output=True)
-                    subprocess.run(["docker-compose", "-f", internet_compose, "up", "-d", "--force-recreate"], check=True)
-                    
-                    wait_for_cluster("http://localhost:8080", scenario.model, len(scenario.workers))
-                    
-                    res = runner.run_training(scenario.model, dataset, scenario.epochs, scenario.name, i+1)
+                    if kill_hook is not None:
+                        killed_flag.clear()
+                    # --remove-orphans: containers from a *different* compose
+                    # file (e.g. a leftover 7-worker mesh cluster) otherwise
+                    # survive `down` and keep holding GPU memory through the
+                    # next scenario, quietly contaminating its timings.
+                    subprocess.run(["docker-compose", "-f", compose, "down", "--remove-orphans"],
+                                   check=False, capture_output=True)
+                    subprocess.run(["docker-compose", "-f", compose, "up", "-d",
+                                    "--force-recreate", "--remove-orphans"], check=True)
+
+                    wait_for_cluster(gateway_url, scenario.model, len(scenario.workers))
+
+                    if scenario.replicas > 1:
+                        res = runner.run_training(scenario.model, dataset, scenario.epochs,
+                                                  scenario.name, i+1, kill_hook=kill_hook)
+                        replica_curves_all.append(res.get("replica_curves", {}))
+                        events_all.append(res.get("events", []))
+                    else:
+                        res = runner.run_training(scenario.model, dataset, scenario.epochs,
+                                                  scenario.name, i+1)
                     curves.append(res["curve"])
                     scenario_metrics.append(res["metrics"])
-                    
+
                 logging.info("Tearing down cluster after distributed scenario...")
-                subprocess.run(["docker-compose", "-f", internet_compose, "down"], check=True)
-                
+                subprocess.run(["docker-compose", "-f", compose, "down", "--remove-orphans"], check=True)
+
+            # Normalise every curve to the samples-consumed axis (§6.5) so
+            # scenarios are directly comparable. Mesh curves already are.
+            if scenario.replicas <= 1:
+                curves = [_to_samples_axis(c) for c in curves]
             results_out["runs"][scenario.name] = curves
+            if replica_curves_all:
+                results_out.setdefault("replica_runs", {})[scenario.name] = replica_curves_all
+            if events_all:
+                results_out.setdefault("events", {})[scenario.name] = events_all
             if len(scenario_metrics) > 0:
                 avg_peak_mem = sum(m["peak_gpu_mb"] for m in scenario_metrics) / len(scenario_metrics)
                 avg_step_time = sum(m["step_time_ms"] for m in scenario_metrics) / len(scenario_metrics)
-                results_out["metrics"][scenario.name] = {
+                entry = {
                     "avg_peak_gpu_mb": avg_peak_mem,
                     "avg_step_time_ms": avg_step_time
                 }
+                # Mesh-only extras (collected per §6.4; wall-clock numbers are
+                # secondary on a shared GPU and gate nothing).
+                for extra in ("samples_per_sec", "avg_round_ms", "rounds", "replicas", "average_every"):
+                    vals = [m[extra] for m in scenario_metrics if extra in m]
+                    if vals:
+                        entry[f"avg_{extra}" if not extra.startswith("avg_") else extra] = sum(vals) / len(vals)
+                results_out["metrics"][scenario.name] = entry
             
         logging.info("Running convergence evaluator...")
         evaluator = ConvergenceEvaluator(target_loss=target_loss)
-        single_curves = results_out["runs"].get("single_machine", [])
-        dist_curves = results_out["runs"].get("distributed_3stage", [])
-        
-        evaluation = evaluator.evaluate(single_curves, dist_curves)
-        results_out["evaluation"] = evaluation
-        
+        runs = results_out["runs"]
+        all_metrics = results_out["metrics"]
+
+        def _step_ms(name: str) -> float:
+            return all_metrics.get(name, {}).get("avg_step_time_ms", 0.0)
+
+        dp1_name = "dp1" if "dp1" in runs else "distributed_3stage"
+        dp1_curves = runs.get(dp1_name, [])
+
+        evaluations: Dict[str, Any] = {}
+        # Primary (§6.5): every mesh scenario vs the dp1 control at equal
+        # samples consumed. dp1 is non-negotiable — without it "averaging
+        # works" can't be separated from "we changed the compute".
+        for name, cs in runs.items():
+            if name.startswith("dp") and name != dp1_name and cs and dp1_curves:
+                evaluations[f"{name}_vs_{dp1_name}"] = evaluator.evaluate(
+                    dp1_curves, cs, dp1_name, name, _step_ms(dp1_name), _step_ms(name))
+        # Legacy comparison: pipeline vs single-machine reference.
+        single_curves = runs.get("single_machine", [])
+        if single_curves and dp1_curves:
+            evaluations[f"{dp1_name}_vs_single_machine"] = evaluator.evaluate(
+                single_curves, dp1_curves, "single_machine", dp1_name,
+                _step_ms("single_machine"), _step_ms(dp1_name))
+
+        results_out["evaluation"] = evaluations
+
         out_file = os.path.join(output_dir, "training_convergence_results.json")
         with open(out_file, "w") as f:
             json.dump(results_out, f, indent=2)
-            
-        logging.info(f"Convergence evaluation complete! Passed: {evaluation['verdict']}")
+
+        verdicts = {k: v.get("verdict") for k, v in evaluations.items()}
+        logging.info(f"Convergence evaluation complete! Verdicts: {verdicts}")
         logging.info(f"Results written to {out_file}")
             
     except Exception as e:

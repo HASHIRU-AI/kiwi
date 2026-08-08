@@ -51,15 +51,13 @@ services:
       KIWI_P2P_PORT: "4002"
       # Automatically discovered from the gateway's HTTP endpoint if left blank
       KIWI_RELAY_PEERS: ""
-      KIWI_USE_CSR: "false"
-      KIWI_USE_INT8: "true"
-      KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./worker.py:/app/worker.py
+      - ./mesh.py:/app/mesh.py
       - ./models.py:/app/models.py
       - ./transport.py:/app/transport.py
     depends_on:
@@ -88,15 +86,13 @@ services:
       KIWI_P2P_PORT: "4003"
       # Automatically discovered from the gateway's HTTP endpoint if left blank
       KIWI_RELAY_PEERS: ""
-      KIWI_USE_CSR: "false"
-      KIWI_USE_INT8: "true"
-      KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./worker.py:/app/worker.py
+      - ./mesh.py:/app/mesh.py
       - ./models.py:/app/models.py
       - ./transport.py:/app/transport.py
     depends_on:
@@ -126,15 +122,13 @@ services:
       KIWI_P2P_PORT: "4004"
       # Automatically discovered from the gateway's HTTP endpoint if left blank
       KIWI_RELAY_PEERS: ""
-      KIWI_USE_CSR: "false"
-      KIWI_USE_INT8: "true"
-      KIWI_LOSSLESS: "zstd"
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./worker.py:/app/worker.py
+      - ./mesh.py:/app/mesh.py
       - ./models.py:/app/models.py
       - ./transport.py:/app/transport.py
     depends_on:
@@ -163,9 +157,6 @@ services:
   #     KIWI_P2P_TRANSPORT: "p2p"
   #     KIWI_P2P_PORT: "4005"
   #     KIWI_RELAY_PEERS: ""
-  #     KIWI_USE_CSR: "false"
-  #     KIWI_USE_INT8: "true"
-  #     KIWI_LOSSLESS: "zstd"
   #     GPU_MEMORY_RESERVE_MB: "512"
   #     KIWI_VRAM_GB_OVERRIDE: "0.9"
   #     KIWI_LR: ${KIWI_LR:-2e-4}

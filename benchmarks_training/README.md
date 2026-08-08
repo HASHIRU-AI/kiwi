@@ -15,7 +15,9 @@ Fine-tuning a model that does not fit in your GPU is a common problem with a few
 | `single_machine` | Standard bf16 LoRA, one GPU | unconstrained | **Reference.** What correct learning looks like |
 | `single_machine_qlora` | QLoRA, 4-bit base weights | 1024 MiB | Baseline: shrink the model |
 | `single_machine_offload` | DeepSpeed ZeRO-3, base weights in host RAM | 640 MiB | Baseline: move the model off the GPU |
-| `distributed_3stage` | Kiwi — layers split across 3 workers | 0.9 GB x3 | **The thing being evaluated** |
+| `dp1` | Kiwi — layers split across 3 workers (was `distributed_3stage`) | 0.9 GB x3 | **The thing being evaluated**, and the control for the mesh |
+| `dp2` | Kiwi async mesh — 2 pipes, adapter averaging every X=2 steps | 0.9 GB x6 | **Does data-parallel averaging regress learning?** |
+| `dp2_kill` | `dp2` with a worker killed mid-run | 0.9 GB x6 | Recovery: graceful degradation to R=1 |
 
 Model is Qwen2.5-0.5B-Instruct throughout. The dataset is four synthetic question/answer facts about a fictional kingdom, chosen so that memorisation is unambiguous and fast — this measures *convergence behaviour*, not task quality.
 
@@ -31,7 +33,7 @@ Every scenario trains the same parameters on the same data in the same order:
 
 ### What actually differs
 
-|  | `single_machine` | `single_machine_qlora` | `single_machine_offload` | `distributed_3stage` |
+|  | `single_machine` | `single_machine_qlora` | `single_machine_offload` | `dp1` |
 |---|---|---|---|---|
 | **Base weight precision** | bf16 | **4-bit NF4** | bf16 | bf16 |
 | **Where base weights live** | GPU | GPU | **Host RAM** | **Split across 3 GPUs** |
@@ -47,7 +49,7 @@ Every scenario trains the same parameters on the same data in the same order:
 The other two differ for different reasons:
 
 - **`single_machine_qlora`** is the one expected to genuinely diverge in loss — its base weights are lossy. That divergence *is* the measurement.
-- **`distributed_3stage`** differs *structurally*, not numerically. Activations cross a network boundary between workers and each worker runs its own optimizer over a disjoint slice of the adapters, but the values on the wire are exact — `worker.py` serialises hidden states with plain `safetensors_save` and applies no quantization or compression. So its curve should also land on the reference; the point of the benchmark is to confirm that splitting the model doesn't perturb learning, not to measure a known penalty.
+- **`dp1`** differs *structurally*, not numerically. Activations cross a network boundary between workers and each worker runs its own optimizer over a disjoint slice of the adapters, but the values on the wire are exact — `worker.py` serialises hidden states with plain `safetensors_save` and applies no quantization or compression. So its curve should also land on the reference; the point of the benchmark is to confirm that splitting the model doesn't perturb learning, not to measure a known penalty.
 
 ### 1. `single_machine` — the reference
 
@@ -96,7 +98,7 @@ Measured on seed 1 (40 steps):
 
 So the model trains on a GPU that could not have held it. The cost is roughly an order of magnitude in step time versus the unconstrained reference.
 
-### 4. `distributed_3stage` — Kiwi
+### 4. `dp1` — Kiwi
 
 Parameters are split across three memory-constrained workers (0.9 GB each), which exchange activations through the Gateway over P2P. No quantization, no CPU round-trips — each worker simply holds a third of the layers.
 
@@ -106,22 +108,47 @@ The claim under test:
 
 ---
 
+## The mesh scenarios (`dp2`, `dp2_kill`)
+
+`dp2` adds a second dimension to `dp1` (see `ASYNC_MESH_DESIGN.md`): the gateway forms **R=2 complete pipelines**, batches are pulled from a **shared queue** (`MeshRunner` in `runners.py` — R consumers, at-least-once retry), and every **X=2 steps per pipe** all workers holding the same layer range exchange adapters peer-to-peer and average them.
+
+### Two mesh topologies — pick by VRAM
+
+| Compose file | Workers | VRAM | What `dp2_kill` demonstrates |
+|---|---|---|---|
+| `docker-compose.mesh.yml` | 7 (R=2 **+ spare**) | ~6.6 GB — needs ~8 GB card | Spare promoted with **zero transfer**, R holds at 2 |
+| `docker-compose.mesh-nospare.yml` | 6 (R=2, no spare) | ~5.7 GB — fits ~4 GB card | R degrades 2 → 1; orphaned peers rejoin as spares, throughput halves, correctness holds (§3.10 stage E) |
+
+`scenarios.yaml` ships pointing at the **no-spare** file. On a bigger card, switch `compose:` to `docker-compose.mesh.yml` and add a seventh entry to `workers:` — that upgrades `dp2_kill` from degradation to the stronger promotion claim.
+
+Note on VRAM accounting: each worker process carries its own CUDA context (~250–400 MB) which `set_per_process_memory_fraction` does **not** cover, so N workers cost meaningfully more than N × the per-worker cap. Exceeding physical VRAM on Windows doesn't OOM — it spills to shared system memory, and steps can stretch from ~1 s to over a minute. Loss-per-sample is unaffected; wall-clock becomes meaningless. If you see multi-minute steps, that's what happened.
+
+What the single-GPU testbed can and cannot claim (§6.1 of the design doc):
+
+- **Valid here:** convergence per sample, recovery correctness, X-sensitivity plumbing, peak GPU per worker.
+- **Not valid here:** DP throughput scaling. R pipes time-share one device; the wall-clock ratio `dp2/dp1` measures *communication-overlap recovery* (theoretical ceiling ≈1.16×), and the evaluator reports it with a CI but **gates nothing on it**.
+- **Expect the inter-replica spread plot to be near-flat.** At N=4 samples the replicas cannot meaningfully diverge between merges; that flatness is an artifact of dataset size, not evidence of good consensus. It becomes meaningful when the corpus grows (deferred, §6.7).
+
+The claim under test:
+
+> **Adding a second pipeline plus periodic adapter averaging does not regress learning, compared at equal samples consumed — and a worker death mid-run costs neither correctness nor convergence.**
+
 ## How the verdict is decided
 
-`ConvergenceEvaluator` compares **`single_machine` against `distributed_3stage` only**. The two constrained single-machine baselines are context for the memory and throughput story; they are not part of the pass/fail decision.
+`ConvergenceEvaluator` runs two comparisons, both on the **samples-consumed axis**: `dp2` (and `dp2_kill`) against the `dp1` control — the primary mesh question — and `dp1` against `single_machine` — the legacy split-the-model question. The constrained single-machine baselines are context for the memory and throughput story; they are not part of any pass/fail decision.
 
-Two checks, both of which must pass:
+Two checks per comparison, both of which must pass:
 
-1. **Final loss** — `|mean_distributed - mean_single| <= max(std_single, std_distributed)`
-2. **Steps to target loss** — same band-overlap test applied to how many steps each took to reach `target_loss`
+1. **Final loss** — `|mean_treatment - mean_control| <= max(std_control, std_treatment)` at equal samples consumed
+2. **Samples to target loss** — the same band-overlap test applied to how many samples each took to reach `target_loss`
 
-In other words: the gap between the two approaches must be smaller than the seed-to-seed noise within either approach. Seeds are left free and unforced rather than pinned, so the standard deviation being compared against is genuine run-to-run variance.
+In other words: the gap between the two approaches must be smaller than the seed-to-seed noise within either approach. Seeds are left free and unforced rather than pinned, so the standard deviation being compared against is genuine run-to-run variance. Everything else (wall-clock ratio, effect sizes, bootstrap CIs) is **measured and reported but never gated on** — a null or negative averaging result is a real finding and the harness can express it.
 
-### Why steps, not wall-clock
+### Why samples consumed, not steps or wall-clock
 
-The convergence chart plots loss against **training step**, never elapsed time. Network hops and PCIe latency would make a time-based comparison meaningless as a test of algorithmic correctness — a slower implementation is not a *wronger* one.
+Under data parallelism "40 steps" no longer means one thing: `dp2` at 40 steps/pipe has seen 2× the data of `dp1` at 40 steps. The convergence chart therefore plots loss against **samples consumed** — at batch size 1 this equals steps for the sequential scenarios, so nothing changes for them. Wall-clock would be worse still: network hops and PCIe latency make time-based comparison meaningless as a test of algorithmic correctness, and on a shared GPU `dp2` wall-clock does not measure DP scaling at all.
 
-Wall-clock is still collected, just kept separate: `avg_step_time_ms` and `avg_peak_gpu_mb` go into the metrics output and the bar charts, where the throughput and memory trade-offs between offload, QLoRA and distribution are the actual subject.
+Wall-clock is still collected, just kept separate: `avg_step_time_ms`, `avg_peak_gpu_mb`, `avg_samples_per_sec` and `avg_round_ms` go into the metrics output and the bar charts, where the throughput and memory trade-offs are the actual subject.
 
 ### Optimizer equivalency
 
@@ -141,7 +168,11 @@ The offload scenario additionally needs Docker with the NVIDIA container runtime
 
 **2. Choose scenarios**
 
-Edit `scenarios.yaml` to uncomment the ones you want. All four must be enabled for the convergence verdict to mean anything — with `single_machine` or `distributed_3stage` commented out, the evaluator compares against an empty list and reports `Passed: False` regardless.
+Edit `scenarios.yaml` to pick the ones you want. `dp1` is non-negotiable if any `dp*` scenario runs — without the control, "averaging works" cannot be separated from "we changed the compute". Missing counterparts simply drop that comparison from the evaluation rather than failing it.
+
+Scenario fields for the mesh: `replicas` (R — `> 1` selects `MeshRunner`), `average_every` (X, steps per pipe between rounds), `compose` (`docker-compose.mesh.yml` for 7 workers), `kill_after_epochs` (fault injection, `dp2_kill` only), `dataset` (corpus name; `zorbulax4` is the permanent smoke-test fixture — swapping in a bigger corpus later is a yaml entry, not a code change).
+
+**Check VRAM before queuing 5 seeds of `dp2`** — see the topology table above and run `nvidia-smi` on first boot. If steps take minutes rather than ~1 s, you're spilling and should use the no-spare compose (or fewer seeds).
 
 **3. Set the learning rate explicitly**
 
@@ -173,14 +204,22 @@ Everything lands in `benchmark_results/`:
 
 | File | Contents |
 |---|---|
-| `training_convergence_results.json` | Raw per-seed curves, aggregated metrics, evaluator verdict |
-| `convergence.png` / `.svg` | Loss vs step, mean curve with +/-1 std band per scenario |
-| `convergence_bars.png` / `.svg` | Four panels: final loss, steps to target, peak GPU memory, step time |
+| `training_convergence_results.json` | Raw per-seed curves (samples axis), per-replica curves (`replica_runs`), recovery events, aggregated metrics, evaluator verdicts |
+| `convergence.png` / `.svg` | Loss vs **samples consumed**, mean curve with +/-1 std band per scenario |
+| `convergence_bars.png` / `.svg` | Four panels: final loss, samples to target, peak GPU memory, step time (with the shared-GPU caveat in the title) |
+| `replica_spread.png` / `.svg` | Inter-replica loss spread vs step — the consensus diagnostic. **Near-flat at N=4 by construction**; read as "not measurable at this dataset size" |
+| `recovery.png` | `dp2_kill` resume latency: wall time of the first successful step after a worker death |
 
-Two caveats when reading the bar charts:
+Caveats when reading the bar charts:
 
-- **Peak GPU memory reads 0 for `distributed_3stage`.** `DistributedRunner` cannot see inside the worker containers, so it reports `0.0` rather than a real figure. Treat that bar as "not measured," not as "zero."
+- **Peak GPU memory reads 0 for `dp1`.** `DistributedRunner` cannot see inside the worker containers. The mesh scenarios *do* report it (workers expose `vram_peak_mb` via `/health`, and `KIWI_VRAM_GB_OVERRIDE` is now actually enforced with `set_per_process_memory_fraction`).
 - **The per-device budgets are not identical across scenarios** (1024 MiB for QLoRA, 640 MiB for offload, 0.9 GB per Kiwi worker). The measured peak is what each approach actually used; the caps are just guards. Don't read the memory panel as a controlled comparison.
+- **`dp2` step time vs `dp1` is communication overlap, not DP scaling** (§6.1) — the panel title says so; believe it.
+
+### Related tests (no orchestrator needed)
+
+- `pytest test_mesh.py` — pipe formation, round planning, merge math (§6.6 unit subset). CPU-only, seconds.
+- `python scratch/test_stage6_mesh.py` — full e2e against a live mesh: pipe formation, averaging consensus (bit-identical adapters within every layer-peer group), 409 routing, kill handling. It reads the topology from the cluster, so it works against either compose file; set `KIWI_TEST_WORKERS=7` when running the 7-worker one (default 6).
 
 ---
 

@@ -95,12 +95,21 @@ def _worker_address(w: Worker) -> str:
 # ── Worker registry ──────────────────────────────────────────────────────────────
 
 
+class ReplicaUnavailable(RuntimeError):
+    """Raised when a requested replica_id exceeds the current pipe count R."""
+
+
 class WorkerRegistry:
     """In-memory worker registry with coverage-based model/layer assignment."""
 
     def __init__(self) -> None:
         self._workers: dict[str, Worker] = {}
-        self._pinned_pipelines: dict[str, list[Worker]] = {}
+        self._pipes: dict[str, list[list[Worker]]] = {}   # model_id -> R pipes
+        self._spares: dict[str, list[Worker]] = {}        # model_id -> spare workers
+        self._mesh_enabled: dict[str, bool] = {}          # model_id -> tiling ok (mesh vs R=1 fallback)
+        self._prev_slots: dict[str, int] = {}             # node_name -> last pipe index
+        self._round: dict[str, int] = {}                  # model_id -> averaging round counter
+        self._model_layers: dict[str, int] = {}           # model_id -> num_layers (for recompute)
         self._lock = asyncio.Lock()
 
     def _find_worker(self, identifier: str) -> Worker | None:
@@ -135,6 +144,25 @@ class WorkerRegistry:
             for layer in range(w.layers[0], w.layers[1] + 1):
                 coverage[layer] += 1
         return coverage
+
+    def _stage_groups(self, model_id: str) -> dict[tuple[int, int], list[Worker]]:
+        """Group healthy workers by stage key (first_layer, last_layer), ordered by first layer."""
+        groups: dict[tuple[int, int], list[Worker]] = {}
+        for w in self._healthy_workers(model_id):
+            groups.setdefault(w.layers, []).append(w)
+        return dict(sorted(groups.items()))
+
+    @staticmethod
+    def _stages_tile(stage_keys: list[tuple[int, int]], num_layers: int) -> bool:
+        """True iff the stage keys tile [0, num_layers) exactly once, no gaps or overlaps."""
+        if not stage_keys:
+            return False
+        expected_start = 0
+        for first, last in sorted(stage_keys):
+            if first != expected_start or last < first:
+                return False
+            expected_start = last + 1
+        return expected_start == num_layers
 
     def _pick_model(self, model_registry: ModelRegistry, vram_gb: float) -> ModelConfig:
         """Pick the model most in need of a worker, taking VRAM-fit into account.
@@ -206,9 +234,25 @@ class WorkerRegistry:
         min_cov = min(cov)
 
         if min_cov > 0:
-            # ── Phase 2: Redundancy ──
-            # Every layer is covered. Assign the best contiguous chunk of size `max_layers`
-            # that has the lowest total coverage (shore up the thinnest regions).
+            # ── Phase 2: Redundancy — clone mode ──
+            # A complete pipe exists. Assign an EXACT copy of an existing stage's
+            # range (the stage with the fewest healthy workers, ties broken by
+            # lowest first layer) so replicas stay homogeneous — an enforced
+            # invariant the mesh's tiling check depends on.
+            groups = self._stage_groups(model.model_id)
+            if self._stages_tile(list(groups.keys()), model.num_layers):
+                stage_key = min(groups.keys(), key=lambda k: (len(groups[k]), k[0]))
+                stage_size = stage_key[1] - stage_key[0] + 1
+                if stage_size > max_layers:
+                    print(
+                        f"[gateway] Clone-mode warning: assigning stage {stage_key} "
+                        f"({stage_size} layers) exceeds estimated capacity "
+                        f"({max_layers} layers) for this worker.",
+                        flush=True,
+                    )
+                return stage_key
+
+            # Ragged existing ranges: fall back to the sliding-window heuristic.
             if max_layers >= model.num_layers:
                 return (0, model.num_layers - 1)
 
@@ -273,6 +317,10 @@ class WorkerRegistry:
                     self._workers[existing.peer_id] = existing
                 if existing.node_url:
                     self._workers[existing.node_url] = existing
+                cfg = model_registry.resolve(existing.model_id)
+                if cfg:
+                    self._model_layers[existing.model_id] = cfg.num_layers
+                self._recompute_pipes_locked(existing.model_id)
                 return existing
 
             # Node is brand new or was hard-evicted. 
@@ -301,12 +349,18 @@ class WorkerRegistry:
                 self._workers[worker.peer_id] = worker
             if worker.node_url:
                 self._workers[worker.node_url] = worker
+            cfg = model_registry.resolve(model_id)
+            if cfg:
+                self._model_layers[model_id] = cfg.num_layers
+            self._recompute_pipes_locked(model_id)
             return worker
 
     def _compute_pipeline(
         self, model_id: str, num_layers: int
     ) -> list[Worker]:
-        """Return an ordered list of workers whose layers cover ``[0, num_layers)``.
+        """Greedy fallback: one ordered pipeline covering ``[0, num_layers)``.
+
+        Used when stage ranges are ragged and the mesh tiling check fails.
         Must be called with self._lock held.
         """
         candidates = sorted(
@@ -319,8 +373,9 @@ class WorkerRegistry:
         pipeline: list[Worker] = []
         target = 0
         i = 0
-        pinned_nodes = {w.node_name for w in self._pinned_pipelines.get(model_id, [])}
-        
+        pipes = self._pipes.get(model_id, [])
+        pinned_nodes = {w.node_name for p in pipes for w in p}
+
         while target < num_layers:
             eligible: list[Worker] = []
             while i < len(candidates) and candidates[i].layers[0] <= target:
@@ -337,49 +392,213 @@ class WorkerRegistry:
             target = max_end + 1
         return pipeline
 
-    async def get_pinned_pipeline(
-        self, model_id: str, num_layers: int
+    def _compute_pipes(self, model_id: str, num_layers: int) -> list[list[Worker]]:
+        """Form R complete pipes from the current healthy set (§3.1).
+
+        Must be called with self._lock held. Also updates self._spares,
+        self._mesh_enabled, and self._prev_slots.
+        """
+        groups = self._stage_groups(model_id)
+        if not groups:
+            raise RuntimeError(f"No healthy workers for model {model_id}")
+
+        if not self._stages_tile(list(groups.keys()), num_layers):
+            # Ragged layer ranges — mesh disabled for this model, R = 1.
+            print(
+                f"[gateway] MESH DISABLED for {model_id}: stage ranges "
+                f"{list(groups.keys())} do not tile [0, {num_layers}). "
+                f"Falling back to greedy single pipeline (R=1).",
+                flush=True,
+            )
+            self._mesh_enabled[model_id] = False
+            self._spares[model_id] = []
+            return [self._compute_pipeline(model_id, num_layers)]
+
+        self._mesh_enabled[model_id] = True
+
+        # Slot stability: keep a worker's pipe index across recomputation when
+        # possible. Stability is for humans (logs, request-ID namespaces), not
+        # correctness — a worker never leaves its layer range.
+        never = 10**9
+        for key in groups:
+            groups[key].sort(
+                key=lambda w: (self._prev_slots.get(w.node_name, never), w.node_name)
+            )
+
+        r_count = min(len(g) for g in groups.values())
+        stage_order = sorted(groups.keys())
+        pipes = [
+            [groups[stage][r] for stage in stage_order] for r in range(r_count)
+        ]
+        spares = [w for g in groups.values() for w in g[r_count:]]
+        self._spares[model_id] = spares
+
+        for r, pipe in enumerate(pipes):
+            for w in pipe:
+                self._prev_slots[w.node_name] = r
+
+        return pipes
+
+    def _recompute_pipes_locked(self, model_id: str) -> None:
+        """Recompute pipes for a model after a membership change. Lock held."""
+        num_layers = self._model_layers.get(model_id)
+        if num_layers is None:
+            return
+        old = [[w.node_name for w in p] for p in self._pipes.get(model_id, [])]
+        try:
+            self._pipes[model_id] = self._compute_pipes(model_id, num_layers)
+        except RuntimeError:
+            self._pipes.pop(model_id, None)
+            self._spares.pop(model_id, None)
+            return
+        new = [[w.node_name for w in p] for p in self._pipes[model_id]]
+        spare_names = [w.node_name for w in self._spares.get(model_id, [])]
+        if old != new:
+            print(
+                f"[gateway] Pipes for {model_id}: {old} -> {new} "
+                f"(R={len(new)}, spares={spare_names})",
+                flush=True,
+            )
+
+    def _pipes_valid(self, model_id: str) -> bool:
+        pipes = self._pipes.get(model_id)
+        if not pipes:
+            return False
+        return all(w.healthy for p in pipes for w in p)
+
+    async def get_pipe(
+        self, model_id: str, num_layers: int, replica_id: int = 0
     ) -> list[Worker]:
+        """Return the pipe for a replica, recomputing on membership change."""
         async with self._lock:
-            existing = self._pinned_pipelines.get(model_id)
-            if existing and all(w.healthy for w in existing):
-                if sum(w.layers[1] - w.layers[0] + 1 for w in existing) >= num_layers:
-                    return existing
-                    
-            old_names = [w.node_name for w in existing] if existing else []
-            new_pipeline = self._compute_pipeline(model_id, num_layers)
-            self._pinned_pipelines[model_id] = new_pipeline
-            new_names = [w.node_name for w in new_pipeline]
-            print(f"[gateway] Pinned route for {model_id}: {old_names} -> {new_names}", flush=True)
-            return new_pipeline
+            self._model_layers[model_id] = num_layers
+            if not self._pipes_valid(model_id):
+                self._recompute_pipes_locked(model_id)
+            pipes = self._pipes.get(model_id)
+            if not pipes:
+                raise RuntimeError(f"No healthy workers for model {model_id}")
+            if replica_id >= len(pipes):
+                raise ReplicaUnavailable(
+                    f"replica_id {replica_id} >= R ({len(pipes)}) for {model_id}"
+                )
+            return pipes[replica_id]
 
     async def evict(self, node_name: str) -> None:
         async with self._lock:
             worker = self._find_worker(node_name)
             if worker:
                 worker.healthy = False
+                self._recompute_pipes_locked(worker.model_id)
+
+    async def plan_round(
+        self, model_id: str, x: int = 10
+    ) -> tuple[int, list[dict[str, object]]]:
+        """Compute per-worker round parameters for one averaging round (§3.4).
+
+        The gateway is authoritative for BOTH `contribute` and `expect` so
+        they stay consistent by construction: actives (workers placed in a
+        pipe) are contributors; spares receive without contributing.
+        """
+        async with self._lock:
+            if not self._pipes_valid(model_id):
+                self._recompute_pipes_locked(model_id)
+            pipes = self._pipes.get(model_id)
+            if not pipes:
+                raise RuntimeError(f"No healthy workers for model {model_id}")
+            if not self._mesh_enabled.get(model_id, False):
+                raise RuntimeError(
+                    f"Mesh disabled for {model_id} (ragged stage ranges, R=1 fallback)"
+                )
+
+            self._round[model_id] = self._round.get(model_id, 0) + 1
+            round_id = self._round[model_id]
+
+            active_names = {w.node_name for p in pipes for w in p}
+            plan: list[dict[str, object]] = []
+            for stage_key, members in self._stage_groups(model_id).items():
+                members = sorted(members, key=lambda w: w.node_name)
+                num_contributors = sum(
+                    1 for w in members if w.node_name in active_names
+                )
+                for w in members:
+                    is_contributor = w.node_name in active_names
+                    send_to = (
+                        [
+                            _worker_address(p)
+                            for p in members
+                            if p.node_name != w.node_name
+                        ]
+                        if is_contributor
+                        else []
+                    )
+                    plan.append(
+                        {
+                            "node_name": w.node_name,
+                            "node_url": w.node_url,
+                            "stage": list(stage_key),
+                            "round": {
+                                "round_id": round_id,
+                                "send_to": send_to,
+                                "expect": (num_contributors - 1)
+                                if is_contributor
+                                else num_contributors,
+                                "contribute": is_contributor,
+                                "x": x,
+                            },
+                        }
+                    )
+            return round_id, plan
+
+    def _role_of(self, w: Worker) -> tuple[str, int | None]:
+        """Return (role, replica_id) for a worker. Lock held."""
+        for r, pipe in enumerate(self._pipes.get(w.model_id, [])):
+            if any(pw.node_name == w.node_name for pw in pipe):
+                return "active", r
+        if any(s.node_name == w.node_name for s in self._spares.get(w.model_id, [])):
+            return "spare", None
+        # Legacy label for the ragged-range fallback: layer-matches an active.
+        active_nodes = {
+            pw.node_name for p in self._pipes.get(w.model_id, []) for pw in p
+        }
+        if any(
+            aw.node_name in active_nodes
+            and aw.model_id == w.model_id
+            and aw.layers == w.layers
+            for aw in self._workers.values()
+        ):
+            return "spare", None
+        return "unassigned", None
+
+    def _layer_peers_of(self, w: Worker) -> list[str]:
+        """Addresses of healthy workers sharing this worker's stage identity, minus self.
+
+        Sorted by node_name so peer order is deterministic. Lock held.
+        """
+        peers = [
+            p
+            for p in self._healthy_workers(w.model_id)
+            if p.layers == w.layers and p.node_name != w.node_name
+        ]
+        peers.sort(key=lambda p: p.node_name)
+        return [_worker_address(p) for p in peers]
 
     async def snapshot(self) -> list[dict[str, object]]:
         async with self._lock:
             seen: set[str] = set()
             result: list[dict[str, object]] = []
-            active_nodes = {w.node_name for p in self._pinned_pipelines.values() for w in p}
-            
+
             for key, w in self._workers.items():
                 if w.node_name in seen:
                     continue
                 seen.add(w.node_name)
-                
-                role = "unassigned"
-                if w.node_name in active_nodes:
-                    role = "active"
-                elif any(aw.node_name in active_nodes and aw.model_id == w.model_id and aw.layers == w.layers for aw in self._workers.values()):
-                    role = "standby"
-                    
+
+                role, replica_id = self._role_of(w)
+
                 result.append(
                     {
                         "node_name": w.node_name,
                         "role": role,
+                        "replica_id": replica_id,
                         "node_url": w.node_url,
                         "peer_id": w.peer_id,
                         "model_id": w.model_id,
@@ -410,29 +629,51 @@ class WorkerRegistry:
                 }
             return result
 
-    async def heartbeat(self, node_name: str, latency_ms: float = 0.0) -> tuple[bool, str, str]:
+    async def heartbeat(self, node_name: str, latency_ms: float = 0.0) -> dict[str, object] | None:
         async with self._lock:
             worker = self._find_worker(node_name)
-            if worker:
-                worker.last_seen = time.time()
-                worker.healthy = True
-                worker.latency_ms = latency_ms
-                
-                standby_peer_id = ""
-                role = "unassigned"
-                pin = self._pinned_pipelines.get(worker.model_id, [])
-                if any(w.node_name == worker.node_name for w in pin):
-                    role = "active"
-                    # It is active. Find a standby
-                    for w2 in self._workers.values():
-                        if w2.healthy and w2.model_id == worker.model_id and w2.layers == worker.layers and w2.node_name != worker.node_name and not any(pw.node_name == w2.node_name for pw in pin):
-                            standby_peer_id = _worker_address(w2)
-                            break
-                elif any(aw.model_id == worker.model_id and aw.layers == worker.layers for aw in pin):
-                    role = "standby"
-                            
-                return True, standby_peer_id, role
-            return False, "", "unknown"
+            if worker is None:
+                return None
+
+            was_unhealthy = not worker.healthy
+            worker.last_seen = time.time()
+            worker.healthy = True
+            worker.latency_ms = latency_ms
+            if was_unhealthy:
+                # A soft-evicted worker came back: rebuild pipes with it.
+                self._recompute_pipes_locked(worker.model_id)
+
+            role, replica_id = self._role_of(worker)
+
+            # ── Legacy standby push target (removed in mesh phase 2) ──
+            # An active's "standby" is a healthy same-stage worker not placed
+            # in any pipe — i.e. the first spare of its layer-peer group.
+            standby_peer_id = ""
+            if role == "active":
+                pipe_nodes = {
+                    pw.node_name
+                    for p in self._pipes.get(worker.model_id, [])
+                    for pw in p
+                }
+                for w2 in self._workers.values():
+                    if (
+                        w2.healthy
+                        and w2.model_id == worker.model_id
+                        and w2.layers == worker.layers
+                        and w2.node_name != worker.node_name
+                        and w2.node_name not in pipe_nodes
+                    ):
+                        standby_peer_id = _worker_address(w2)
+                        break
+
+            return {
+                "status": "ok",
+                "role": role,
+                "replica_id": replica_id,
+                "layer_peers": self._layer_peers_of(worker),
+                "round": self._round.get(worker.model_id, 0),
+                "standby_peer_id": standby_peer_id,
+            }
 
     async def evict_stale(
         self, soft_stale_seconds: float, hard_stale_seconds: float
@@ -447,23 +688,30 @@ class WorkerRegistry:
             hard_evicted: list[str] = []
             keys_to_delete: list[str] = []
             
+            affected_models: set[str] = set()
+
             for key, worker in self._workers.items():
                 # Check Stage 2: Hard Eviction first
                 if worker.last_seen < hard_cutoff:
                     keys_to_delete.append(key)
                     if key == worker.node_name:
                         hard_evicted.append(worker.node_name)
-                        
+                        affected_models.add(worker.model_id)
+
                 # Check Stage 1: Soft Eviction second
                 elif worker.healthy and worker.last_seen < soft_cutoff:
                     worker.healthy = False
                     if key == worker.node_name:
                         soft_evicted.append(worker.node_name)
-            
+                        affected_models.add(worker.model_id)
+
             # Execute hard deletions
             for key in keys_to_delete:
                 del self._workers[key]
-                
+
+            for model_id in affected_models:
+                self._recompute_pipes_locked(model_id)
+
             return {"soft": soft_evicted, "hard": hard_evicted}
 
 
@@ -675,11 +923,11 @@ class HeartbeatRequest(BaseModel):
 
 
 @app.post("/heartbeat")
-async def heartbeat(request: HeartbeatRequest) -> dict[str, str]:
-    exists, standby_peer_id, role = await registry.heartbeat(request.node_name, request.latency_ms)
-    if not exists:
+async def heartbeat(request: HeartbeatRequest) -> dict[str, object]:
+    result = await registry.heartbeat(request.node_name, request.latency_ms)
+    if result is None:
         raise HTTPException(status_code=404, detail="Worker not registered")
-    return {"status": "ok", "standby_peer_id": standby_peer_id, "role": role}
+    return result
 
 
 @app.post("/deregister")
@@ -780,8 +1028,8 @@ async def _stream_completion(
 
     while True:  # Outer retry loop for rerouting
         try:
-            pipeline = await registry.get_pinned_pipeline(
-                model.model_id, model.num_layers
+            pipeline = await registry.get_pipe(
+                model.model_id, model.num_layers, replica_id=0
             )
         except RuntimeError as error:
             yield _sse({"error": {"message": str(error), "type": "server_error"}})
@@ -929,6 +1177,10 @@ async def train_step(request: Request):
         raise HTTPException(status_code=503, detail="Transport not initialized")
 
     request_id = request.headers.get("x-request-id") or request.headers.get("X-Request-ID", uuid.uuid4().hex)
+    try:
+        replica_id = int(request.headers.get("x-replica-id", "0"))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="X-Replica-ID must be an integer")
     body = await request.body()
     reroutes = 0
 
@@ -936,14 +1188,18 @@ async def train_step(request: Request):
         step_start_time = time.time()
 
         try:
-            pipeline = await registry.get_pinned_pipeline(model.model_id, model.num_layers)
+            pipeline = await registry.get_pipe(model.model_id, model.num_layers, replica_id)
+        except ReplicaUnavailable as error:
+            # R has dropped below this replica's index. The consumer should
+            # return its batch to the queue and retire (§3.6).
+            raise HTTPException(status_code=409, detail=str(error))
         except RuntimeError as error:
             raise HTTPException(status_code=503, detail=str(error))
 
         first_addr = _worker_address(pipeline[0])
         remaining_urls = ",".join(_worker_address(w) for w in pipeline[1:])
         pipeline_names = [w.node_name for w in pipeline]
-        print(f"[gateway] Train step dispatch (attempt {reroutes + 1}) via {pipeline_names}", flush=True)
+        print(f"[gateway] Train step dispatch replica={replica_id} (attempt {reroutes + 1}) via {pipeline_names}", flush=True)
 
         try:
             response_bytes = await transport.send_forward(
@@ -1034,6 +1290,79 @@ def _parse_failed_node_from_error(error: Exception) -> str | None:
         except (json.JSONDecodeError, TypeError):
             pass
     return None
+
+
+# ── Averaging round endpoint (§3.4) ─────────────────────────────────────────────
+
+
+T_AVERAGE = float(os.getenv("KIWI_T_AVERAGE", "60"))
+
+
+@app.post("/average")
+async def average_round(request: Request):
+    """Trigger one averaging round across all layer-peer groups.
+
+    The gateway is a barrier only: it fans out small JSON `/round` messages
+    and collects completions. No adapter bytes touch the gateway — payloads
+    stay peer-to-peer.
+
+    Headers: X-Model-ID (optional), X-Avg-Interval (X, for the skew guard).
+    """
+    if not model_registry:
+        raise HTTPException(status_code=503, detail="Gateway not ready")
+
+    model_id = request.headers.get("x-model-id") or request.headers.get("X-Model-ID", "")
+    if not model_id:
+        default_model = model_registry.default()
+        if not default_model:
+            raise HTTPException(status_code=400, detail="No model_id provided and no default available")
+        model_id = default_model.model_id
+    model = model_registry.resolve(model_id)
+    if not model:
+        raise HTTPException(status_code=400, detail=f"Unknown model: {model_id}")
+
+    try:
+        x = int(request.headers.get("x-avg-interval", "10") or 10)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="X-Avg-Interval must be an integer")
+
+    try:
+        round_id, plan = await registry.plan_round(model.model_id, x)
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+
+    print(
+        f"[gateway] Round {round_id} for {model.model_id}: "
+        f"{[(e['node_name'], e['round']['contribute']) for e in plan]}",
+        flush=True,
+    )
+
+    async def _trigger(entry: dict) -> tuple[str, dict]:
+        try:
+            async with httpx.AsyncClient(timeout=T_AVERAGE) as client:
+                response = await client.post(
+                    f"{entry['node_url']}/round", json=entry["round"]
+                )
+                response.raise_for_status()
+                return entry["node_name"], response.json()
+        except Exception as error:
+            return entry["node_name"], {"status": "error", "error": str(error)}
+
+    results = await asyncio.gather(*[_trigger(e) for e in plan])
+
+    completed = [name for name, r in results if r.get("status") == "ok"]
+    skipped = {name: r for name, r in results if r.get("status") != "ok"}
+    if skipped:
+        # Best-effort by design: a partial round is strictly better than a
+        # stalled cluster; the next round corrects it.
+        print(f"[gateway] Round {round_id} partial — skipped: {skipped}", flush=True)
+
+    return {
+        "round_id": round_id,
+        "completed": completed,
+        "skipped": skipped,
+        "results": {name: r for name, r in results},
+    }
 
 
 # ── Chat completions endpoint ────────────────────────────────────────────────────
