@@ -68,7 +68,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     peft>=0.11.0 \
     hivemind>=1.1.10
 
-COPY worker.py models.py transport.py ./
+COPY worker.py models.py transport.py mesh.py ./
 
 EXPOSE 8000 4001
 CMD ["uvicorn", "worker:app", "--host", "0.0.0.0", "--port", "8000"]

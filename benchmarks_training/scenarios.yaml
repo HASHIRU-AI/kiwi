@@ -33,33 +33,32 @@ scenarios:
 
   # Headline (§6.2): does the mesh run and learn without regression?
   # X=2 (not 10) so rounds actually fire ~10 times per run at N=4 (§6.3).
-  # 6 workers = 2 pipes x 3 stages, NO spare — sized to fit a ~4 GB card.
-  # On an 8 GB+ card switch both dp2 scenarios to docker-compose.mesh.yml
-  # (7 workers, adds a spare) and bump `workers` to seven entries; that also
-  # upgrades dp2_kill from R-degradation to zero-transfer spare promotion.
+  # 7 workers = 2 pipes x 3 stages + 1 spare (the §3.10 reference layout).
+  # Needs ~6.6 GB. On a small card (<8 GB) switch both dp2 scenarios to
+  # docker-compose.mesh-nospare.yml and drop `workers` to six entries; that
+  # trades spare promotion for the R-degrades-to-1 path.
   - name: "dp2"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 5
     epochs: 10
     target_loss: 2.0
-    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9] # 6 workers: 2 pipes, no spare
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] # 7 workers: 2 pipes + 1 spare
     replicas: 2
     average_every: 2
-    compose: "docker-compose.mesh-nospare.yml"
+    compose: "docker-compose.mesh.yml"
 
   # Fault injection mid-run (§6.2). Fully valid at N=4 — recovery needs no
-  # data diversity. With no spare this exercises §3.10 stage E's "if there had
-  # been no spare" path: R drops 2 -> 1, the orphaned stage peers rejoin their
-  # layer-peer groups and stay promotable, throughput halves, correctness
-  # holds. `degraded_sample_fraction` in the metrics records how much of the
-  # run trained below nominal R.
-  # - name: "dp2_kill"
-  #   model: "Qwen/Qwen2.5-0.5B-Instruct"
-  #   num_seeds: 5
-  #   epochs: 10
-  #   target_loss: 2.0
-  #   workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
-  #   replicas: 2
-  #   average_every: 2
-  #   compose: "docker-compose.mesh.yml"
-  #   kill_after_epochs: 5
+  # data diversity. Kills an active worker that has a same-stage spare, so the
+  # spare is promoted with ZERO transfer and R holds at 2 — throughput and
+  # convergence should both be unaffected. `degraded_sample_fraction` records
+  # any samples trained below nominal R (expected: 0.0 with a spare present).
+  - name: "dp2_kill"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 5
+    epochs: 10
+    target_loss: 2.0
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 2
+    compose: "docker-compose.mesh.yml"
+    kill_after_epochs: 5

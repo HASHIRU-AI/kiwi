@@ -151,6 +151,68 @@ def load_scenarios(yaml_path: str) -> List[Scenario]:
 #         f.write("\n".join(lines))
 
 
+_DOCKER_CMD: Optional[List[str]] = None
+_COMPOSE_CMD: Optional[List[str]] = None
+
+
+def docker_cmd() -> List[str]:
+    """Return a docker invocation that can actually reach the daemon.
+
+    `docker --version` succeeds without daemon access, so it is not a valid
+    probe — `docker ps` is. Falls back to passwordless sudo for accounts not in
+    the docker group. `sudo -n` never prompts: an interactive password prompt
+    inside a captured subprocess would hang the whole benchmark.
+    """
+    global _DOCKER_CMD
+    if _DOCKER_CMD is not None:
+        return _DOCKER_CMD
+    for candidate in (["docker"], ["sudo", "-n", "docker"]):
+        try:
+            probe = subprocess.run(candidate + ["ps"], capture_output=True, timeout=30)
+            if probe.returncode == 0:
+                _DOCKER_CMD = candidate
+                if candidate[0] == "sudo":
+                    logging.warning(
+                        "Using `sudo docker` — this user is not in the docker "
+                        "group. Consider: sudo usermod -aG docker $USER"
+                    )
+                return _DOCKER_CMD
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    raise RuntimeError(
+        "Cannot reach the Docker daemon as this user or via passwordless sudo. "
+        "Run: sudo usermod -aG docker $USER && newgrp docker"
+    )
+
+
+def compose_cmd() -> List[str]:
+    """Return the working Compose invocation for this machine.
+
+    Compose v1 is the standalone `docker-compose` binary; v2+ is a Docker CLI
+    plugin invoked as `docker compose`. A modern install (docker-ce +
+    docker-compose-plugin, e.g. a fresh Ubuntu cloud box) ships only the
+    plugin, while older setups have only v1 — so detect rather than hardcode.
+    """
+    global _COMPOSE_CMD
+    if _COMPOSE_CMD is not None:
+        return _COMPOSE_CMD
+    base = docker_cmd()
+    for candidate in (base + ["compose"], base[:-1] + ["docker-compose"]):
+        try:
+            probe = subprocess.run(candidate + ["version"],
+                                   capture_output=True, timeout=30)
+            if probe.returncode == 0:
+                _COMPOSE_CMD = candidate
+                logging.info(f"Using Compose command: {' '.join(candidate)}")
+                return _COMPOSE_CMD
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    raise RuntimeError(
+        "Neither `docker compose` nor `docker-compose` is available. Install "
+        "the Compose plugin: sudo apt install docker-compose-plugin"
+    )
+
+
 def wait_for_cluster(gateway_url: str, model_id: str, expected_workers: int, timeout_sec: int = 300):
     """Wait until the gateway reports readiness AND every worker has finished model loading."""
     logging.info(f"Waiting for cluster to become ready (up to {timeout_sec}s)...")
@@ -284,13 +346,17 @@ def _kill_one_active_worker(gateway_url: str) -> None:
         return
 
     node = victim["node_name"]
-    result = subprocess.run(["docker", "ps", "--format", "{{.Names}}"],
-                            capture_output=True, text=True, timeout=10)
+    result = subprocess.run(docker_cmd() + ["ps", "--format", "{{.Names}}"],
+                            capture_output=True, text=True, timeout=30)
     container = next((l.strip() for l in result.stdout.strip().splitlines()
                       if node in l), node)
     logging.info(f"kill hook: docker stop {container} (node {node}, layers {victim['layers']})")
-    subprocess.run(["docker", "stop", "-t", "0", container],
-                   capture_output=True, timeout=30)
+    stop = subprocess.run(docker_cmd() + ["stop", "-t", "0", container],
+                          capture_output=True, text=True, timeout=60)
+    if stop.returncode != 0:
+        logging.error(f"kill hook: docker stop {container} FAILED "
+                      f"(rc={stop.returncode}): {stop.stderr.strip()} — "
+                      f"dp2_kill will not have injected a fault this seed")
 
 def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_results"):
     os.makedirs(output_dir, exist_ok=True)
@@ -329,7 +395,7 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                     # time and turns a build failure into N identical failures.
                     logging.info("Building DeepSpeed image (once for all seeds)...")
                     build = subprocess.run(
-                        ["docker-compose", "-f", ds_compose, "-p", "kiwi", "build"],
+                        compose_cmd() + ["-f", ds_compose, "-p", "kiwi", "build"],
                         check=False,
                     )
                     if build.returncode != 0:
@@ -354,7 +420,7 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                         if os.path.exists(res_path):
                             os.remove(res_path)
 
-                        subprocess.run(["docker-compose", "-f", ds_compose, "-p", "kiwi", "down"], check=False, capture_output=True)
+                        subprocess.run(compose_cmd() + ["-f", ds_compose, "-p", "kiwi", "down"], check=False, capture_output=True)
 
                         logging.info("Starting DeepSpeed container (detached)...")
                         # Detached on purpose. Running `up` attached binds this process's
@@ -368,7 +434,7 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                         # still matters: it guarantees the container picks up this seed's
                         # env vars rather than reusing the previous one.
                         up = subprocess.run(
-                            ["docker-compose", "-f", ds_compose, "-p", "kiwi", "up", "-d", "--force-recreate"],
+                            compose_cmd() + ["-f", ds_compose, "-p", "kiwi", "up", "-d", "--force-recreate"],
                             env=env, check=False,
                         )
                         if up.returncode != 0:
@@ -378,12 +444,12 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                         # Follow the container's output so progress is still visible. This
                         # blocks until the container exits, so it doubles as the wait —
                         # but interrupting it now only stops the log stream, not the run.
-                        subprocess.run(["docker", "logs", "-f", ds_container], check=False)
+                        subprocess.run(docker_cmd() + ["logs", "-f", ds_container], check=False)
 
                         # Authoritative exit code, independent of how log streaming ended.
                         # On an already-exited container `docker wait` returns immediately.
                         wait = subprocess.run(
-                            ["docker", "wait", ds_container],
+                            docker_cmd() + ["wait", ds_container],
                             capture_output=True, text=True, check=False,
                         )
                         try:
@@ -396,7 +462,7 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                         if exit_code != 0:
                             logging.error(f"DeepSpeed container exited with error code {exit_code}")
 
-                        subprocess.run(["docker-compose", "-f", ds_compose, "-p", "kiwi", "down"], check=False, capture_output=True)
+                        subprocess.run(compose_cmd() + ["-f", ds_compose, "-p", "kiwi", "down"], check=False, capture_output=True)
 
                         if os.path.exists(res_path):
                             with open(res_path, "r") as f:
@@ -459,9 +525,9 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                     # file (e.g. a leftover 7-worker mesh cluster) otherwise
                     # survive `down` and keep holding GPU memory through the
                     # next scenario, quietly contaminating its timings.
-                    subprocess.run(["docker-compose", "-f", compose, "down", "--remove-orphans"],
+                    subprocess.run(compose_cmd() + ["-f", compose, "down", "--remove-orphans"],
                                    check=False, capture_output=True)
-                    subprocess.run(["docker-compose", "-f", compose, "up", "-d",
+                    subprocess.run(compose_cmd() + ["-f", compose, "up", "-d",
                                     "--force-recreate", "--remove-orphans"], check=True)
 
                     wait_for_cluster(gateway_url, scenario.model, len(scenario.workers))
@@ -478,7 +544,7 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                     scenario_metrics.append(res["metrics"])
 
                 logging.info("Tearing down cluster after distributed scenario...")
-                subprocess.run(["docker-compose", "-f", compose, "down", "--remove-orphans"], check=True)
+                subprocess.run(compose_cmd() + ["-f", compose, "down", "--remove-orphans"], check=True)
 
             # Normalise every curve to the samples-consumed axis (§6.5) so
             # scenarios are directly comparable. Mesh curves already are.
@@ -546,7 +612,7 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
     # finally:
     #     if os.path.exists(compose_path):
     #         logging.info("Performing safety cleanup of benchmark cluster...")
-    #         subprocess.run(["docker-compose", "-f", compose_path, "-p", "kiwitrainbench", "down", "--remove-orphans"], check=False)
+    #         subprocess.run(compose_cmd() + ["-f", compose_path, "-p", "kiwitrainbench", "down", "--remove-orphans"], check=False)
     #         try:
     #             os.remove(compose_path)
     #         except OSError:
