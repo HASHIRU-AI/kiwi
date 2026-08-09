@@ -41,6 +41,7 @@ class Scenario:
     # be exercised with merges that are mathematically no-ops (dp1_mesh).
     runner: str = "auto"
     shard_mode: str = "queue"   # "static" pins replica r to samples[r::R]
+    freeze_lora_a: bool = False # §3.5 ablation: train only B, making the merge exact
 
 def load_scenarios(yaml_path: str) -> List[Scenario]:
     with open(yaml_path, 'r') as f:
@@ -61,6 +62,7 @@ def load_scenarios(yaml_path: str) -> List[Scenario]:
             dataset=s_dict.get('dataset', "zorbulax4"),
             runner=s_dict.get('runner', "auto"),
             shard_mode=s_dict.get('shard_mode', "queue"),
+            freeze_lora_a=bool(s_dict.get('freeze_lora_a', False)),
         ))
     return scenarios
 
@@ -365,11 +367,74 @@ def _kill_one_active_worker(gateway_url: str) -> None:
                       f"(rc={stop.returncode}): {stop.stderr.strip()} — "
                       f"dp2_kill will not have injected a fault this seed")
 
+def resolve_learning_rate() -> float:
+    """Return the one learning rate every scenario must use, or refuse to run.
+
+    KIWI_LR is read independently by four places whose FALLBACKS DISAGREE:
+    runners.py and worker.py default to 1e-5, while the compose files and
+    run_offload.py default to 2e-4. If the variable is unset, the in-process
+    baselines therefore train 20x slower than the containerised scenarios and
+    every cross-scenario comparison is silently invalid — the curves still look
+    plausible, which is what makes it dangerous.
+
+    Rather than pick a default and hope, refuse to start.
+    """
+    raw = os.getenv("KIWI_LR")
+    if not raw:
+        raise RuntimeError(
+            "KIWI_LR is not set.\n"
+            "  Every scenario must train at the SAME learning rate, but the "
+            "defaults scattered across the codebase disagree (1e-5 in-process "
+            "vs 2e-4 in containers), so leaving it unset produces curves that "
+            "are not comparable.\n"
+            "  Set it explicitly, e.g.:  export KIWI_LR=5e-5"
+        )
+    try:
+        lr = float(raw)
+    except ValueError:
+        raise RuntimeError(f"KIWI_LR={raw!r} is not a number")
+    logging.info(f"Learning rate for ALL scenarios: {lr:g} (KIWI_LR={raw})")
+    return lr
+
+
+def collect_provenance(lr: float) -> Dict[str, Any]:
+    """Record what actually produced these numbers.
+
+    Without this, a result from today and one from a rebuilt image with a
+    different peft version are indistinguishable after the fact.
+    """
+    prov: Dict[str, Any] = {
+        "kiwi_lr": lr,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "host_packages": {},
+        "worker_packages": {},
+    }
+    for mod in ("torch", "transformers", "peft", "safetensors", "accelerate"):
+        try:
+            prov["host_packages"][mod] = __import__(mod).__version__
+        except Exception:
+            prov["host_packages"][mod] = "unavailable"
+    try:
+        probe = subprocess.run(
+            docker_cmd() + ["run", "--rm", "kiwi-worker:latest", "python", "-c",
+                            "import torch,transformers,peft,safetensors;"
+                            "print(torch.__version__,transformers.__version__,"
+                            "peft.__version__,safetensors.__version__)"],
+            capture_output=True, text=True, timeout=120)
+        if probe.returncode == 0:
+            names = ("torch", "transformers", "peft", "safetensors")
+            prov["worker_packages"] = dict(zip(names, probe.stdout.split()))
+    except Exception as error:
+        prov["worker_packages"] = {"error": str(error)[:200]}
+    return prov
+
+
 def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_results"):
     os.makedirs(output_dir, exist_ok=True)
+    lr = resolve_learning_rate()
     compose_path = "docker-compose.trainbench.yml"
     
-    results_out = {"runs": {}, "metrics": {}}
+    results_out = {"runs": {}, "metrics": {}, "provenance": collect_provenance(lr)}
     target_loss = None
     
     try:
@@ -502,6 +567,9 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                 # (internet.yml for dp1, mesh.yml for dp2/dp2_kill).
                 gateway_url = "http://localhost:8080"
                 compose = scenario.compose
+                # Compose reads this from the environment we hand the
+                # subprocess, so it must be set BEFORE the cluster comes up.
+                os.environ["KIWI_FREEZE_LORA_A"] = "1" if scenario.freeze_lora_a else "0"
                 logging.info(f"Running {scenario.name} distributed via {compose} "
                              f"(R={scenario.replicas}, X={scenario.average_every})...")
 

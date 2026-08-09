@@ -68,6 +68,7 @@ services:
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
+      KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -104,6 +105,7 @@ services:
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
+      KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -140,6 +142,7 @@ services:
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
+      KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -176,6 +179,7 @@ services:
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
+      KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -212,6 +216,7 @@ services:
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
+      KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -248,6 +253,7 @@ services:
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
+      KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface

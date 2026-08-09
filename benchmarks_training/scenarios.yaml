@@ -118,3 +118,97 @@ scenarios:
   #   average_every: 2
   #   compose: "docker-compose.mesh.yml"
   #   kill_after_epochs: 5
+
+  # ── Diagnostic sweep: WHY does R=2 regress when R=1 (dp1_mesh) does not? ──
+  # dp2 / dp2_static / dp2_rotate all landed ~1.1-1.6 regardless of how data was
+  # assigned, so the cause is the averaging operation, not the data. Two
+  # candidate mechanisms, and these scenarios separate them:
+  #
+  #   (a) MERGE FREQUENCY vs ADAM. Moments are local and never averaged (§4.2),
+  #       so every merge hands Adam a weight jump it knows nothing about. At
+  #       X=2 half of all steps follow such a jump. If this dominates, loss
+  #       should IMPROVE monotonically as X grows.
+  #   (b) LoRA BILINEARITY. mean(A)*mean(B) != mean(A*B); the cross terms are
+  #       spurious and are present at EVERY merge regardless of X. If this
+  #       dominates, the X sweep stays flat and only freeze_a helps.
+  #
+  # Note the design doc predicts the opposite of (a): it argues smaller X means
+  # less drift and therefore a more accurate merge. Worth settling by measuring.
+
+  - name: "dp2_x1"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 3
+    epochs: 10
+    target_loss: 2.0
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 1
+    compose: "docker-compose.mesh.yml"
+
+  - name: "dp2_x5"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 3
+    epochs: 10
+    target_loss: 2.0
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 5
+    compose: "docker-compose.mesh.yml"
+
+  - name: "dp2_x20"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 3
+    epochs: 10
+    target_loss: 2.0
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 20
+    compose: "docker-compose.mesh.yml"
+
+  # §3.5 mitigation: hold LoRA A at its random init and train/average only B.
+  # All replicas then share an identical A, the cross terms vanish, and weight
+  # averaging becomes EXACT — at some cost in capacity. If this alone recovers
+  # dp1-like convergence, bilinearity was the cause.
+  - name: "dp2_freeze_a"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 3
+    epochs: 10
+    target_loss: 2.0
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 2
+    compose: "docker-compose.mesh.yml"
+    freeze_lora_a: true
+
+  # Control for freeze_a: same toggle at R=1, so any capacity loss from
+  # freezing A is measured WITHOUT any averaging in play.
+  - name: "dp1_freeze_a"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 3
+    epochs: 10
+    target_loss: 2.0
+    workers: [0.9, 0.9, 0.9]
+    replicas: 1
+    compose: "docker-compose.internet.yml"
+    freeze_lora_a: true
+
+  # THE MISSING CONTROL. queue/static/rotate all gave each replica a disjoint
+  # half of every window, so they never tested whether replicas sharing data
+  # fixes averaging. Here both replicas train on the SAME batches, so the two
+  # adapters should stay nearly identical and the merge has nothing to
+  # reconcile. Compare per STEPS PER REPLICA (40) against dp1 (40 steps), not
+  # on samples consumed — each batch is trained twice here.
+  #   mirror ~= dp1   -> averaging is sound; the dp2 penalty is entirely the
+  #                      cost of merging models trained on different data.
+  #   mirror still bad-> the merge damages weights even with nothing to
+  #                      reconcile, and the bug is in averaging itself.
+  - name: "dp2_mirror"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 3
+    epochs: 10
+    target_loss: 2.0
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 2
+    compose: "docker-compose.mesh.yml"
+    shard_mode: "mirror"

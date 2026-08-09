@@ -300,6 +300,23 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
         task_type="CAUSAL_LM"
     )
     loaded_model = get_peft_model(loaded_model, lora_config)
+
+    # ── Optional: freeze LoRA A (ASYNC_MESH_DESIGN.md §3.5 mitigation) ──
+    # Averaging LoRA factors is NOT averaging the updates they represent:
+    #   mean(A)·mean(B) != mean(A·B)
+    # because the cross terms A0·B1 and A1·B0 are spurious. If A is held at its
+    # random init and never trained, every replica shares the same A, the cross
+    # terms collapse, and weight averaging becomes EXACT at some cost in
+    # capacity. Ship as a toggle and an ablation, never as the default.
+    if os.getenv("KIWI_FREEZE_LORA_A", "0") == "1":
+        frozen = 0
+        for name, param in loaded_model.named_parameters():
+            if "lora_A" in name:
+                param.requires_grad = False
+                frozen += 1
+        print(f"[{NODE_NAME}] KIWI_FREEZE_LORA_A=1: froze {frozen} LoRA A tensors "
+              f"(averaging is now exact; capacity reduced)", flush=True)
+
     loaded_model.print_trainable_parameters()
 
     position = (

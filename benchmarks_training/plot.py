@@ -8,19 +8,47 @@ import matplotlib.pyplot as plt
 # under data parallelism "step" no longer means one thing across scenarios.
 
 CONFIG_STYLES = {
-    "single_machine": {"color": "blue", "label": "Single Machine"},
-    "single_machine_offload": {"color": "orange", "label": "Single Machine (Offload)"},
-    "single_machine_qlora": {"color": "purple", "label": "Single Machine (QLoRA)"},
-    "distributed_3stage": {"color": "red", "label": "Distributed (3-worker)"},
-    "dp1": {"color": "red", "label": "dp1 (pipeline control)"},
-    "dp2": {"color": "green", "label": "dp2 (mesh, R=2)"},
-    "dp2_kill": {"color": "darkgreen", "label": "dp2 + mid-run kill"},
-    "dp3": {"color": "teal", "label": "dp3 (mesh, R=3)"},
+    # Baselines — blues/greys
+    "single_machine": {"color": "#1f77b4", "label": "single_machine (reference)"},
+    "single_machine_offload": {"color": "#8c9eb2", "label": "single_machine (offload)"},
+    "single_machine_qlora": {"color": "#6a51a3", "label": "single_machine (QLoRA)"},
+    # R=1 controls — reds
+    "distributed_3stage": {"color": "#d62728", "label": "dp1 (pipeline control)"},
+    "dp1": {"color": "#d62728", "label": "dp1 (pipeline control)"},
+    "dp1_mesh": {"color": "#ff9896", "label": "dp1_mesh (R=1 via MeshRunner)"},
+    "dp1_freeze_a": {"color": "#e377c2", "label": "dp1_freeze_a (R=1, A frozen)"},
+    # R=2, data-assignment variants — greens
+    "dp2": {"color": "#2ca02c", "label": "dp2 (queue)"},
+    "dp2_static": {"color": "#98df8a", "label": "dp2_static (clean split)"},
+    "dp2_rotate": {"color": "#5fa855", "label": "dp2_rotate (rotating split)"},
+    "dp2_mirror": {"color": "#17becf", "label": "dp2_mirror (identical data)"},
+    # R=2, X sweep — oranges (light -> dark as X grows)
+    "dp2_x1": {"color": "#ffbb78", "label": "dp2_x1 (merge every step)"},
+    "dp2_x5": {"color": "#ff7f0e", "label": "dp2_x5"},
+    "dp2_x20": {"color": "#b35806", "label": "dp2_x20 (merge once)"},
+    # Ablation
+    "dp2_freeze_a": {"color": "#9467bd", "label": "dp2_freeze_a (A frozen)"},
+    "dp2_kill": {"color": "#006d2c", "label": "dp2 + mid-run kill"},
+    "dp3": {"color": "#17becf", "label": "dp3 (mesh, R=3)"},
 }
+
+# Scenarios whose samples-consumed axis is not comparable to the others.
+# dp2_mirror trains every batch on EVERY replica, so its sample count is
+# inflated R-fold; it must be read per steps-per-replica instead.
+_INFLATED_SAMPLE_AXIS = {"dp2_mirror"}
+
+_FALLBACK_PALETTE = [
+    "#7f7f7f", "#bcbd22", "#c49c94", "#dbdb8d", "#9edae5", "#c7c7c7",
+]
 
 
 def _style(name):
-    return CONFIG_STYLES.get(name, {"color": "gray", "label": name})
+    if name in CONFIG_STYLES:
+        return CONFIG_STYLES[name]
+    # Deterministic distinct colour for anything new, so an unregistered
+    # scenario is still readable rather than another anonymous grey line.
+    idx = sum(ord(c) for c in name) % len(_FALLBACK_PALETTE)
+    return {"color": _FALLBACK_PALETTE[idx], "label": name}
 
 
 def _interp_curves(curves, grid):
@@ -47,12 +75,12 @@ def plot_convergence(results_path: str, output_dir: str):
         return
 
     # ── 1. Loss vs samples consumed (the headline figure, §6.4) ──
-    plt.figure(figsize=(12, 7))
+    plt.figure(figsize=(14, 8))
     bar_data = {}
 
     for config_name, curves in runs.items():
-        if not curves:
-            continue
+        if not curves or config_name in _INFLATED_SAMPLE_AXIS:
+            continue   # not comparable on this axis; see diagnostic_summary
         lo = max(min(p[0] for p in c) for c in curves)
         hi = min(max(p[0] for p in c) for c in curves)
         if hi <= lo:
@@ -86,8 +114,9 @@ def plot_convergence(results_path: str, output_dir: str):
 
     plt.xlabel("Samples consumed")
     plt.ylabel("Loss")
-    plt.title("Convergence at equal samples consumed")
-    plt.legend()
+    plt.title("Convergence at equal samples consumed\n"
+              "(dp2_mirror omitted — its samples axis is inflated R-fold)")
+    plt.legend(fontsize=8, ncol=2)
     plt.grid(True, linestyle="--", alpha=0.6)
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "convergence.png"), dpi=300)
@@ -95,7 +124,7 @@ def plot_convergence(results_path: str, output_dir: str):
     plt.close()
 
     # ── 2. Bar charts ──
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 10))
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(18, 11))
 
     configs = list(bar_data.keys())
     labels = [bar_data[c]["label"] for c in configs]
@@ -107,7 +136,7 @@ def plot_convergence(results_path: str, output_dir: str):
     ax1.set_title("Final Loss")
     ax1.set_ylabel("Loss")
     ax1.grid(True, axis='y', linestyle="--", alpha=0.6)
-    plt.setp(ax1.xaxis.get_majorticklabels(), rotation=15, ha='right')
+    plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right', fontsize=8)
 
     ax2.bar(labels, [bar_data[c]["samples_target_mean"] for c in configs],
             yerr=[bar_data[c]["samples_target_std"] for c in configs],
@@ -115,14 +144,14 @@ def plot_convergence(results_path: str, output_dir: str):
     ax2.set_title("Samples to Target Loss")
     ax2.set_ylabel("Samples consumed")
     ax2.grid(True, axis='y', linestyle="--", alpha=0.6)
-    plt.setp(ax2.xaxis.get_majorticklabels(), rotation=15, ha='right')
+    plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right', fontsize=8)
 
     ax3.bar(labels, [metrics.get(c, {}).get("avg_peak_gpu_mb", 0) for c in configs],
             color=colors, alpha=0.7)
     ax3.set_title("Peak GPU Memory per worker (MB)")
     ax3.set_ylabel("Memory (MB)")
     ax3.grid(True, axis='y', linestyle="--", alpha=0.6)
-    plt.setp(ax3.xaxis.get_majorticklabels(), rotation=15, ha='right')
+    plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45, ha='right', fontsize=8)
 
     ax4.bar(labels, [metrics.get(c, {}).get("avg_step_time_ms", 0) for c in configs],
             color=colors, alpha=0.7)
@@ -130,7 +159,7 @@ def plot_convergence(results_path: str, output_dir: str):
                   "dp_R vs dp1 measures communication overlap, NOT DP scaling (§6.1)")
     ax4.set_ylabel("Time (ms)")
     ax4.grid(True, axis='y', linestyle="--", alpha=0.6)
-    plt.setp(ax4.xaxis.get_majorticklabels(), rotation=15, ha='right')
+    plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45, ha='right', fontsize=8)
 
     verdicts = {k: v.get("verdict") for k, v in eval_data.items()} if eval_data else {}
     plt.suptitle(f"Benchmark Results — verdicts: {verdicts}")
@@ -200,7 +229,59 @@ def plot_convergence(results_path: str, output_dir: str):
         plt.savefig(os.path.join(output_dir, "recovery.png"), dpi=300)
         plt.close()
 
-    print(f"Plots saved to {output_dir}")
+    # ── 5. Diagnostic summary: final loss per scenario, sorted ──
+    # With a dozen scenarios the overlaid convergence curves stop being
+    # readable, and the question these runs exist to answer ("which knob moves
+    # the R=2 regression?") is a single-number-per-scenario comparison. This is
+    # the figure to actually look at.
+    finals = {}
+    for name, curves in runs.items():
+        if not curves:
+            continue
+        vals = [sorted([tuple(p) for p in c])[-1][1] for c in curves]
+        finals[name] = (np.mean(vals), np.std(vals), len(vals))
+
+    if finals:
+        order = sorted(finals, key=lambda n: finals[n][0])
+        fig_h = max(4.0, 0.45 * len(order) + 2.0)
+        plt.figure(figsize=(11, fig_h))
+        ypos = np.arange(len(order))
+        means = [finals[n][0] for n in order]
+        errs = [finals[n][1] for n in order]
+        colors = [_style(n)["color"] for n in order]
+        plt.barh(ypos, means, xerr=errs, color=colors, alpha=0.85, capsize=4)
+        labels = [
+            _style(n)["label"] + (" *" if n in _INFLATED_SAMPLE_AXIS else "")
+            + f"  (n={finals[n][2]})"
+            for n in order
+        ]
+        plt.yticks(ypos, labels, fontsize=9)
+        plt.gca().invert_yaxis()
+        plt.xscale("symlog", linthresh=1e-3)
+        plt.xlabel("Final loss (mean over seeds, ±1 std) — symlog scale")
+
+        ref = finals.get("dp1", finals.get("distributed_3stage"))
+        if ref:
+            plt.axvline(ref[0], color="#d62728", linestyle="--", linewidth=1.2,
+                        label=f"dp1 control = {ref[0]:.4f}")
+            plt.legend(loc="lower right", fontsize=9)
+
+        plt.title("Diagnostic summary — which knob moves the R=2 regression?\n"
+                  "* dp2_mirror trains every batch on every replica; compare it "
+                  "per steps-per-replica, not samples consumed")
+        plt.grid(True, axis="x", linestyle="--", alpha=0.5)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "diagnostic_summary.png"), dpi=300)
+        plt.savefig(os.path.join(output_dir, "diagnostic_summary.svg"))
+        plt.close()
+
+        print("\nFinal loss by scenario (sorted):")
+        for n in order:
+            m, s, k = finals[n]
+            flag = "   <-- inflated samples axis" if n in _INFLATED_SAMPLE_AXIS else ""
+            print(f"   {n:18s} {m:9.4f} +/- {s:.4f}  (n={k}){flag}")
+
+    print(f"\nPlots saved to {output_dir}")
 
 
 if __name__ == "__main__":

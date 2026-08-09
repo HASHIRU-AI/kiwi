@@ -27,11 +27,13 @@ services:
           {"model_id": "Qwen/Qwen2.5-0.5B-Instruct", "aliases": ["qwen-0.5b", "kiwi-small"], "default_dtype": "bfloat16"}
         ]
       REQUEST_TIMEOUT_SECONDS: "300"
-      # A worker time-sharing an oversubscribed GPU can be slow enough to delay
-      # its heartbeat well past the default 30s. Evicting it collapses R
-      # mid-run and silently degrades the benchmark, so widen the window.
-      HEARTBEAT_SOFT_STALE_SECONDS: "180"
-      HEARTBEAT_HARD_STALE_SECONDS: "600"
+      # Tolerant enough that a briefly-slow worker isn't evicted as a dead one
+      # (heartbeat interval is 5s, so this is ~9 missed beats), but tight enough
+      # that a REAL death is detected in under a minute. The no-spare compose
+      # uses a much wider window because it targets an oversubscribed GPU where
+      # a single step can stall for minutes; this file assumes VRAM headroom.
+      HEARTBEAT_SOFT_STALE_SECONDS: "45"
+      HEARTBEAT_HARD_STALE_SECONDS: "300"
       KIWI_P2P_TRANSPORT: "p2p"
       KIWI_P2P_PORT: "4001"
       KIWI_P2P_PUBLIC_HOST: "http://gateway:4001"
@@ -69,6 +71,7 @@ services:
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
+      KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -105,6 +108,7 @@ services:
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
+      KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -141,6 +145,7 @@ services:
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
+      KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -177,6 +182,7 @@ services:
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
+      KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -213,6 +219,7 @@ services:
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
+      KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -249,6 +256,7 @@ services:
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
+      KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -285,6 +293,7 @@ services:
       GPU_MEMORY_RESERVE_MB: "512"
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
+      KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface

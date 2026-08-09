@@ -337,7 +337,10 @@ class MeshRunner(BaseRunner):
             rng.shuffle(batches)
 
             # Windows of R×X batches -> one averaging round per X steps/pipe.
-            window_size = max(1, R * X)
+            # EXCEPT in mirror mode, where every replica trains on every batch
+            # in the window, so a window is X batches and each replica still
+            # takes X steps before the merge.
+            window_size = max(1, X if self.shard_mode == "mirror" else R * X)
             for w_start in range(0, len(batches), window_size):
                 window = batches[w_start:w_start + window_size]
                 work: "queue_mod.Queue" = queue_mod.Queue()
@@ -346,7 +349,29 @@ class MeshRunner(BaseRunner):
                     b.pop("_attempts", None)
 
                 window_index += 1
-                if self.shard_mode in ("static", "rotate"):
+                if self.shard_mode == "mirror":
+                    # Every replica trains on EVERY batch in the window. The
+                    # replicas therefore see IDENTICAL data between merges, so
+                    # averaging has nothing to reconcile. This is the control
+                    # that none of queue/static/rotate provided: all three hand
+                    # each replica a DISJOINT half, so they varied "which facts"
+                    # while holding "do the replicas share data" constant.
+                    #
+                    # If mirror recovers dp1-like convergence, the averaging
+                    # machinery is sound and the whole penalty is the cost of
+                    # merging models trained on different data (non-i.i.d.
+                    # local SGD). If mirror is ALSO bad, the merge is damaging
+                    # weights even when there is nothing to reconcile, and the
+                    # bug is in the averaging itself.
+                    #
+                    # Compare on STEPS PER REPLICA, not samples consumed: each
+                    # batch here is trained R times, once per replica.
+                    for r in range(R):
+                        q: "queue_mod.Queue" = queue_mod.Queue()
+                        for b in window:
+                            q.put(dict(b))       # independent copy per replica
+                        per_replica[r] = q
+                elif self.shard_mode in ("static", "rotate"):
                     # Deterministic assignment instead of a race. The shared
                     # queue stays EMPTY and is used only for batches handed back
                     # by a retired replica, so failure handling is unchanged.
