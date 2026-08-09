@@ -36,6 +36,11 @@ class Scenario:
     compose: str = "docker-compose.internet.yml"
     kill_after_epochs: Optional[int] = None   # fault injection (dp2_kill)
     dataset: str = "zorbulax4"        # scenario-parameterised corpus (§6.7)
+    # "auto" -> MeshRunner when replicas > 1, else DistributedRunner.
+    # "mesh" forces MeshRunner even at R=1, so the queue/barrier/round path can
+    # be exercised with merges that are mathematically no-ops (dp1_mesh).
+    runner: str = "auto"
+    shard_mode: str = "queue"   # "static" pins replica r to samples[r::R]
 
 def load_scenarios(yaml_path: str) -> List[Scenario]:
     with open(yaml_path, 'r') as f:
@@ -54,6 +59,8 @@ def load_scenarios(yaml_path: str) -> List[Scenario]:
             compose=s_dict.get('compose', "docker-compose.internet.yml"),
             kill_after_epochs=s_dict.get('kill_after_epochs'),
             dataset=s_dict.get('dataset', "zorbulax4"),
+            runner=s_dict.get('runner', "auto"),
+            shard_mode=s_dict.get('shard_mode', "queue"),
         ))
     return scenarios
 
@@ -498,12 +505,15 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                 logging.info(f"Running {scenario.name} distributed via {compose} "
                              f"(R={scenario.replicas}, X={scenario.average_every})...")
 
-                if scenario.replicas > 1:
+                use_mesh = scenario.runner == "mesh" or (
+                    scenario.runner == "auto" and scenario.replicas > 1)
+                if use_mesh:
                     runner = MeshRunner(
                         gateway_url=gateway_url,
                         replicas=scenario.replicas,
                         average_every=scenario.average_every,
                         worker_ports=[8000 + i for i in range(len(scenario.workers))],
+                        shard_mode=scenario.shard_mode,
                     )
                 else:
                     runner = DistributedRunner(gateway_url=gateway_url)
@@ -532,7 +542,7 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
 
                     wait_for_cluster(gateway_url, scenario.model, len(scenario.workers))
 
-                    if scenario.replicas > 1:
+                    if use_mesh:
                         res = runner.run_training(scenario.model, dataset, scenario.epochs,
                                                   scenario.name, i+1, kill_hook=kill_hook)
                         replica_curves_all.append(res.get("replica_curves", {}))
@@ -548,7 +558,8 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
 
             # Normalise every curve to the samples-consumed axis (§6.5) so
             # scenarios are directly comparable. Mesh curves already are.
-            if scenario.replicas <= 1:
+            if not (scenario.runner == "mesh" or scenario.replicas > 1):
+                # MeshRunner already reports the samples-consumed axis.
                 curves = [_to_samples_axis(c) for c in curves]
             results_out["runs"][scenario.name] = curves
             if replica_curves_all:
@@ -564,7 +575,8 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                 }
                 # Mesh-only extras (collected per §6.4; wall-clock numbers are
                 # secondary on a shared GPU and gate nothing).
-                for extra in ("samples_per_sec", "avg_round_ms", "rounds", "replicas", "average_every"):
+                for extra in ("samples_per_sec", "avg_round_ms", "rounds", "replicas",
+                              "average_every", "degraded_sample_fraction"):
                     vals = [m[extra] for m in scenario_metrics if extra in m]
                     if vals:
                         entry[f"avg_{extra}" if not extra.startswith("avg_") else extra] = sum(vals) / len(vals)

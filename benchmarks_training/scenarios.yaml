@@ -31,6 +31,26 @@ scenarios:
     replicas: 1
     compose: "docker-compose.internet.yml"
 
+  # Diagnostic control: R=1 driven through MeshRunner. The work queue, the
+  # consumer, the barrier and the /round fan-out all execute, but with a single
+  # contributor every merge is a mathematical no-op (expect=0, send_to=[]).
+  #
+  # So dp1_mesh vs dp1 isolates HARNESS PLUMBING from AVERAGING SEMANTICS:
+  #   - dp1_mesh ~= dp1  -> the plumbing is sound; any dp2 gap is real
+  #     behaviour of weight averaging, not a bug in the round path.
+  #   - dp1_mesh <  dp1  -> the round path itself is damaging the adapter, and
+  #     the dp2 result says nothing about averaging.
+  - name: "dp1_mesh"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 5
+    epochs: 10
+    target_loss: 2.0
+    workers: [0.9, 0.9, 0.9]
+    replicas: 1
+    average_every: 2
+    compose: "docker-compose.internet.yml"
+    runner: "mesh"        # force MeshRunner despite R=1
+
   # Headline (§6.2): does the mesh run and learn without regression?
   # X=2 (not 10) so rounds actually fire ~10 times per run at N=4 (§6.3).
   # 7 workers = 2 pipes x 3 stages + 1 spare (the §3.10 reference layout).
@@ -47,12 +67,14 @@ scenarios:
     average_every: 2
     compose: "docker-compose.mesh.yml"
 
-  # Fault injection mid-run (§6.2). Fully valid at N=4 — recovery needs no
-  # data diversity. Kills an active worker that has a same-stage spare, so the
-  # spare is promoted with ZERO transfer and R holds at 2 — throughput and
-  # convergence should both be unaffected. `degraded_sample_fraction` records
-  # any samples trained below nominal R (expected: 0.0 with a spare present).
-  - name: "dp2_kill"
+  # Same mesh as dp2, but each replica is pinned to a fixed slice of the
+  # dataset (replica r owns samples[r::R]) instead of taking whatever the
+  # shared queue hands it. This is the §6.7 static-shard mode, and it mirrors
+  # what scratch/test_stage6_mesh.py does — which converged to ~0.01 while the
+  # queue-driven dp2 stalled around 1.3 on identical hardware and settings.
+  # If dp2_static ~= dp1, the mesh is fine and the queue's per-window
+  # re-pairing is what breaks averaging at N=4.
+  - name: "dp2_static"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 5
     epochs: 10
@@ -61,4 +83,38 @@ scenarios:
     replicas: 2
     average_every: 2
     compose: "docker-compose.mesh.yml"
-    kill_after_epochs: 5
+    shard_mode: "static"
+
+  # Third assignment regime: same fixed grouping as dp2_static, but the groups
+  # ROTATE between replicas each window, so every replica eventually sees every
+  # fact while still specialising on a consistent subset between merges.
+  # This is exactly what scratch/test_stage6_mesh.py does — the run that
+  # converged to ~0.01 where queue-driven dp2 stalled at ~1.3. If dp2_rotate
+  # reproduces ~0.01, the e2e result is explained and the variable is the data
+  # assignment, not the mesh.
+  - name: "dp2_rotate"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 5
+    epochs: 10
+    target_loss: 2.0
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 2
+    compose: "docker-compose.mesh.yml"
+    shard_mode: "rotate"
+
+  # Fault injection mid-run (§6.2). Fully valid at N=4 — recovery needs no
+  # data diversity. Kills an active worker that has a same-stage spare, so the
+  # spare is promoted with ZERO transfer and R holds at 2 — throughput and
+  # convergence should both be unaffected. `degraded_sample_fraction` records
+  # any samples trained below nominal R (expected: 0.0 with a spare present).
+  # - name: "dp2_kill"
+  #   model: "Qwen/Qwen2.5-0.5B-Instruct"
+  #   num_seeds: 5
+  #   epochs: 10
+  #   target_loss: 2.0
+  #   workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+  #   replicas: 2
+  #   average_every: 2
+  #   compose: "docker-compose.mesh.yml"
+  #   kill_after_epochs: 5

@@ -162,12 +162,20 @@ class MeshRunner(BaseRunner):
         replicas: Optional[int] = None,
         average_every: int = 2,
         worker_ports: Optional[List[int]] = None,
+        shard_mode: str = "queue",
     ):
         self.gateway_url = gateway_url
         self.replicas = replicas          # None -> discover from /registry
         self.x = average_every
         self.worker_ports = worker_ports or []
         self.max_batch_attempts = 10      # give up on a batch (cluster is down)
+        # "queue"  — shared queue, consumers race (§3.6). Which facts a replica
+        #            sees is re-randomised every window.
+        # "static" — replica r permanently owns samples[r::R] (§6.7 static-shard
+        #            mode). Each replica specialises on a CONSISTENT subset, so
+        #            merges combine complementary experts instead of conflicting
+        #            partial ones. This is also the honestly non-i.i.d. setup.
+        self.shard_mode = shard_mode
 
     # ── Gateway helpers ──────────────────────────────────────────────────
 
@@ -246,19 +254,34 @@ class MeshRunner(BaseRunner):
                 timeout=180.0,
             )
 
-        def consumer(replica_id: int, work: "queue_mod.Queue") -> None:
+        def consumer(replica_id: int, work: "queue_mod.Queue",
+                     own: Optional["queue_mod.Queue"] = None) -> None:
             nonlocal samples_consumed
             while True:
-                try:
-                    batch = work.get_nowait()
-                except queue_mod.Empty:
-                    return
+                batch = None
+                if own is not None:                 # static-shard mode
+                    try:
+                        batch = own.get_nowait()
+                    except queue_mod.Empty:
+                        # Own slice done — absorb anything a retired replica
+                        # handed back, so work is never stranded.
+                        try:
+                            batch = work.get_nowait()
+                        except queue_mod.Empty:
+                            return
+                else:
+                    try:
+                        batch = work.get_nowait()
+                    except queue_mod.Empty:
+                        return
                 start_t = time.time()
                 attempts = batch.setdefault("_attempts", 0)
                 try:
                     resp = post_step(batch["payload"], replica_id)
                     if resp.status_code == 409:
                         # R dropped below our index: return the batch, retire.
+                        # Always to the SHARED queue so a surviving replica can
+                        # pick it up even in static-shard mode.
                         work.put(batch)
                         with lock:
                             retired.add(replica_id)
@@ -279,7 +302,7 @@ class MeshRunner(BaseRunner):
                         logging.error(f"[{scenario_name}] batch abandoned after "
                                       f"{attempts + 1} attempts: {e}")
                         return
-                    work.put(batch)
+                    (own if own is not None else work).put(batch)
                     with lock:
                         events.append({"type": "step_error", "replica": replica_id,
                                        "samples": samples_consumed, "error": str(e)[:200]})
@@ -307,9 +330,10 @@ class MeshRunner(BaseRunner):
 
         total_wall_start = time.time()
         total_steps_target = epochs * len(dataset)
+        window_index = 0
 
         for epoch in range(epochs):
-            batches = [dict(payload=s["payload"]) for s in dataset]
+            batches = [dict(payload=s["payload"], _idx=i) for i, s in enumerate(dataset)]
             rng.shuffle(batches)
 
             # Windows of R×X batches -> one averaging round per X steps/pipe.
@@ -317,9 +341,37 @@ class MeshRunner(BaseRunner):
             for w_start in range(0, len(batches), window_size):
                 window = batches[w_start:w_start + window_size]
                 work: "queue_mod.Queue" = queue_mod.Queue()
+                per_replica: Dict[int, "queue_mod.Queue"] = {}
                 for b in window:
                     b.pop("_attempts", None)
-                    work.put(b)
+
+                window_index += 1
+                if self.shard_mode in ("static", "rotate"):
+                    # Deterministic assignment instead of a race. The shared
+                    # queue stays EMPTY and is used only for batches handed back
+                    # by a retired replica, so failure handling is unchanged.
+                    #
+                    #   static — replica r permanently owns samples[r::R]. True
+                    #            disjoint sharding: a replica NEVER sees the
+                    #            other replicas' facts, so the merged model can
+                    #            only acquire them through averaging. Maximally
+                    #            non-i.i.d.
+                    #   rotate — same fixed grouping, but the groups are handed
+                    #            to a different replica each window (offset by
+                    #            the window index). Every replica eventually
+                    #            sees every fact, while still specialising on a
+                    #            consistent subset between merges. This is what
+                    #            scratch/test_stage6_mesh.py does.
+                    offset = (window_index - 1) % R if self.shard_mode == "rotate" else 0
+                    for r in range(R):
+                        q: "queue_mod.Queue" = queue_mod.Queue()
+                        for b in window:
+                            if (b["_idx"] + offset) % R == r:
+                                q.put(b)
+                        per_replica[r] = q
+                else:
+                    for b in window:
+                        work.put(b)
 
                 # A consumer retires when its replica_id exceeds R after a pipe
                 # loss. R can come BACK (a spare is promoted, or a falsely
@@ -349,13 +401,22 @@ class MeshRunner(BaseRunner):
                         live = [r for r in range(R) if r not in retired]
                     if not live:
                         raise RuntimeError(f"[{scenario_name}] all consumers retired; cluster unusable")
-                    threads = [threading.Thread(target=consumer, args=(r, work), daemon=True)
-                               for r in live]
+                    threads = [
+                        threading.Thread(
+                            target=consumer,
+                            args=(r, work,
+                                  per_replica.get(r) if self.shard_mode != "queue" else None),
+                            daemon=True,
+                        )
+                        for r in live
+                    ]
                     for t in threads:
                         t.start()
                     for t in threads:
                         t.join()
-                    if work.empty():
+                    drained = work.empty() and all(
+                        q.empty() for q in per_replica.values())
+                    if drained:
                         break
                 else:
                     raise RuntimeError(f"[{scenario_name}] window failed to drain")
@@ -388,6 +449,7 @@ class MeshRunner(BaseRunner):
                 "avg_round_ms": (sum(round_times) / len(round_times)) * 1000 if round_times else 0.0,
                 "replicas": R,
                 "average_every": X,
+                "shard_mode": self.shard_mode,
                 # Fraction of this seed trained below nominal R. Anything
                 # above 0 means the curve is a blend of dp{R} and dp{<R} and
                 # should not be pooled with clean seeds without saying so.

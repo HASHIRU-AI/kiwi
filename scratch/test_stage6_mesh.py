@@ -39,7 +39,7 @@ from transformers import AutoTokenizer
 
 GATEWAY_URL = "http://localhost:8080"
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
-NUM_WORKERS = int(os.getenv("KIWI_TEST_WORKERS", "6"))
+NUM_WORKERS = int(os.getenv("KIWI_TEST_WORKERS", "7"))
 X = 2  # averaging interval (steps per replica between rounds)
 PRE_KILL_EPOCHS = 8
 POST_KILL_EPOCHS = 4
@@ -117,15 +117,80 @@ def wait_for_swarm() -> list[dict]:
     fail("Workers did not finish model loading in time.")
 
 
+_DOCKER: list[str] | None = None
+
+
+def docker() -> list[str]:
+    """Return a docker invocation that can actually reach the daemon.
+
+    `docker --version` works without daemon access, so it is not a valid probe;
+    `docker ps` is. If the user's account isn't in the docker group we fall back
+    to passwordless sudo (`sudo -n`, never interactive — a password prompt in a
+    captured subprocess would hang the run forever).
+    """
+    global _DOCKER
+    if _DOCKER is not None:
+        return _DOCKER
+    for candidate in (["docker"], ["sudo", "-n", "docker"]):
+        try:
+            probe = subprocess.run(candidate + ["ps", "--format", "{{.Names}}"],
+                                   capture_output=True, timeout=30)
+            if probe.returncode == 0:
+                _DOCKER = candidate
+                if candidate[0] == "sudo":
+                    print("  NOTE: falling back to `sudo docker` (user not in "
+                          "docker group).")
+                return _DOCKER
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    fail("Cannot reach the Docker daemon as this user or via passwordless sudo.\n"
+         "       sudo usermod -aG docker $USER && newgrp docker")
+
+
 def find_container(node_name: str) -> str:
+    """Resolve a worker's container name. Fails loudly rather than guessing.
+
+    Silently falling back to the node name produces a `docker stop` against a
+    non-existent container, which "succeeds" from the test's point of view and
+    turns a broken kill into a confusing assertion failure much later.
+    """
     result = subprocess.run(
-        ["docker", "ps", "--format", "{{.Names}}"],
-        capture_output=True, text=True, timeout=10,
+        docker() + ["ps", "--format", "{{.Names}}"],
+        capture_output=True, text=True, timeout=30,
     )
-    for line in result.stdout.strip().splitlines():
-        if node_name in line.strip():
-            return line.strip()
-    return node_name
+    if result.returncode != 0:
+        fail(f"`docker ps` failed (rc={result.returncode}): {result.stderr.strip()}\n"
+             f"       If this is a permissions error, add yourself to the docker "
+             f"group:\n       sudo usermod -aG docker $USER && newgrp docker")
+    names = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
+    matches = [n for n in names if node_name in n]
+    if not matches:
+        fail(f"No running container matches '{node_name}'. Running containers: {names}")
+    return matches[0]
+
+
+def wait_for_eviction(node_name: str, timeout_s: float = 240.0) -> float:
+    """Block until the gateway observes that `node_name` is gone.
+
+    Detection is not instantaneous: a dead worker is noticed either when a
+    request routed through it fails, or when its heartbeat goes stale
+    (HEARTBEAT_SOFT_STALE_SECONDS, deliberately widened in the mesh compose so
+    a merely-slow worker on a contended GPU isn't evicted as a dead one).
+    Asserting on round membership before that happens tests nothing.
+    """
+    start = time.time()
+    while time.time() - start < timeout_s:
+        try:
+            for w in get_registry():
+                if w["node_name"] == node_name and not w.get("healthy"):
+                    elapsed = time.time() - start
+                    print(f"  Gateway observed the failure after {elapsed:.0f}s.")
+                    return elapsed
+        except Exception:
+            pass
+        time.sleep(3)
+    fail(f"Gateway still considers {node_name} healthy after {timeout_s:.0f}s. "
+         f"Check HEARTBEAT_SOFT_STALE_SECONDS in the compose file.")
 
 
 def post_train_step(payload: bytes, request_id: str, replica_id: int,
@@ -170,6 +235,88 @@ def pull_adapters(workers: list[dict]) -> dict[str, dict[str, torch.Tensor]]:
         r.raise_for_status()
         out[w["node_name"]] = safetensors_load(r.content)
     return out
+
+
+def check_round_arithmetic(workers: list[dict], label: str) -> dict:
+    """Verify the round produces the CONTRIBUTORS' MEAN, not merely agreement.
+
+    Consensus alone (check_consensus) is a weaker claim: a symmetric-but-wrong
+    merge — summing instead of averaging, or folding a non-contributing spare
+    into the divisor — leaves every peer holding identical tensors and would
+    pass it. So snapshot every adapter *before* the round, compute the expected
+    per-stage mean here, and compare the post-round adapters against it.
+
+    Only actives contribute (§3.5); spares receive the result without being in
+    the numerator or the divisor, so a spare's pre-round values must not
+    influence the expected mean at all.
+    """
+    before = pull_adapters(workers)
+
+    # Group by stage, splitting contributors (active) from receivers (spare).
+    contributors: dict[tuple, list[str]] = {}
+    receivers: dict[tuple, list[str]] = {}
+    for w in workers:
+        if not (w.get("healthy") and w["node_name"] in before):
+            continue
+        stage = tuple(w["layers"])
+        target = contributors if w["role"] == "active" else receivers
+        target.setdefault(stage, []).append(w["node_name"])
+
+    # Expected result per stage: uniform fp32 mean over contributors only,
+    # cast back to the stored dtype (mirrors mesh.merge_adapters).
+    expected: dict[tuple, dict[str, torch.Tensor]] = {}
+    for stage, names in contributors.items():
+        keys = sorted(before[names[0]].keys())
+        acc = {k: torch.zeros(before[names[0]][k].shape, dtype=torch.float32)
+               for k in keys}
+        for name in sorted(names):
+            for k in keys:
+                acc[k] += before[name][k].float()
+        expected[stage] = {
+            k: (acc[k] / len(names)).to(before[names[0]][k].dtype) for k in keys
+        }
+
+    result = run_average_round()
+    after = pull_adapters(get_registry())
+
+    for stage in sorted(expected):
+        exp = expected[stage]
+        members = contributors[stage] + receivers.get(stage, [])
+        for name in members:
+            if name not in after:
+                continue
+            got = after[name]
+            for k in sorted(exp):
+                if not torch.equal(got[k], exp[k]):
+                    diff = (got[k].float() - exp[k].float()).abs().max().item()
+                    fail(f"{label}: {name} stage {stage} key {k} is not the "
+                         f"contributors' mean (max abs diff {diff:.3e}). "
+                         f"Contributors: {sorted(contributors[stage])}, "
+                         f"receivers: {sorted(receivers.get(stage, []))}")
+        role_note = (f"{len(contributors[stage])} contributor(s)"
+                     + (f" + {len(receivers[stage])} receiver(s)"
+                        if stage in receivers else ""))
+        check(True, f"{label}: stage {stage} == exact mean of {role_note}")
+
+    # A merge that changed nothing would trivially satisfy the above if the
+    # peers happened to start equal, so confirm the round actually moved
+    # weights whenever the contributors disagreed going in.
+    moved = any(
+        not torch.equal(before[n][k], after[n][k])
+        for stage, names in contributors.items() if len(names) > 1
+        for n in names if n in after
+        for k in before[n]
+    )
+    started_equal = all(
+        torch.equal(before[names[0]][k], before[n][k])
+        for stage, names in contributors.items() if len(names) > 1
+        for n in names[1:]
+        for k in before[names[0]]
+    )
+    if not started_equal:
+        check(moved, f"{label}: diverged replicas were actually moved by the merge")
+
+    return result
 
 
 def check_consensus(workers: list[dict], label: str) -> None:
@@ -234,8 +381,11 @@ def main():
           f"{'with' if has_spare else 'NO'} spare")
 
     # ── Step 3: averaging round before training → initial consensus ──
+    # Each worker initialises LoRA A randomly and independently, so replicas
+    # start genuinely diverged — round 1 is a real averaging test, not a
+    # merge of already-identical tensors.
     print(f"\n{'='*70}\nSTEP 3: Initial averaging round\n{'='*70}")
-    result = run_average_round()
+    result = check_round_arithmetic(get_registry(), "round-1")
     print(f"  Round {result['round_id']}: completed={result['completed']}")
     check(len(result["completed"]) == NUM_WORKERS,
           f"all {NUM_WORKERS} workers completed round 1 "
@@ -270,7 +420,12 @@ def main():
                 out = post_train_step(samples[i], f"r{replica_id}-s{step}-{i}", replica_id)
                 losses.append(out["loss"].item())
         step += X  # each replica did X=2 steps this epoch
-        result = run_average_round()
+        # Verify the arithmetic again on the last epoch, where the replicas
+        # have had the most opportunity to drift apart between merges.
+        if epoch == PRE_KILL_EPOCHS - 1:
+            result = check_round_arithmetic(get_registry(), f"epoch-{epoch + 1}")
+        else:
+            result = run_average_round()
         avg = sum(losses) / len(losses)
         epoch_losses.append(avg)
         print(f"  Epoch {epoch + 1:2d} | avg loss {avg:7.4f} | "
@@ -300,8 +455,15 @@ def main():
           + (f"spare {spare_name} should be promoted, R stays {R}."
              if has_spare else
              f"no spare — R should drop {R} -> {expected_R}."))
-    subprocess.run(["docker", "stop", "-t", "0", container],
-                   capture_output=True, timeout=30)
+    stop = subprocess.run(docker() + ["stop", "-t", "0", container],
+                          capture_output=True, text=True, timeout=60)
+    if stop.returncode != 0:
+        fail(f"`docker stop {container}` failed (rc={stop.returncode}): "
+             f"{stop.stderr.strip()}")
+    check(True, f"container {container} stopped")
+
+    # The gateway must actually notice before round membership means anything.
+    wait_for_eviction(victim["node_name"])
 
     # Replicas below the new R must keep training; those at or above it must
     # cleanly report 409 so a harness consumer knows to return its batch.
