@@ -42,6 +42,12 @@ class Scenario:
     runner: str = "auto"
     shard_mode: str = "queue"   # "static" pins replica r to samples[r::R]
     freeze_lora_a: bool = False # §3.5 ablation: train only B, making the merge exact
+    # Linear scaling rule. Weight averaging makes the effective update the MEAN
+    # of R local updates, not their sum, so at fixed LR an R-replica mesh makes
+    # ~1/R the parameter-space progress per sample. Scaling the LR by R is the
+    # standard correction; without it the equal-samples comparison is unfair to
+    # the mesh by construction.
+    lr_scale: float = 1.0
 
 def load_scenarios(yaml_path: str) -> List[Scenario]:
     with open(yaml_path, 'r') as f:
@@ -63,6 +69,7 @@ def load_scenarios(yaml_path: str) -> List[Scenario]:
             runner=s_dict.get('runner', "auto"),
             shard_mode=s_dict.get('shard_mode', "queue"),
             freeze_lora_a=bool(s_dict.get('freeze_lora_a', False)),
+            lr_scale=float(s_dict.get('lr_scale', 1.0)),
         ))
     return scenarios
 
@@ -441,6 +448,19 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
         datasets: Dict[tuple, List[Dict[str, Any]]] = {}
         for scenario in scenarios:
             logging.info(f"--- Running Scenario: {scenario.name} ---")
+
+            # Set the per-scenario LR/toggles HERE, not inside the distributed
+            # branch. os.environ persists across scenarios, so a scaled value
+            # left behind by an earlier scenario would silently leak into the
+            # next one's containers (the DeepSpeed baseline reads KIWI_LR too).
+            scenario_lr = lr * scenario.lr_scale
+            os.environ["KIWI_LR"] = repr(scenario_lr)
+            os.environ["KIWI_FREEZE_LORA_A"] = "1" if scenario.freeze_lora_a else "0"
+            if scenario.lr_scale != 1.0:
+                logging.info(f"{scenario.name}: LR scaled x{scenario.lr_scale} "
+                             f"-> {scenario_lr:g} (linear scaling rule for "
+                             f"R={scenario.replicas})")
+
             ds_key = (scenario.model, scenario.dataset)
             if ds_key not in datasets:
                 datasets[ds_key] = prepare_dataset(scenario.model, scenario.dataset)
@@ -567,9 +587,6 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                 # (internet.yml for dp1, mesh.yml for dp2/dp2_kill).
                 gateway_url = "http://localhost:8080"
                 compose = scenario.compose
-                # Compose reads this from the environment we hand the
-                # subprocess, so it must be set BEFORE the cluster comes up.
-                os.environ["KIWI_FREEZE_LORA_A"] = "1" if scenario.freeze_lora_a else "0"
                 logging.info(f"Running {scenario.name} distributed via {compose} "
                              f"(R={scenario.replicas}, X={scenario.average_every})...")
 

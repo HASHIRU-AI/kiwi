@@ -440,6 +440,32 @@ class MeshRunner(BaseRunner):
                     live = [r for r in range(R) if r not in retired]
                 if not live:
                     raise RuntimeError(f"[{scenario_name}] all consumers retired; cluster unusable")
+
+                # A retired replica's private queue has no reader — no consumer
+                # ever looks at another replica's shard — so its batches would
+                # strand and the window could never drain, killing the entire
+                # run with "window failed to drain". Hand that work to the
+                # shared queue, which every live consumer falls back to.
+                for _r, _q in per_replica.items():
+                    if _r in live:
+                        continue
+                    _moved = 0
+                    while True:
+                        try:
+                            work.put(_q.get_nowait())
+                            _moved += 1
+                        except queue_mod.Empty:
+                            break
+                    if _moved:
+                        with lock:
+                            events.append({"type": "shard_reassigned",
+                                           "from_replica": _r, "batches": _moved,
+                                           "samples": samples_consumed})
+                        logging.warning(
+                            f"[{scenario_name}] replica {_r} retired holding "
+                            f"{_moved} batches; reassigned to the shared queue"
+                        )
+
                 threads = [
                     threading.Thread(
                         target=consumer,

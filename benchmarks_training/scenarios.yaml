@@ -212,3 +212,46 @@ scenarios:
     average_every: 2
     compose: "docker-compose.mesh.yml"
     shard_mode: "mirror"
+
+  # LINEAR SCALING RULE. Averaging makes the effective update the MEAN of the R
+  # local updates, so at a fixed LR an R=2 mesh travels ~half the distance per
+  # sample that R=1 does — the equal-samples comparison handicaps the mesh
+  # before averaging quality even enters. Standard correction: LR x R.
+  # If dp2_lr2x closes most of the gap to dp1, the "regression" was largely a
+  # missing hyperparameter adjustment, not a defect in the mesh.
+  - name: "dp2_lr2x"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 3
+    epochs: 10
+    target_loss: 2.0
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 2
+    compose: "docker-compose.mesh.yml"
+    lr_scale: 2.0
+
+  # MATCHED SEQUENTIAL DEPTH — the comparison the mesh actually exists to win.
+  #
+  # Every other dp2 scenario splits one epoch's data across replicas (standard
+  # DDP semantics), so at 10 epochs each replica takes only 20 steps against
+  # dp1's 40. On the samples-consumed axis dp2 is then handicapped BY
+  # CONSTRUCTION: averaging combines displacements by taking their mean, so R
+  # replicas x X steps advances about X steps, not R*X. A flawless
+  # implementation would still trail dp1 there.
+  #
+  # Here epochs are doubled so each replica takes 40 steps, matching dp1's
+  # sequential depth while consuming 80 samples. That is the throughput claim:
+  # "in the same number of sequential steps we processed twice the data."
+  #
+  # Read this one against dp1 by FINAL LOSS (see diagnostic_summary.png), not
+  # on the samples axis — the evaluator's equal-samples comparison truncates to
+  # the overlapping range and would silently compare only the first 40 samples.
+  - name: "dp2_matched_steps"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 3
+    epochs: 20          # 20 x 4 = 80 samples -> 40 steps per replica at R=2
+    target_loss: 2.0
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 2
+    compose: "docker-compose.mesh.yml"
