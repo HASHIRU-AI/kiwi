@@ -332,133 +332,153 @@ class MeshRunner(BaseRunner):
         total_steps_target = epochs * len(dataset)
         window_index = 0
 
+        # ONE continuous stream across all epochs, reshuffled within each epoch.
+        #
+        # Windowing must span epoch boundaries. Rebuilding a 4-element batch
+        # list per epoch caps every window at 4, so any X where R*X exceeds the
+        # dataset size silently collapses back to "one round per epoch" — X=5
+        # and X=20 both behaved exactly like X=2, making the sweep meaningless
+        # while still printing plausible round counts.
+        stream: List[Dict[str, Any]] = []
         for epoch in range(epochs):
-            batches = [dict(payload=s["payload"], _idx=i) for i, s in enumerate(dataset)]
-            rng.shuffle(batches)
+            epoch_batches = [
+                dict(payload=s["payload"], _idx=i, _epoch=epoch)
+                for i, s in enumerate(dataset)
+            ]
+            rng.shuffle(epoch_batches)
+            stream.extend(epoch_batches)
 
-            # Windows of R×X batches -> one averaging round per X steps/pipe.
-            # EXCEPT in mirror mode, where every replica trains on every batch
-            # in the window, so a window is X batches and each replica still
-            # takes X steps before the merge.
-            window_size = max(1, X if self.shard_mode == "mirror" else R * X)
-            for w_start in range(0, len(batches), window_size):
-                window = batches[w_start:w_start + window_size]
-                work: "queue_mod.Queue" = queue_mod.Queue()
-                per_replica: Dict[int, "queue_mod.Queue"] = {}
-                for b in window:
-                    b.pop("_attempts", None)
+        # Windows of R×X batches -> one averaging round per X steps/pipe.
+        # EXCEPT in mirror mode, where every replica trains on every batch
+        # in the window, so a window is X batches and each replica still
+        # takes X steps before the merge.
+        window_size = max(1, X if self.shard_mode == "mirror" else R * X)
+        epochs_fired = 0
 
-                window_index += 1
-                if self.shard_mode == "mirror":
-                    # Every replica trains on EVERY batch in the window. The
-                    # replicas therefore see IDENTICAL data between merges, so
-                    # averaging has nothing to reconcile. This is the control
-                    # that none of queue/static/rotate provided: all three hand
-                    # each replica a DISJOINT half, so they varied "which facts"
-                    # while holding "do the replicas share data" constant.
-                    #
-                    # If mirror recovers dp1-like convergence, the averaging
-                    # machinery is sound and the whole penalty is the cost of
-                    # merging models trained on different data (non-i.i.d.
-                    # local SGD). If mirror is ALSO bad, the merge is damaging
-                    # weights even when there is nothing to reconcile, and the
-                    # bug is in the averaging itself.
-                    #
-                    # Compare on STEPS PER REPLICA, not samples consumed: each
-                    # batch here is trained R times, once per replica.
-                    for r in range(R):
-                        q: "queue_mod.Queue" = queue_mod.Queue()
-                        for b in window:
-                            q.put(dict(b))       # independent copy per replica
-                        per_replica[r] = q
-                elif self.shard_mode in ("static", "rotate"):
-                    # Deterministic assignment instead of a race. The shared
-                    # queue stays EMPTY and is used only for batches handed back
-                    # by a retired replica, so failure handling is unchanged.
-                    #
-                    #   static — replica r permanently owns samples[r::R]. True
-                    #            disjoint sharding: a replica NEVER sees the
-                    #            other replicas' facts, so the merged model can
-                    #            only acquire them through averaging. Maximally
-                    #            non-i.i.d.
-                    #   rotate — same fixed grouping, but the groups are handed
-                    #            to a different replica each window (offset by
-                    #            the window index). Every replica eventually
-                    #            sees every fact, while still specialising on a
-                    #            consistent subset between merges. This is what
-                    #            scratch/test_stage6_mesh.py does.
-                    offset = (window_index - 1) % R if self.shard_mode == "rotate" else 0
-                    for r in range(R):
-                        q: "queue_mod.Queue" = queue_mod.Queue()
-                        for b in window:
-                            if (b["_idx"] + offset) % R == r:
-                                q.put(b)
-                        per_replica[r] = q
-                else:
+        for w_start in range(0, len(stream), window_size):
+            window = stream[w_start:w_start + window_size]
+            work: "queue_mod.Queue" = queue_mod.Queue()
+            per_replica: Dict[int, "queue_mod.Queue"] = {}
+            for b in window:
+                b.pop("_attempts", None)
+
+            window_index += 1
+            if self.shard_mode == "mirror":
+                # Every replica trains on EVERY batch in the window. The
+                # replicas therefore see IDENTICAL data between merges, so
+                # averaging has nothing to reconcile. This is the control
+                # that none of queue/static/rotate provided: all three hand
+                # each replica a DISJOINT half, so they varied "which facts"
+                # while holding "do the replicas share data" constant.
+                #
+                # If mirror recovers dp1-like convergence, the averaging
+                # machinery is sound and the whole penalty is the cost of
+                # merging models trained on different data (non-i.i.d.
+                # local SGD). If mirror is ALSO bad, the merge is damaging
+                # weights even when there is nothing to reconcile, and the
+                # bug is in the averaging itself.
+                #
+                # Compare on STEPS PER REPLICA, not samples consumed: each
+                # batch here is trained R times, once per replica.
+                for r in range(R):
+                    q: "queue_mod.Queue" = queue_mod.Queue()
                     for b in window:
-                        work.put(b)
+                        q.put(dict(b))       # independent copy per replica
+                    per_replica[r] = q
+            elif self.shard_mode in ("static", "rotate"):
+                # Deterministic assignment instead of a race. The shared
+                # queue stays EMPTY and is used only for batches handed back
+                # by a retired replica, so failure handling is unchanged.
+                #
+                #   static — replica r permanently owns samples[r::R]. True
+                #            disjoint sharding: a replica NEVER sees the
+                #            other replicas' facts, so the merged model can
+                #            only acquire them through averaging. Maximally
+                #            non-i.i.d.
+                #   rotate — same fixed grouping, but the groups are handed
+                #            to a different replica each window (offset by
+                #            the window index). Every replica eventually
+                #            sees every fact, while still specialising on a
+                #            consistent subset between merges. This is what
+                #            scratch/test_stage6_mesh.py does.
+                offset = (window_index - 1) % R if self.shard_mode == "rotate" else 0
+                for r in range(R):
+                    q: "queue_mod.Queue" = queue_mod.Queue()
+                    for b in window:
+                        if (b["_idx"] + offset) % R == r:
+                            q.put(b)
+                    per_replica[r] = q
+            else:
+                for b in window:
+                    work.put(b)
 
-                # A consumer retires when its replica_id exceeds R after a pipe
-                # loss. R can come BACK (a spare is promoted, or a falsely
-                # soft-evicted worker heartbeats again), so re-check at every
-                # window boundary and let retired consumers rejoin — otherwise
-                # one transient blip silently degrades the whole run to R=1 and
-                # the resulting curve is not a dp{R} curve at all.
-                if retired:
-                    try:
-                        live_r = self._discover_r(model_id)
-                    except Exception:
-                        live_r = 0
-                    with lock:
-                        rejoined = {r for r in retired if r < live_r}
-                        if rejoined:
-                            retired.difference_update(rejoined)
-                            events.append({"type": "consumer_rejoined",
-                                           "replicas": sorted(rejoined),
-                                           "samples": samples_consumed})
-                            logging.info(f"[{scenario_name}] consumers {sorted(rejoined)} "
-                                         f"rejoined (R recovered to {live_r})")
-
-                # Drain the window; loop again if a requeued batch was left
-                # behind after all threads of a pass exited.
-                for _pass in range(self.max_batch_attempts):
-                    with lock:
-                        live = [r for r in range(R) if r not in retired]
-                    if not live:
-                        raise RuntimeError(f"[{scenario_name}] all consumers retired; cluster unusable")
-                    threads = [
-                        threading.Thread(
-                            target=consumer,
-                            args=(r, work,
-                                  per_replica.get(r) if self.shard_mode != "queue" else None),
-                            daemon=True,
-                        )
-                        for r in live
-                    ]
-                    for t in threads:
-                        t.start()
-                    for t in threads:
-                        t.join()
-                    drained = work.empty() and all(
-                        q.empty() for q in per_replica.values())
-                    if drained:
-                        break
-                else:
-                    raise RuntimeError(f"[{scenario_name}] window failed to drain")
-
-                # Cluster is quiescent (no /train_step in flight) — barrier.
-                round_start = time.time()
-                result = self._average(model_id)
-                round_times.append(time.time() - round_start)
+            # A consumer retires when its replica_id exceeds R after a pipe
+            # loss. R can come BACK (a spare is promoted, or a falsely
+            # soft-evicted worker heartbeats again), so re-check at every
+            # window boundary and let retired consumers rejoin — otherwise
+            # one transient blip silently degrades the whole run to R=1 and
+            # the resulting curve is not a dp{R} curve at all.
+            if retired:
+                try:
+                    live_r = self._discover_r(model_id)
+                except Exception:
+                    live_r = 0
                 with lock:
-                    n_now = samples_consumed
-                logging.info(
-                    f"[{scenario_name} seed {seed_idx}] samples {n_now}/{total_steps_target} "
-                    f"| round {result['round_id']} completed={len(result['completed'])}"
-                )
+                    rejoined = {r for r in retired if r < live_r}
+                    if rejoined:
+                        retired.difference_update(rejoined)
+                        events.append({"type": "consumer_rejoined",
+                                       "replicas": sorted(rejoined),
+                                       "samples": samples_consumed})
+                        logging.info(f"[{scenario_name}] consumers {sorted(rejoined)} "
+                                     f"rejoined (R recovered to {live_r})")
 
+            # Drain the window; loop again if a requeued batch was left
+            # behind after all threads of a pass exited.
+            for _pass in range(self.max_batch_attempts):
+                with lock:
+                    live = [r for r in range(R) if r not in retired]
+                if not live:
+                    raise RuntimeError(f"[{scenario_name}] all consumers retired; cluster unusable")
+                threads = [
+                    threading.Thread(
+                        target=consumer,
+                        args=(r, work,
+                              per_replica.get(r) if self.shard_mode != "queue" else None),
+                        daemon=True,
+                    )
+                    for r in live
+                ]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+                drained = work.empty() and all(
+                    q.empty() for q in per_replica.values())
+                if drained:
+                    break
+            else:
+                raise RuntimeError(f"[{scenario_name}] window failed to drain")
+
+            # Cluster is quiescent (no /train_step in flight) — barrier.
+            round_start = time.time()
+            result = self._average(model_id)
+            round_times.append(time.time() - round_start)
+            with lock:
+                n_now = samples_consumed
+            logging.info(
+                f"[{scenario_name} seed {seed_idx}] samples {n_now}/{total_steps_target} "
+                f"| round {result['round_id']} completed={len(result['completed'])}"
+            )
+
+            # Fire the kill hook at epoch boundaries. Windows may now span
+            # epochs, so derive completed epochs from the stream position
+            # rather than a loop variable.
             if kill_hook is not None:
-                kill_hook(epoch + 1)
+                completed = window[-1]["_epoch"] + 1
+                while epochs_fired < completed:
+                    epochs_fired += 1
+                    kill_hook(epochs_fired)
 
         total_wall = time.time() - total_wall_start
         avg_step_ms = (sum(step_times) / len(step_times)) * 1000 if step_times else 0.0
