@@ -69,6 +69,10 @@ services:
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
       KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
+      # Trades ~30% step time for ~25x less activation memory. Required at
+      # alpaca1k sequence lengths under the 0.9 GB cap; set to 0 only to
+      # reproduce a pre-checkpointing timing baseline.
+      KIWI_GRAD_CHECKPOINT: ${KIWI_GRAD_CHECKPOINT:-1}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -106,6 +110,10 @@ services:
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
       KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
+      # Trades ~30% step time for ~25x less activation memory. Required at
+      # alpaca1k sequence lengths under the 0.9 GB cap; set to 0 only to
+      # reproduce a pre-checkpointing timing baseline.
+      KIWI_GRAD_CHECKPOINT: ${KIWI_GRAD_CHECKPOINT:-1}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -143,6 +151,10 @@ services:
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
       KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
+      # Trades ~30% step time for ~25x less activation memory. Required at
+      # alpaca1k sequence lengths under the 0.9 GB cap; set to 0 only to
+      # reproduce a pre-checkpointing timing baseline.
+      KIWI_GRAD_CHECKPOINT: ${KIWI_GRAD_CHECKPOINT:-1}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -180,6 +192,10 @@ services:
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
       KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
+      # Trades ~30% step time for ~25x less activation memory. Required at
+      # alpaca1k sequence lengths under the 0.9 GB cap; set to 0 only to
+      # reproduce a pre-checkpointing timing baseline.
+      KIWI_GRAD_CHECKPOINT: ${KIWI_GRAD_CHECKPOINT:-1}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -217,6 +233,10 @@ services:
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
       KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
+      # Trades ~30% step time for ~25x less activation memory. Required at
+      # alpaca1k sequence lengths under the 0.9 GB cap; set to 0 only to
+      # reproduce a pre-checkpointing timing baseline.
+      KIWI_GRAD_CHECKPOINT: ${KIWI_GRAD_CHECKPOINT:-1}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface
@@ -254,6 +274,10 @@ services:
       KIWI_VRAM_GB_OVERRIDE: "0.9"
       KIWI_LR: ${KIWI_LR:-2e-4}
       KIWI_FREEZE_LORA_A: ${KIWI_FREEZE_LORA_A:-0}
+      # Trades ~30% step time for ~25x less activation memory. Required at
+      # alpaca1k sequence lengths under the 0.9 GB cap; set to 0 only to
+      # reproduce a pre-checkpointing timing baseline.
+      KIWI_GRAD_CHECKPOINT: ${KIWI_GRAD_CHECKPOINT:-1}
       KIWI_T_ROUND: "120"
     volumes:
       - hf_cache:/root/.cache/huggingface

@@ -147,9 +147,23 @@ class SingleMachineRunner(BaseRunner):
             device_map=device
         )
         
+        # Same gradient checkpointing as the workers, for the same reason it
+        # has to be uniform: this is the reference arm every distributed
+        # scenario is compared against, and an arm running a different compute
+        # path is not a reference. It changes no gradient (checkpoint restores
+        # the RNG state, so LoRA dropout recomputes identically) — only step
+        # time, which gates nothing.
+        if os.getenv("KIWI_GRAD_CHECKPOINT", "1") == "1":
+            model.enable_input_require_grads()
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            model.config.use_cache = False
+            logging.info("Gradient checkpointing enabled (matches worker config)")
+
         model = get_peft_model(model, SHARED_TRAIN_CONFIG["lora_config"])
         model.train()
-        
+
         logging.info(f"Using learning rate: {SHARED_TRAIN_CONFIG['lr']}")
         optimizer = torch.optim.Adam(model.parameters(), lr=SHARED_TRAIN_CONFIG["lr"])
 
@@ -227,22 +241,66 @@ class SingleMachineRunner(BaseRunner):
         }
 
 class DistributedRunner(BaseRunner):
-    def __init__(self, gateway_url: str = "http://localhost:8080"):
+    def __init__(self, gateway_url: str = "http://localhost:8080",
+                 max_attempts: int = 10):
         self.gateway_url = gateway_url
+        # Matches MeshRunner.max_batch_attempts. Enough to ride out a pipe
+        # reformation; not so many that a genuinely dead cluster hangs the run.
+        self.max_attempts = max_attempts
 
     def run_training(self, model_id: str, dataset: List[Dict[str, Any]], epochs: int,
                      scenario_name: str = "unknown", seed_idx: int = 0,
                      eval_dataset: Optional[List[Dict[str, Any]]] = None,
                      eval_every: int = 0,
                      eval_samples: int = DEFAULT_EVAL_SAMPLES) -> Dict[str, Any]:
+        events: List[Dict[str, Any]] = []
+
         def post(payload, rid):
-            r = httpx.post(f"{self.gateway_url}/train_step", content=payload,
-                           headers={"Content-Type": "application/octet-stream",
-                                    "X-Model-ID": model_id,
-                                    "X-Request-ID": rid},
-                           timeout=120.0)
-            r.raise_for_status()
-            return safetensors_load(r.content)
+            """At-least-once, mirroring MeshRunner's consumer.
+
+            The gateway returns 503 while it has no healthy pipe — which
+            happens transiently whenever a worker is evicted and the pipe is
+            being reformed. Observed exactly this: a worker hit a CUDA OOM,
+            the gateway evicted it, re-formed the identical pipe seconds
+            later, and the run died anyway because this function raised on
+            the one request in between. The cluster recovered; the benchmark
+            did not.
+
+            The worker-side dedup guard keys on X-Request-ID, so retrying the
+            SAME rid cannot double-count a step that actually landed.
+            """
+            last_error: Optional[Exception] = None
+            for attempt in range(self.max_attempts):
+                try:
+                    r = httpx.post(f"{self.gateway_url}/train_step", content=payload,
+                                   headers={"Content-Type": "application/octet-stream",
+                                            "X-Model-ID": model_id,
+                                            "X-Request-ID": rid},
+                                   timeout=120.0)
+                    r.raise_for_status()
+                    if attempt > 0:
+                        events.append({"type": "recovered_step", "request_id": rid,
+                                       "attempts": attempt + 1})
+                        logging.info(f"[{scenario_name}] {rid} succeeded on attempt "
+                                     f"{attempt + 1}")
+                    return safetensors_load(r.content)
+                except httpx.HTTPStatusError as error:
+                    # 409 means this replica index no longer exists. At R=1
+                    # that is unrecoverable and retrying only wastes the
+                    # budget, so fail fast and loudly.
+                    if error.response.status_code == 409:
+                        raise
+                    last_error = error
+                except Exception as error:
+                    last_error = error
+                events.append({"type": "step_error", "request_id": rid,
+                               "attempt": attempt + 1, "error": str(last_error)[:200]})
+                logging.warning(f"[{scenario_name}] {rid} attempt {attempt + 1}/"
+                                f"{self.max_attempts} failed: {last_error}")
+                time.sleep(min(2.0 * (attempt + 1), 10.0))
+            raise RuntimeError(
+                f"{rid} failed after {self.max_attempts} attempts: {last_error}"
+            )
 
         total_steps = epochs * len(dataset)
         curve = []
@@ -284,9 +342,21 @@ class DistributedRunner(BaseRunner):
 
         avg_time_ms = (total_time / total_steps) * 1000 if total_steps > 0 else 0
 
+        if events:
+            logging.warning(
+                f"[{scenario_name} seed {seed_idx}] completed with "
+                f"{sum(1 for e in events if e['type'] == 'step_error')} failed request(s) "
+                f"and {sum(1 for e in events if e['type'] == 'recovered_step')} recovery(ies) "
+                f"— this seed was NOT a clean run; see events in the results JSON"
+            )
+
         return {
             "curve": curve,
             "eval_curve": eval_curve,
+            # Surfaced so a seed that only completed because of retries is
+            # visible in the results file. A silent retry that rescues a run
+            # also hides the fault that made it necessary.
+            "events": events,
             "metrics": {
                 "peak_gpu_mb": 0.0,
                 "step_time_ms": float(avg_time_ms)

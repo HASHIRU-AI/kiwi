@@ -303,6 +303,47 @@ def _load_assigned_model(assignment: dict[str, Any]) -> Any:
     # ── Device placement ──
     inference_device = _place_model_on_device(loaded_model, num_assigned, total_layers)
 
+    # ── Gradient checkpointing ──
+    # Without this a worker stores every decoder layer's forward intermediates
+    # for the backward pass. The MLP tensors dominate: 3 x (T x 4864 x 2) bytes
+    # per layer, plus the saved input of each of the 7 LoRA adapters. At
+    # T ~= 25 (the zorbulax fixture) that is ~1 MB per layer and invisible; at
+    # T = 256 it is ~10 MB per layer, and a 10-layer first stage that also
+    # carries the 272 MB embedding table exceeds the 0.9 GB per-worker cap and
+    # dies mid-run with a CUDA OOM. Observed exactly that on alpaca1k.
+    #
+    # Checkpointing keeps only each layer's INPUT (T x 896 x 2, under 1 MB)
+    # and recomputes the internals during backward. Costs roughly one extra
+    # forward pass (~30% step time; wall clock gates nothing here) and changes
+    # no gradient: torch.utils.checkpoint restores the RNG state, so the
+    # recomputed LoRA dropout mask is identical to the original.
+    #
+    # NOTE: this does NOT help the last stage's logits. lm_head runs after the
+    # decoder stack, outside the checkpointed region, and its [T, vocab]
+    # output is genuinely needed by cross-entropy's backward. That is why
+    # ALPACA_MAX_LENGTH is 256 rather than 512 — see orchestrator.py.
+    if os.getenv("KIWI_GRAD_CHECKPOINT", "1") == "1":
+        # Must come BEFORE get_peft_model. enable_input_require_grads installs
+        # a forward hook on the input embeddings; the first stage's only input
+        # is input_ids (an integer tensor that cannot require grad), so without
+        # it torch.utils.checkpoint sees no grad-requiring input, warns
+        # "None of the inputs have requires_grad=True", and silently produces
+        # NO gradients for that stage — a silent failure, not a crash.
+        loaded_model.enable_input_require_grads()
+        loaded_model.gradient_checkpointing_enable(
+            # Reentrant checkpointing is incompatible with the frozen base +
+            # trainable-adapter split: it decides what to recompute from the
+            # inputs' requires_grad, which is wrong when only inner params
+            # need grads. The repo already settled on this in QLoRARunner.
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        # use_cache and checkpointing are mutually exclusive; transformers
+        # warns and disables the cache anyway, so do it explicitly. Training
+        # never uses the KV cache.
+        loaded_model.config.use_cache = False
+        print(f"[{NODE_NAME}] Gradient checkpointing ENABLED "
+              f"(~30% slower per step, ~25x less activation memory)", flush=True)
+
     # ── Apply LoRA ──
     lora_config = LoraConfig(
         r=16,

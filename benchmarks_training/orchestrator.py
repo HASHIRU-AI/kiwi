@@ -382,7 +382,20 @@ ALPACA_EVAL_N = 200
 # machine, every run, forever. If this is ever changed, results from before
 # and after the change are not comparable and must not be pooled.
 ALPACA_SELECTION_SEED = 20250811
-ALPACA_MAX_LENGTH = 512
+# 256, not the 512 the plan suggested. Measured constraint, not a preference:
+# the LAST pipeline stage materializes a [T, 151936] logits tensor (Qwen2.5's
+# vocab), plus its contiguous shift copy, the softmax saved for backward, and
+# the incoming gradient — roughly T x 1.2 MB in total. That work happens after
+# the decoder stack, so gradient checkpointing cannot touch it, and against
+# the ~440 MB of headroom left by the 0.9 GB per-worker cap it puts the
+# ceiling at ~300-360 tokens. 512 OOMs; 256 clears it with margin.
+#
+# The cost is truncation of the longest ~decile of alpaca instructions.
+# Examples that would lose ALL their answer tokens are dropped by
+# _encode_pair rather than trained on (all -100 labels make cross_entropy
+# return NaN silently). Raising this back to 512 requires chunked
+# cross-entropy on the last stage.
+ALPACA_MAX_LENGTH = 256
 
 _ALPACA_WITH_INPUT = (
     "Below is an instruction that describes a task, paired with an input that "
@@ -922,6 +935,8 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                     else:
                         res = runner.run_training(scenario.model, dataset, scenario.epochs,
                                                   scenario.name, i+1, **eval_kwargs)
+                        if res.get("events"):
+                            events_all.append(res["events"])
                     curves.append(res["curve"])
                     if res.get("eval_curve"):
                         eval_curves.append(res["eval_curve"])
