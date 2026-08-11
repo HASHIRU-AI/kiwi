@@ -399,11 +399,132 @@ class TestPlanRound:
         asyncio.run(scenario())
 
 
+# ── Phase 3.3: sparsity and the full-sync cadence (gateway) ─────────────────
+
+
+class TestSparsePlanning:
+    """The gateway is the single source of truth for `p`.
+
+    Peers derive their masks from (key, round_id, p) WITHOUT exchanging them,
+    so two workers that disagreed about p for one round would average into
+    different coordinates and corrupt the adapter silently. These tests pin
+    the property that makes that impossible: every entry in a plan carries
+    the same p, and p is decided per round, not per worker.
+    """
+
+    def test_default_is_dense_and_backward_compatible(self, seven_workers):
+        async def scenario():
+            await seven_workers.get_pipe(MODEL, NUM_LAYERS, 0)
+            _, plan = await seven_workers.plan_round(MODEL, x=2)
+            for entry in plan:
+                assert entry["round"]["p"] == 1.0
+                assert entry["round"]["full"] is True
+                assert entry["round"]["outer"] is False
+
+        asyncio.run(scenario())
+
+    def test_every_worker_in_a_round_gets_identical_p(self, seven_workers):
+        async def scenario():
+            await seven_workers.get_pipe(MODEL, NUM_LAYERS, 0)
+            _, plan = await seven_workers.plan_round(
+                MODEL, x=2, p=0.05, full_sync_every=10
+            )
+            ps = {e["round"]["p"] for e in plan}
+            assert ps == {0.05}, f"peers disagree about p: {ps}"
+            # Spares included — they apply the sparse payload too, so they
+            # must recompute the SAME mask as the contributors.
+            spare_name = seven_workers._spares[MODEL][0].node_name
+            spare = next(e for e in plan if e["node_name"] == spare_name)["round"]
+            assert spare["p"] == 0.05
+            assert spare["contribute"] is False
+
+        asyncio.run(scenario())
+
+    def test_every_nth_round_is_dense(self, seven_workers):
+        async def scenario():
+            await seven_workers.get_pipe(MODEL, NUM_LAYERS, 0)
+            seen = {}
+            for _ in range(12):
+                round_id, plan = await seven_workers.plan_round(
+                    MODEL, x=2, p=0.05, full_sync_every=5
+                )
+                seen[round_id] = (plan[0]["round"]["p"], plan[0]["round"]["full"])
+            for round_id, (p, full) in seen.items():
+                if round_id % 5 == 0:
+                    assert full is True and p == 1.0, f"round {round_id} not dense"
+                else:
+                    assert full is False and p == 0.05, f"round {round_id} not sparse"
+
+        asyncio.run(scenario())
+
+    def test_full_sync_can_be_disabled(self, seven_workers):
+        async def scenario():
+            await seven_workers.get_pipe(MODEL, NUM_LAYERS, 0)
+            for _ in range(6):
+                _, plan = await seven_workers.plan_round(
+                    MODEL, x=2, p=0.1, full_sync_every=0
+                )
+                assert plan[0]["round"]["full"] is False
+
+        asyncio.run(scenario())
+
+    def test_outer_only_on_dense_rounds(self, seven_workers):
+        """The outer step needs a COMPLETE pseudo-gradient.
+
+        A sparse round touches a different ~p of coordinates each time, so
+        "delta since the last anchor" over one of them is not a coherent
+        gradient of anything. The gateway must therefore never set outer on a
+        sparse round, even when the arm has outer_opt enabled.
+        """
+        async def scenario():
+            await seven_workers.get_pipe(MODEL, NUM_LAYERS, 0)
+            for _ in range(10):
+                round_id, plan = await seven_workers.plan_round(
+                    MODEL, x=2, p=0.05, outer=True, full_sync_every=4
+                )
+                r = plan[0]["round"]
+                assert r["outer"] == r["full"], (
+                    f"round {round_id}: outer={r['outer']} but full={r['full']}"
+                )
+
+        asyncio.run(scenario())
+
+    def test_dense_arm_makes_every_round_outer(self, seven_workers):
+        """The DiLoCo arm (p=1.0, X=8) — every round is dense, so every round
+        takes an outer step."""
+        async def scenario():
+            await seven_workers.get_pipe(MODEL, NUM_LAYERS, 0)
+            for _ in range(5):
+                _, plan = await seven_workers.plan_round(MODEL, x=8, p=1.0, outer=True)
+                assert plan[0]["round"]["full"] is True
+                assert plan[0]["round"]["outer"] is True
+
+        asyncio.run(scenario())
+
+
 # ── Phase 2: merge math (§3.5 / §6.6) — needs real torch ────────────────────
 
 torch = pytest.importorskip("torch")
-_HAS_REAL_TORCH = hasattr(torch, "tensor")
-needs_torch = pytest.mark.skipif(not _HAS_REAL_TORCH, reason="real torch required")
+
+
+def _torch_is_functional() -> bool:
+    """Probe torch by USING it, not by inspecting attributes.
+
+    Attribute checks are unreliable: a stub or partially-installed torch can
+    expose `tensor` and still be unusable, which turns a skip into a spurious
+    failure and hides whether the real assertions ever ran.
+    """
+    try:
+        g = torch.Generator().manual_seed(0)
+        a = torch.randn(2, 2, generator=g)
+        return bool(torch.equal(a, a.clone()))
+    except Exception:
+        return False
+
+
+needs_torch = pytest.mark.skipif(
+    not _torch_is_functional(), reason="a functional torch install is required"
+)
 
 
 def _sd(scale: float, dtype=None) -> dict:
@@ -510,6 +631,61 @@ class TestMergeAdapters:
         for k in own:
             expected = (own[k].float() + good[k].float()) / 2
             assert torch.allclose(merged[k], expected)
+
+
+@needs_torch
+class TestRoundOracle:
+    """The e2e test (scratch/test_stage6_mesh.py) checks a live round against an
+    expected mean it computes itself, independently of mesh.py. If that oracle
+    and the implementation ever disagree the e2e test is worthless, so pin them
+    together here — over the exact topologies the cluster runs.
+    """
+
+    @staticmethod
+    def _oracle(before: dict, contributors: list) -> dict:
+        """Byte-for-byte the computation check_round_arithmetic performs."""
+        keys = sorted(before[contributors[0]].keys())
+        acc = {
+            k: torch.zeros(before[contributors[0]][k].shape, dtype=torch.float32)
+            for k in keys
+        }
+        for name in sorted(contributors):
+            for k in keys:
+                acc[k] += before[name][k].float()
+        return {
+            k: (acc[k] / len(contributors)).to(before[contributors[0]][k].dtype)
+            for k in keys
+        }
+
+    @pytest.mark.parametrize(
+        "n_contributors,n_spares",
+        [(2, 0), (2, 1), (3, 0)],  # mesh-nospare, mesh (7-worker), and R=3
+    )
+    def test_oracle_matches_implementation(self, n_contributors, n_spares):
+        from mesh import merge_adapters
+
+        before = {f"c{i}": _sd(float(i + 1)) for i in range(n_contributors)}
+        for j in range(n_spares):
+            # A spare's adapter is deliberately far from the contributors': if
+            # it leaked into the numerator or divisor this would blow up.
+            before[f"s{j}"] = _sd(99.0 + j)
+        contributors = [f"c{i}" for i in range(n_contributors)]
+        expected = self._oracle(before, contributors)
+
+        # Every active computes the mean from its own perspective.
+        for me in contributors:
+            received = [(o, 100, before[o]) for o in contributors if o != me]
+            got = merge_adapters(before[me], received, contribute=True, own_name=me)
+            for k in expected:
+                assert torch.equal(got[k], expected[k]), f"active {me}, key {k}"
+
+        # Every spare receives all contributions and contributes nothing.
+        for j in range(n_spares):
+            me = f"s{j}"
+            received = [(o, 100, before[o]) for o in contributors]
+            got = merge_adapters(before[me], received, contribute=False, own_name=me)
+            for k in expected:
+                assert torch.equal(got[k], expected[k]), f"spare {me}, key {k}"
 
 
 @needs_torch

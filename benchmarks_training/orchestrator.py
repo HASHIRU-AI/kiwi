@@ -10,6 +10,7 @@ import httpx
 import os
 import argparse
 import logging
+import random
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
 from transformers import AutoTokenizer
@@ -48,6 +49,28 @@ class Scenario:
     # standard correction; without it the equal-samples comparison is unfair to
     # the mesh by construction.
     lr_scale: float = 1.0
+    # ── Held-out eval (Phase 1.2/1.3) ──
+    # Run the eval split every `eval_every` SAMPLES CONSUMED. 0 disables eval
+    # entirely, which is the right setting for zorbulax4 (a 4-fact
+    # memorization fixture has no meaningful held-out split).
+    eval_every: int = 0
+    # How many held-out examples each eval point averages over. A fixed prefix
+    # of the split, identical at every point and in every scenario.
+    eval_samples: int = 64
+    # Kept at 1 throughout the suite. See _validate_batch_size: values > 1
+    # are rejected rather than silently mishandled.
+    batch_size: int = 1
+    # ── Averaging mechanism (Phases 3 & 4) ──
+    # sparse_p < 1.0 selects sparse averaging: each round exchanges and
+    # averages only that fraction of adapter parameters, chosen by a
+    # deterministic per-(key, round) mask. 1.0 is the dense path.
+    sparse_p: float = 1.0
+    # Every Nth round is dense regardless of sparse_p, restoring exact
+    # replica agreement. None -> the gateway's KIWI_FULL_SYNC_EVERY default.
+    full_sync_every: Optional[int] = None
+    # DiLoCo-style outer optimizer with Nesterov momentum, applied on dense
+    # rounds. The comparison arm against sparse averaging.
+    outer_opt: bool = False
 
 def load_scenarios(yaml_path: str) -> List[Scenario]:
     with open(yaml_path, 'r') as f:
@@ -70,8 +93,45 @@ def load_scenarios(yaml_path: str) -> List[Scenario]:
             shard_mode=s_dict.get('shard_mode', "queue"),
             freeze_lora_a=bool(s_dict.get('freeze_lora_a', False)),
             lr_scale=float(s_dict.get('lr_scale', 1.0)),
+            eval_every=int(s_dict.get('eval_every', 0)),
+            eval_samples=int(s_dict.get('eval_samples', 64)),
+            batch_size=int(s_dict.get('batch_size', 1)),
+            sparse_p=float(s_dict.get('sparse_p', 1.0)),
+            full_sync_every=(int(s_dict['full_sync_every'])
+                             if s_dict.get('full_sync_every') is not None else None),
+            outer_opt=bool(s_dict.get('outer_opt', False)),
         ))
+    for s in scenarios:
+        _validate_batch_size(s)
     return scenarios
+
+
+def _validate_batch_size(scenario: Scenario) -> None:
+    """Reject batch_size > 1 loudly instead of half-supporting it.
+
+    The field exists because scenarios.yaml should be able to express it, but
+    nothing in the pipeline can currently honour it:
+
+      - samples are variable-length and would need padding, and no
+        attention_mask is ever sent between stages (`_run_forward` calls the
+        model with input_ids / inputs_embeds only), so a padded batch would
+        silently attend to pad tokens and compute a wrong loss;
+      - the samples-consumed axis (§6.5) is derived as `step + 1` for
+        sequential runners, which is only true at batch size 1 — a larger
+        batch would mislabel every x-coordinate in every comparison.
+
+    Both failures produce plausible-looking curves, which is precisely why
+    this raises rather than warns. Phase 1.3 also asks for the >1 case to be
+    verified against the 0.9 GB VRAM cap on a real worker first; until that
+    measurement exists there is nothing to enable.
+    """
+    if scenario.batch_size != 1:
+        raise ValueError(
+            f"Scenario '{scenario.name}': batch_size={scenario.batch_size} is not "
+            f"supported. Padded batching needs attention_mask plumbed through the "
+            f"pipeline stages and a samples-axis fix, and must be verified against "
+            f"the 0.9 GB per-worker VRAM cap first. Use batch_size: 1."
+        )
 
 # NOTE: generate_compose_file is NOT currently used — the benchmark drives
 # docker-compose.internet.yml directly (see run_orchestration). Kept here for
@@ -306,25 +366,202 @@ ZORBULAX4_FACTS = [
 ]
 
 
-def prepare_dataset(model_id: str, dataset_name: str = "zorbulax4") -> List[Dict[str, Any]]:
-    """Scenario-parameterised dataset (§6.7): swapping corpora should be a
-    scenarios.yaml entry, not a code change. zorbulax4 stays permanently as
-    the smoke test / correctness fixture."""
-    if dataset_name != "zorbulax4":
-        raise ValueError(f"Unknown dataset '{dataset_name}' — add it here to enable it.")
+# ── alpaca1k (Phase 1.1) ────────────────────────────────────────────────────
+#
+# The 4-sample zorbulax4 fixture is maximally NON-I.I.D. under sharding:
+# replicas memorize different facts and the merge erases both. Every
+# averaging-quality conclusion has to come from an i.i.d.-shardable corpus
+# instead, which is what this is for. zorbulax4 stays permanently as the
+# fast smoke-test / correctness fixture — it is not being replaced, it is
+# being demoted to the role it is actually valid for.
+
+ALPACA_HF_DATASET = "yahma/alpaca-cleaned"
+ALPACA_TRAIN_N = 1000
+ALPACA_EVAL_N = 200
+# Fixed selection seed + fixed slice = the same 1,200 examples on every
+# machine, every run, forever. If this is ever changed, results from before
+# and after the change are not comparable and must not be pooled.
+ALPACA_SELECTION_SEED = 20250811
+ALPACA_MAX_LENGTH = 512
+
+_ALPACA_WITH_INPUT = (
+    "Below is an instruction that describes a task, paired with an input that "
+    "provides further context. Write a response that appropriately completes "
+    "the request.\n\n"
+    "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n"
+)
+_ALPACA_NO_INPUT = (
+    "Below is an instruction that describes a task. Write a response that "
+    "appropriately completes the request.\n\n"
+    "### Instruction:\n{instruction}\n\n### Response:\n"
+)
+
+# (model_id, dataset_tag) -> (train_samples, eval_samples). Tokenizing 1,200
+# examples is cheap but not free, and prepare_dataset / prepare_eval_dataset
+# are called independently — building both splits in one pass also guarantees
+# they can never drift out of sync.
+_ALPACA_CACHE: Dict[tuple, tuple] = {}
+
+
+def _encode_pair(
+    tok: Any,
+    prompt_text: str,
+    answer_text: str,
+    max_length: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Tokenize one (prompt, answer) pair, masking prompt tokens to -100.
+
+    This is the single encoding path for every corpus, so the alpaca samples
+    are shaped EXACTLY like the zorbulax ones: {input_ids, labels, payload}
+    with payload = safetensors_save({input_ids, labels}). MeshRunner and
+    DistributedRunner consume `payload`; local runners consume the tensors.
+
+    Returns None when, after truncation, not a single answer token survives.
+    Such a sample has labels that are ALL -100, and F.cross_entropy over an
+    entirely-ignored target returns NaN — which propagates through the loss
+    curve, the mean, and the evaluator without ever raising. Dropping the
+    sample is the only safe handling.
+    """
+    input_ids = tok(prompt_text + answer_text, return_tensors="pt").input_ids.to(torch.long)
+    prompt_len = len(tok(prompt_text, return_tensors="pt").input_ids[0])
+
+    if max_length is not None and input_ids.shape[1] > max_length:
+        input_ids = input_ids[:, :max_length]
+
+    # Need at least one supervised token: the loss shifts by one, so the
+    # number of contributing positions is exactly (seq_len - prompt_len).
+    if prompt_len >= input_ids.shape[1]:
+        return None
+
+    labels = input_ids.clone()
+    labels[0, :prompt_len] = -100
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "payload": safetensors_save({"input_ids": input_ids, "labels": labels}),
+    }
+
+
+def _alpaca_prompt(example: Dict[str, Any]) -> tuple:
+    """Standard Stanford-Alpaca prompt template."""
+    instruction = (example.get("instruction") or "").strip()
+    extra_input = (example.get("input") or "").strip()
+    output = (example.get("output") or "").strip()
+    if extra_input:
+        prompt = _ALPACA_WITH_INPUT.format(instruction=instruction, input=extra_input)
+    else:
+        prompt = _ALPACA_NO_INPUT.format(instruction=instruction)
+    return prompt, output
+
+
+def _build_alpaca1k(model_id: str) -> tuple:
+    """Deterministically select and tokenize 1,000 train + 200 eval examples.
+
+    Determinism has three parts, all of which matter:
+      1. a FIXED shuffle seed over the raw dataset order,
+      2. a FIXED slice taken from that shuffled order,
+      3. a deterministic skip rule (drop samples with no surviving answer
+         token), applied while walking the shuffled order — so the survivors
+         are a pure function of (dataset, seed, tokenizer, max_length).
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError as error:
+        raise RuntimeError(
+            "The `datasets` package is required for the alpaca1k corpus. "
+            "Install it: pip install 'datasets>=2.14.4'"
+        ) from error
+
+    tok = AutoTokenizer.from_pretrained(model_id)
+    raw = load_dataset(ALPACA_HF_DATASET, split="train")
+
+    order = list(range(len(raw)))
+    random.Random(ALPACA_SELECTION_SEED).shuffle(order)
+
+    wanted = ALPACA_TRAIN_N + ALPACA_EVAL_N
+    kept: List[Dict[str, Any]] = []
+    skipped = 0
+    lengths: List[int] = []
+    for i in order:
+        if len(kept) >= wanted:
+            break
+        prompt_text, answer_text = _alpaca_prompt(raw[i])
+        if not answer_text:
+            skipped += 1
+            continue
+        sample = _encode_pair(tok, prompt_text, answer_text, ALPACA_MAX_LENGTH)
+        if sample is None:
+            skipped += 1
+            continue
+        lengths.append(int(sample["input_ids"].shape[1]))
+        kept.append(sample)
+
+    if len(kept) < wanted:
+        raise RuntimeError(
+            f"alpaca1k: only {len(kept)} usable examples from {ALPACA_HF_DATASET} "
+            f"(wanted {wanted}, skipped {skipped}). Raise ALPACA_MAX_LENGTH or "
+            f"pick a different corpus."
+        )
+
+    train = kept[:ALPACA_TRAIN_N]
+    held_out = kept[ALPACA_TRAIN_N:wanted]
+
+    lengths_sorted = sorted(lengths)
+    logging.info(
+        f"alpaca1k[{model_id}]: {len(train)} train + {len(held_out)} eval from "
+        f"{ALPACA_HF_DATASET} (seed={ALPACA_SELECTION_SEED}, "
+        f"max_length={ALPACA_MAX_LENGTH}, skipped={skipped}); token lengths "
+        f"min/median/p95/max = {lengths_sorted[0]}/"
+        f"{lengths_sorted[len(lengths_sorted) // 2]}/"
+        f"{lengths_sorted[int(len(lengths_sorted) * 0.95)]}/{lengths_sorted[-1]}"
+    )
+    return train, held_out
+
+
+def _alpaca1k(model_id: str) -> tuple:
+    key = (model_id, ALPACA_HF_DATASET, ALPACA_TRAIN_N, ALPACA_EVAL_N,
+           ALPACA_SELECTION_SEED, ALPACA_MAX_LENGTH)
+    if key not in _ALPACA_CACHE:
+        _ALPACA_CACHE[key] = _build_alpaca1k(model_id)
+    return _ALPACA_CACHE[key]
+
+
+def _zorbulax4(model_id: str) -> List[Dict[str, Any]]:
     tok = AutoTokenizer.from_pretrained(model_id)
     samples = []
     for prompt_text, answer_text in ZORBULAX4_FACTS:
-        input_ids = tok(prompt_text + answer_text, return_tensors="pt").input_ids.to(torch.long)
-        prompt_len = len(tok(prompt_text, return_tensors="pt").input_ids[0])
-        labels = input_ids.clone()
-        labels[0, :prompt_len] = -100
-        samples.append({
-            "input_ids": input_ids,
-            "labels": labels,
-            "payload": safetensors_save({"input_ids": input_ids, "labels": labels}),
-        })
+        sample = _encode_pair(tok, prompt_text, answer_text)
+        assert sample is not None, "zorbulax4 fixture must always encode"
+        samples.append(sample)
     return samples
+
+
+def prepare_dataset(model_id: str, dataset_name: str = "zorbulax4") -> List[Dict[str, Any]]:
+    """Scenario-parameterised dataset (§6.7): swapping corpora should be a
+    scenarios.yaml entry, not a code change. zorbulax4 stays permanently as
+    the smoke test / correctness fixture; alpaca1k is the corpus that
+    averaging-quality conclusions are drawn from."""
+    if dataset_name == "zorbulax4":
+        return _zorbulax4(model_id)
+    if dataset_name == "alpaca1k":
+        return _alpaca1k(model_id)[0]
+    raise ValueError(f"Unknown dataset '{dataset_name}' — add it here to enable it.")
+
+
+def prepare_eval_dataset(model_id: str, dataset_name: str = "zorbulax4") -> List[Dict[str, Any]]:
+    """Held-out split, in the same shape as the training split.
+
+    zorbulax4 deliberately returns an EMPTY list rather than a held-out slice.
+    It is a 4-fact memorization fixture: there is no generalization to
+    measure, and carving out a "held-out fact" would produce a curve that
+    never moves and reads as a failed run. Callers must treat [] as "this
+    corpus has no eval split" and skip eval entirely.
+    """
+    if dataset_name == "zorbulax4":
+        return []
+    if dataset_name == "alpaca1k":
+        return _alpaca1k(model_id)[1]
+    raise ValueError(f"Unknown dataset '{dataset_name}' — add it here to enable it.")
 
 
 def _to_samples_axis(curve: List) -> List:
@@ -446,6 +683,7 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
     
     try:
         datasets: Dict[tuple, List[Dict[str, Any]]] = {}
+        eval_datasets: Dict[tuple, List[Dict[str, Any]]] = {}
         for scenario in scenarios:
             logging.info(f"--- Running Scenario: {scenario.name} ---")
 
@@ -456,6 +694,22 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
             scenario_lr = lr * scenario.lr_scale
             os.environ["KIWI_LR"] = repr(scenario_lr)
             os.environ["KIWI_FREEZE_LORA_A"] = "1" if scenario.freeze_lora_a else "0"
+            # Sparsity / outer-opt reach the cluster as /average HEADERS (see
+            # MeshRunner._average), not as container env. Exported anyway so
+            # `docker compose config` and any manually-started gateway agree
+            # with what the harness is about to request — a gateway defaulting
+            # to dense while the harness asks for p=0.05 would run the wrong
+            # arm and label it correctly, which is the worst kind of wrong.
+            os.environ["KIWI_SPARSE_P"] = repr(scenario.sparse_p)
+            os.environ["KIWI_OUTER_OPT"] = "1" if scenario.outer_opt else "0"
+            if scenario.full_sync_every is not None:
+                os.environ["KIWI_FULL_SYNC_EVERY"] = str(scenario.full_sync_every)
+            if scenario.sparse_p != 1.0 or scenario.outer_opt:
+                logging.info(
+                    f"{scenario.name}: averaging mechanism — "
+                    f"p={scenario.sparse_p:g}, outer_opt={scenario.outer_opt}, "
+                    f"full_sync_every={scenario.full_sync_every or 'gateway default'}"
+                )
             if scenario.lr_scale != 1.0:
                 logging.info(f"{scenario.name}: LR scaled x{scenario.lr_scale} "
                              f"-> {scenario_lr:g} (linear scaling rule for "
@@ -466,11 +720,33 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                 datasets[ds_key] = prepare_dataset(scenario.model, scenario.dataset)
             dataset = datasets[ds_key]
 
+            eval_dataset: List[Dict[str, Any]] = []
+            if scenario.eval_every > 0:
+                if ds_key not in eval_datasets:
+                    eval_datasets[ds_key] = prepare_eval_dataset(scenario.model, scenario.dataset)
+                eval_dataset = eval_datasets[ds_key]
+                if not eval_dataset:
+                    # zorbulax4 has no held-out split by construction. Say so
+                    # once rather than emitting an empty eval_curve that reads
+                    # downstream as "eval ran and found nothing".
+                    logging.warning(
+                        f"{scenario.name}: eval_every={scenario.eval_every} but dataset "
+                        f"'{scenario.dataset}' has no held-out split — eval disabled."
+                    )
+            eval_kwargs = {
+                "eval_dataset": eval_dataset,
+                "eval_every": scenario.eval_every if eval_dataset else 0,
+                "eval_samples": scenario.eval_samples,
+            }
+
             target_loss = scenario.target_loss
 
             curves = []
+            eval_curves = []
             replica_curves_all = []
             events_all = []
+            spread_all = []
+            profiles_all = []
             
             if len(scenario.workers) == 0:
                 if scenario.name == "single_machine_offload":
@@ -579,8 +855,11 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                     scenario_metrics = []
                     for i in range(scenario.num_seeds):
                         logging.info(f"Seed run {i+1}/{scenario.num_seeds} for {scenario.name}")
-                        res = runner.run_training(scenario.model, dataset, scenario.epochs, scenario.name, i+1)
+                        res = runner.run_training(scenario.model, dataset, scenario.epochs,
+                                                  scenario.name, i+1, **eval_kwargs)
                         curves.append(res["curve"])
+                        if res.get("eval_curve"):
+                            eval_curves.append(res["eval_curve"])
                         scenario_metrics.append(res["metrics"])
             else:
                 # Distributed Run — compose file is a scenario parameter
@@ -599,6 +878,9 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                         average_every=scenario.average_every,
                         worker_ports=[8000 + i for i in range(len(scenario.workers))],
                         shard_mode=scenario.shard_mode,
+                        sparse_p=scenario.sparse_p,
+                        outer_opt=scenario.outer_opt,
+                        full_sync_every=scenario.full_sync_every,
                     )
                 else:
                     runner = DistributedRunner(gateway_url=gateway_url)
@@ -629,13 +911,20 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
 
                     if use_mesh:
                         res = runner.run_training(scenario.model, dataset, scenario.epochs,
-                                                  scenario.name, i+1, kill_hook=kill_hook)
+                                                  scenario.name, i+1, kill_hook=kill_hook,
+                                                  **eval_kwargs)
                         replica_curves_all.append(res.get("replica_curves", {}))
                         events_all.append(res.get("events", []))
+                        if res.get("spread_curve"):
+                            spread_all.append(res["spread_curve"])
+                        if res["metrics"].get("round_profile_ms"):
+                            profiles_all.append(res["metrics"]["round_profile_ms"])
                     else:
                         res = runner.run_training(scenario.model, dataset, scenario.epochs,
-                                                  scenario.name, i+1)
+                                                  scenario.name, i+1, **eval_kwargs)
                     curves.append(res["curve"])
+                    if res.get("eval_curve"):
+                        eval_curves.append(res["eval_curve"])
                     scenario_metrics.append(res["metrics"])
 
                 logging.info("Tearing down cluster after distributed scenario...")
@@ -647,10 +936,40 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                 # MeshRunner already reports the samples-consumed axis.
                 curves = [_to_samples_axis(c) for c in curves]
             results_out["runs"][scenario.name] = curves
+            # Eval curves are emitted on the samples-consumed axis by EVERY
+            # runner already (the x value is the sample counter at the moment
+            # of measurement), so they must NOT go through _to_samples_axis —
+            # that would shift every point by one and put train and eval
+            # curves on subtly different axes.
+            if eval_curves:
+                results_out.setdefault("eval_runs", {})[scenario.name] = eval_curves
             if replica_curves_all:
                 results_out.setdefault("replica_runs", {})[scenario.name] = replica_curves_all
             if events_all:
                 results_out.setdefault("events", {})[scenario.name] = events_all
+            if spread_all:
+                results_out.setdefault("spread_runs", {})[scenario.name] = spread_all
+            if profiles_all:
+                results_out.setdefault("round_profiles", {})[scenario.name] = profiles_all
+            # Record the mechanism next to the numbers. Six months from now,
+            # "dp2_sparse5" is only a name; this is what makes a result
+            # self-describing rather than dependent on a matching scenarios.yaml.
+            results_out.setdefault("scenario_config", {})[scenario.name] = {
+                "dataset": scenario.dataset,
+                "epochs": scenario.epochs,
+                "replicas": scenario.replicas,
+                "average_every": scenario.average_every,
+                "shard_mode": scenario.shard_mode,
+                "sparse_p": scenario.sparse_p,
+                "full_sync_every": scenario.full_sync_every,
+                "outer_opt": scenario.outer_opt,
+                "lr_scale": scenario.lr_scale,
+                "freeze_lora_a": scenario.freeze_lora_a,
+                "eval_every": scenario.eval_every,
+                "eval_samples": scenario.eval_samples,
+                "batch_size": scenario.batch_size,
+                "num_seeds": scenario.num_seeds,
+            }
             if len(scenario_metrics) > 0:
                 avg_peak_mem = sum(m["peak_gpu_mb"] for m in scenario_metrics) / len(scenario_metrics)
                 avg_step_time = sum(m["step_time_ms"] for m in scenario_metrics) / len(scenario_metrics)
@@ -670,28 +989,72 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
         logging.info("Running convergence evaluator...")
         evaluator = ConvergenceEvaluator(target_loss=target_loss)
         runs = results_out["runs"]
+        eval_runs = results_out.get("eval_runs", {})
         all_metrics = results_out["metrics"]
+        cfg = results_out.get("scenario_config", {})
 
         def _step_ms(name: str) -> float:
             return all_metrics.get(name, {}).get("avg_step_time_ms", 0.0)
 
-        dp1_name = "dp1" if "dp1" in runs else "distributed_3stage"
-        dp1_curves = runs.get(dp1_name, [])
+        def _dataset_of(name: str) -> str:
+            return cfg.get(name, {}).get("dataset", "zorbulax4")
 
         evaluations: Dict[str, Any] = {}
-        # Primary (§6.5): every mesh scenario vs the dp1 control at equal
-        # samples consumed. dp1 is non-negotiable — without it "averaging
-        # works" can't be separated from "we changed the compute".
-        for name, cs in runs.items():
-            if name.startswith("dp") and name != dp1_name and cs and dp1_curves:
-                evaluations[f"{name}_vs_{dp1_name}"] = evaluator.evaluate(
-                    dp1_curves, cs, dp1_name, name, _step_ms(dp1_name), _step_ms(name))
-        # Legacy comparison: pipeline vs single-machine reference.
-        single_curves = runs.get("single_machine", [])
-        if single_curves and dp1_curves:
-            evaluations[f"{dp1_name}_vs_single_machine"] = evaluator.evaluate(
-                single_curves, dp1_curves, "single_machine", dp1_name,
-                _step_ms("single_machine"), _step_ms(dp1_name))
+
+        def _compare(control: str, treatment: str) -> None:
+            """Record one comparison, held-out loss primary where available."""
+            if control == treatment:
+                return
+            if not runs.get(control) or not runs.get(treatment):
+                return
+            evaluations[f"{treatment}_vs_{control}"] = evaluator.evaluate(
+                runs[control], runs[treatment], control, treatment,
+                _step_ms(control), _step_ms(treatment),
+                control_eval_curves=eval_runs.get(control),
+                treatment_eval_curves=eval_runs.get(treatment),
+            )
+
+        # Controls are per-DATASET. Comparing an alpaca1k arm against the
+        # zorbulax4 dp1 control would be meaningless — different corpus,
+        # different loss scale, different number of samples — but the curves
+        # would interpolate and produce a confident, wrong verdict. Dataset
+        # comes from the recorded scenario_config, not from the name.
+        pipeline_controls: Dict[str, str] = {}
+        for candidate in ("dp1_alpaca", "dp1", "distributed_3stage"):
+            if runs.get(candidate):
+                pipeline_controls.setdefault(_dataset_of(candidate), candidate)
+        reference_controls: Dict[str, str] = {}
+        for candidate in ("sm_alpaca", "single_machine"):
+            if runs.get(candidate):
+                reference_controls.setdefault(_dataset_of(candidate), candidate)
+
+        # ── Primary (§6.5): every mesh arm vs its dp1 control ──
+        # dp1 is non-negotiable — without it "averaging works" cannot be
+        # separated from "we changed the compute".
+        for name in runs:
+            if name.startswith("dp"):
+                control = pipeline_controls.get(_dataset_of(name))
+                if control:
+                    _compare(control, name)
+
+        # ── The Phase 5 A/B: each mechanism vs plain uniform averaging ──
+        # Gate 4 is "beats plain dp2", which the dp1 comparison cannot answer:
+        # both arms may trail dp1 while one clearly beats the other, and that
+        # is the result the whole plan exists to produce.
+        for baseline in ("dp2_alpaca", "dp2"):
+            if not runs.get(baseline):
+                continue
+            baseline_ds = _dataset_of(baseline)
+            for name in runs:
+                if (name.startswith("dp2") and name != baseline
+                        and _dataset_of(name) == baseline_ds):
+                    _compare(baseline, name)
+
+        # ── Pipeline vs single-machine reference, per dataset ──
+        for dataset, control in pipeline_controls.items():
+            reference = reference_controls.get(dataset)
+            if reference:
+                _compare(reference, control)
 
         results_out["evaluation"] = evaluations
 
@@ -718,7 +1081,60 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kiwi Training Convergence Benchmark")
     parser.add_argument("--config", type=str, default="benchmarks_training/scenarios.yaml")
+    # The suite is now 24 scenarios and the alpaca1k arms run for hours. Each
+    # gate in IMPLEMENTATION_PLAN.md needs a specific subset, so make that a
+    # flag rather than a yaml edit — an edited scenarios.yaml is a silent,
+    # uncommitted difference between the run and the file describing it.
+    parser.add_argument(
+        "--only", type=str, default="",
+        help="Comma-separated scenario names to run (default: all). "
+             "Example: --only sm_alpaca,dp1_alpaca",
+    )
+    parser.add_argument(
+        "--output", type=str, default="benchmark_results",
+        help="Directory for the results JSON. Use a per-gate directory to "
+             "avoid overwriting a previous gate's results.",
+    )
+    parser.add_argument(
+        "--list", action="store_true", help="List scenario names and exit.",
+    )
+    parser.add_argument(
+        "--seeds", type=int, default=0,
+        help="Override num_seeds for every selected scenario (0 = use the "
+             "value in the config). Use --seeds 1 for a smoke run; never "
+             "report a 1-seed result as a gate.",
+    )
     args = parser.parse_args()
-    
+
     scenarios = load_scenarios(args.config)
-    run_orchestration(scenarios)
+
+    if args.list:
+        for s in scenarios:
+            print(f"{s.name:24s} dataset={s.dataset:10s} R={s.replicas} X={s.average_every} "
+                  f"p={s.sparse_p:g} outer={s.outer_opt} seeds={s.num_seeds}")
+        sys.exit(0)
+
+    if args.only:
+        wanted = [n.strip() for n in args.only.split(",") if n.strip()]
+        known = {s.name for s in scenarios}
+        missing = [n for n in wanted if n not in known]
+        if missing:
+            # Fail rather than silently running a subset: a typo would
+            # otherwise produce a result file missing its control, and every
+            # comparison against that control would be quietly absent.
+            raise SystemExit(
+                f"Unknown scenario(s): {', '.join(missing)}\n"
+                f"Available: {', '.join(sorted(known))}"
+            )
+        order = {n: i for i, n in enumerate(wanted)}
+        scenarios = sorted((s for s in scenarios if s.name in order),
+                           key=lambda s: order[s.name])
+
+    if args.seeds > 0:
+        logging.warning(f"Overriding num_seeds -> {args.seeds} for all selected scenarios")
+        for s in scenarios:
+            s.num_seeds = args.seeds
+
+    logging.info(f"Running {len(scenarios)} scenario(s): "
+                 f"{', '.join(s.name for s in scenarios)}")
+    run_orchestration(scenarios, output_dir=args.output)

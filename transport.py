@@ -103,7 +103,15 @@ class KiwiTransport(ABC):
 
 
 class HttpTransport(KiwiTransport):
-    """HTTP transport implementation wrapping httpx.AsyncClient."""
+    """HTTP transport implementation wrapping httpx.AsyncClient.
+
+    The client is created ONCE and reused (Phase 2.2). Constructing an
+    AsyncClient per send throws away the connection pool every time, so every
+    forward / backward / adapter send paid a fresh TCP handshake — on the
+    averaging round that is one handshake per peer per round, per stage,
+    across every worker simultaneously. Reuse also lets keep-alive do its job
+    on the hot /forward path, which runs once per training step.
+    """
 
     def __init__(self, node_url: str = "") -> None:
         self._node_url = node_url.rstrip("/")
@@ -111,11 +119,35 @@ class HttpTransport(KiwiTransport):
         self._generate_handler: Callable | None = None
         self._backward_handler: Callable | None = None
         self._adapter_handler: Callable | None = None
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Lazily create the shared client.
+
+        Lazy rather than in __init__ because httpx binds its transport to the
+        running event loop; building it at construction time (which happens
+        before the loop starts in some entrypoints) yields a client attached
+        to the wrong loop.
+        """
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                # Per-request timeouts are passed explicitly at each call site;
+                # this is only the fallback.
+                timeout=httpx.Timeout(60.0, connect=10.0),
+                limits=httpx.Limits(
+                    max_keepalive_connections=32, max_connections=128
+                ),
+            )
+        return self._client
 
     async def start(self) -> None:
+        self._get_client()
         logger.info(f"[HttpTransport] Started for node_url={self._node_url}")
 
     async def stop(self) -> None:
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+        self._client = None
         logger.info("[HttpTransport] Stopped.")
 
     async def get_address(self) -> str:
@@ -125,10 +157,11 @@ class HttpTransport(KiwiTransport):
         self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 30.0
     ) -> bytes:
         target_url = f"{target.rstrip('/')}/forward"
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(target_url, headers=headers, content=payload)
-            response.raise_for_status()
-            return response.content
+        response = await self._get_client().post(
+            target_url, headers=headers, content=payload, timeout=timeout
+        )
+        response.raise_for_status()
+        return response.content
 
     async def send_generate(
         self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 60.0
@@ -160,10 +193,11 @@ class HttpTransport(KiwiTransport):
         self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 30.0
     ) -> bytes:
         target_url = f"{target.rstrip('/')}/backward"
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(target_url, headers=headers, content=payload)
-            response.raise_for_status()
-            return response.content
+        response = await self._get_client().post(
+            target_url, headers=headers, content=payload, timeout=timeout
+        )
+        response.raise_for_status()
+        return response.content
 
     def set_backward_handler(
         self, handler: Callable[[dict[str, str], bytes], asyncio.Future[bytes] | bytes]
@@ -174,10 +208,11 @@ class HttpTransport(KiwiTransport):
         self, target: str, payload: bytes, headers: dict[str, str], timeout: float = 30.0
     ) -> bytes:
         target_url = f"{target.rstrip('/')}/adapter"
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(target_url, headers=headers, content=payload)
-            response.raise_for_status()
-            return response.content
+        response = await self._get_client().post(
+            target_url, headers=headers, content=payload, timeout=timeout
+        )
+        response.raise_for_status()
+        return response.content
 
     def set_adapter_handler(
         self, handler: Callable[[dict[str, str], bytes], asyncio.Future[bytes] | bytes]

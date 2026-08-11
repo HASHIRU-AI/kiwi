@@ -56,30 +56,22 @@ class ConvergenceEvaluator:
     def __init__(self, target_loss: float = 1.5):
         self.target_loss = target_loss
 
-    def evaluate(
+    def _compare(
         self,
         control_curves: List[Curve],
         treatment_curves: List[Curve],
-        control_name: str = "control",
-        treatment_name: str = "treatment",
-        control_step_ms: float = 0.0,
-        treatment_step_ms: float = 0.0,
+        control_name: str,
+        treatment_name: str,
     ) -> Dict[str, Any]:
-        """Band-overlap equivalence of two scenario curve sets at equal
-        samples consumed. Curves are per-seed [(samples_consumed, loss)].
-        """
+        """Band-overlap equivalence of two curve sets at equal samples consumed."""
         if not control_curves or not treatment_curves:
-            return {
-                "verdict": None,
-                "error": "Empty curves provided",
-                "measured": {},
-            }
+            return {"passed": None, "error": "Empty curves provided", "measured": {}}
 
         # Common samples range covered by every seed of both scenarios.
         lo = max(min(p[0] for p in c) for c in control_curves + treatment_curves)
         hi = min(max(p[0] for p in c) for c in control_curves + treatment_curves)
         if hi <= lo:
-            return {"verdict": None, "error": "No overlapping samples range", "measured": {}}
+            return {"passed": None, "error": "No overlapping samples range", "measured": {}}
         grid = np.linspace(lo, hi, num=min(200, int(hi - lo) + 1))
 
         ctrl = _interp_on_grid(control_curves, grid)
@@ -102,26 +94,18 @@ class ConvergenceEvaluator:
         stt_pass = bool(stt_gap <= stt_max_std)
         stt_ci = _bootstrap_ci(ctrl_stt, trt_stt)
 
-        # ── Reported, NOT gated: wall-clock ratio (§6.1 caveat) ──
-        wall_clock = None
-        if control_step_ms > 0 and treatment_step_ms > 0:
-            wall_clock = {
-                "ratio_treatment_over_control": treatment_step_ms / control_step_ms,
-                "caveat": "On a shared GPU this measures communication-overlap "
-                          "recovery (ceiling ~1.16x), NOT data-parallel scaling. "
-                          "It gates nothing.",
-            }
-
         return {
-            # The verdict gates ONLY on convergence equivalence.
-            "verdict": bool(final_pass and stt_pass),
-            "axis": "samples_consumed",
-            "compared": {"control": control_name, "treatment": treatment_name},
+            "passed": bool(final_pass and stt_pass),
             "final_loss": {
                 "gap": float(final_gap),
                 "max_std": float(final_max_std),
                 "gap_ci95": final_ci,
                 "passed": final_pass,
+                # Signed, so "the treatment is BETTER" is expressible. The
+                # equivalence gate is symmetric and cannot say that, but the
+                # Phase 4/5 verdict is explicitly about beating a baseline,
+                # not matching it.
+                "delta_treatment_minus_control": float(trt_mean[-1] - ctrl_mean[-1]),
             },
             "samples_to_target": {
                 "target_loss": self.target_loss,
@@ -131,7 +115,6 @@ class ConvergenceEvaluator:
                 "passed": stt_pass,
             },
             "measured": {
-                "wall_clock": wall_clock,
                 control_name: {
                     "final_loss_mean": float(ctrl_mean[-1]),
                     "final_loss_std": float(ctrl_std[-1]),
@@ -151,3 +134,66 @@ class ConvergenceEvaluator:
                 "samples_grid": grid.tolist(),
             },
         }
+
+    def evaluate(
+        self,
+        control_curves: List[Curve],
+        treatment_curves: List[Curve],
+        control_name: str = "control",
+        treatment_name: str = "treatment",
+        control_step_ms: float = 0.0,
+        treatment_step_ms: float = 0.0,
+        control_eval_curves: List[Curve] | None = None,
+        treatment_eval_curves: List[Curve] | None = None,
+    ) -> Dict[str, Any]:
+        """Compare two scenarios at equal samples consumed.
+
+        HELD-OUT loss is the primary comparison whenever eval curves exist
+        (Phase 5). Train loss is kept and reported, but it cannot answer the
+        question this suite is asking: averaging schemes differ in how well
+        the merged model GENERALIZES, and a train curve on a corpus a replica
+        has just seen rewards memorization — which is exactly the behaviour
+        that made the original zorbulax4 conclusions invalid. Train loss is
+        demoted to a diagnostic (it still catches divergence and NaNs).
+
+        `verdict` therefore gates on the eval comparison when one is
+        available, and falls back to train only when it is not, with
+        `primary` recording which was used so no reader has to guess.
+        """
+        train = self._compare(control_curves, treatment_curves,
+                              control_name, treatment_name)
+
+        evaluation = None
+        if control_eval_curves and treatment_eval_curves:
+            evaluation = self._compare(control_eval_curves, treatment_eval_curves,
+                                       control_name, treatment_name)
+
+        primary = "eval_loss" if (evaluation and evaluation.get("passed") is not None) \
+            else "train_loss"
+        verdict = evaluation["passed"] if primary == "eval_loss" else train.get("passed")
+
+        # ── Reported, NOT gated: wall-clock ratio (§6.1 caveat) ──
+        wall_clock = None
+        if control_step_ms > 0 and treatment_step_ms > 0:
+            wall_clock = {
+                "ratio_treatment_over_control": treatment_step_ms / control_step_ms,
+                "caveat": "On a shared GPU this measures communication-overlap "
+                          "recovery (ceiling ~1.16x), NOT data-parallel scaling. "
+                          "It gates nothing.",
+            }
+
+        result: Dict[str, Any] = {
+            "verdict": verdict,
+            "primary": primary,
+            "axis": "samples_consumed",
+            "compared": {"control": control_name, "treatment": treatment_name},
+            "train_loss": train,
+            "eval_loss": evaluation,
+            # Back-compat: existing readers (plot.py, older result files) look
+            # for these at the top level. They mirror the PRIMARY comparison.
+            "final_loss": (evaluation or train).get("final_loss"),
+            "samples_to_target": (evaluation or train).get("samples_to_target"),
+            "measured": dict((evaluation or train).get("measured", {})),
+        }
+        result["measured"]["wall_clock"] = wall_clock
+        return result

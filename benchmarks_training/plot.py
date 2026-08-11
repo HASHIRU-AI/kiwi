@@ -30,6 +30,18 @@ CONFIG_STYLES = {
     "dp2_freeze_a": {"color": "#9467bd", "label": "dp2_freeze_a (A frozen)"},
     "dp2_kill": {"color": "#006d2c", "label": "dp2 + mid-run kill"},
     "dp3": {"color": "#17becf", "label": "dp3 (mesh, R=3)"},
+    # ── Phase 5: the alpaca1k A/B ──
+    # Deliberately distinct hues from the zorbulax4 families above: the two
+    # corpora must never be read as one series on a shared axis.
+    "sm_alpaca": {"color": "#08306b", "label": "sm_alpaca (reference)"},
+    "dp1_alpaca": {"color": "#a50f15", "label": "dp1_alpaca (pipeline control)"},
+    "dp2_alpaca": {"color": "#238b45", "label": "dp2_alpaca (uniform X=2, baseline)"},
+    "dp2_alpaca_lr2x": {"color": "#74c476", "label": "dp2_alpaca lr x2"},
+    "dp2_sparse5": {"color": "#fd8d3c", "label": "dp2_sparse5 (p=0.05, every step)"},
+    "dp2_sparse20": {"color": "#a63603", "label": "dp2_sparse20 (p=0.20)"},
+    "dp2_diloco": {"color": "#6a51a3", "label": "dp2_diloco (dense X=8 + outer)"},
+    "dp2_sparse_diloco": {"color": "#c994c7", "label": "dp2_sparse_diloco"},
+    "dp2_alpaca_kill": {"color": "#00441b", "label": "dp2_alpaca + mid-run kill"},
 }
 
 # Scenarios whose samples-consumed axis is not comparable to the others.
@@ -122,6 +134,123 @@ def plot_convergence(results_path: str, output_dir: str):
     plt.savefig(os.path.join(output_dir, "convergence.png"), dpi=300)
     plt.savefig(os.path.join(output_dir, "convergence.svg"))
     plt.close()
+
+    # ── 1b. HELD-OUT eval loss (Phase 5 — the headline figure) ──
+    #
+    # This is the plot the A/B is decided on. Train loss is kept above as a
+    # diagnostic, but on a corpus a replica has just consumed it rewards
+    # memorization, which is exactly the artifact that made the original
+    # 4-fact conclusions invalid. Train curves are drawn faintly alongside so
+    # a train/eval divergence (overfitting) is visible rather than inferred.
+    eval_runs = data.get("eval_runs", {})
+    if eval_runs:
+        plt.figure(figsize=(14, 8))
+        for config_name, curves in eval_runs.items():
+            curves = [sorted([tuple(p) for p in c]) for c in curves if c]
+            if not curves:
+                continue
+            lo = max(min(p[0] for p in c) for c in curves)
+            hi = min(max(p[0] for p in c) for c in curves)
+            if hi <= lo:
+                continue
+            grid = np.linspace(lo, hi, num=min(200, int(hi - lo) + 1))
+            losses = _interp_curves(curves, grid)
+            mean, std = losses.mean(axis=0), losses.std(axis=0)
+            style = _style(config_name)
+            plt.plot(grid, mean, label=f"{style['label']} (eval)",
+                     color=style["color"], linewidth=2.2, marker="o", markersize=3)
+            plt.fill_between(grid, mean - std, mean + std,
+                             color=style["color"], alpha=0.25)
+
+            train_curves = runs.get(config_name)
+            if train_curves:
+                t_lo = max(min(p[0] for p in c) for c in train_curves)
+                t_hi = min(max(p[0] for p in c) for c in train_curves)
+                if t_hi > t_lo:
+                    t_grid = np.linspace(t_lo, t_hi, num=min(200, int(t_hi - t_lo) + 1))
+                    t_mean = _interp_curves(train_curves, t_grid).mean(axis=0)
+                    plt.plot(t_grid, t_mean, color=style["color"], linewidth=0.9,
+                             alpha=0.35, linestyle=":")
+
+        plt.xlabel("Samples consumed")
+        plt.ylabel("Loss")
+        plt.title("Held-out eval loss at equal samples consumed (PRIMARY)\n"
+                  "solid + markers = eval (fixed held-out probe); "
+                  "dotted = train loss, shown only as a divergence check")
+        plt.legend(fontsize=8, ncol=2)
+        plt.grid(True, linestyle="--", alpha=0.6)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "eval_convergence.png"), dpi=300)
+        plt.savefig(os.path.join(output_dir, "eval_convergence.svg"))
+        plt.close()
+
+        print("\nFinal HELD-OUT loss by scenario (sorted, lower is better):")
+        finals_eval = {}
+        for config_name, curves in eval_runs.items():
+            lasts = [sorted([tuple(p) for p in c])[-1][1] for c in curves if c]
+            if lasts:
+                finals_eval[config_name] = (float(np.mean(lasts)), float(np.std(lasts)),
+                                            len(lasts))
+        for name in sorted(finals_eval, key=lambda n: finals_eval[n][0]):
+            m, sd, k = finals_eval[name]
+            print(f"   {name:22s} {m:9.4f} +/- {sd:7.4f}  ({k} seeds)")
+
+    # ── 1c. Replica spread under sparse averaging (Phase 3.3) ──
+    #
+    # The sawtooth is the claim: adapter L2 distance between same-stage
+    # replicas GROWS across sparse rounds and COLLAPSES to ~0 at each full
+    # sync. A monotonically rising line means replicas are diverging and
+    # "agreement = checkpoint" no longer holds — spare promotion would be
+    # unsound no matter how good the loss curve looks.
+    spread_runs = data.get("spread_runs", {})
+    if spread_runs:
+        plt.figure(figsize=(14, 6))
+        plotted = False
+        for scenario_name, seeds in spread_runs.items():
+            style = _style(scenario_name)
+            for seed_i, points in enumerate(seeds):
+                if not points:
+                    continue
+                xs = [p["samples"] for p in points]
+                ys = [p["spread_l2"] for p in points]
+                plt.plot(xs, ys, color=style["color"], alpha=0.75,
+                         linewidth=1.4,
+                         label=style["label"] if seed_i == 0 else None)
+                full_x = [p["samples"] for p in points if p.get("full_sync")]
+                full_y = [p["spread_l2"] for p in points if p.get("full_sync")]
+                if full_x:
+                    plt.scatter(full_x, full_y, color=style["color"], marker="v",
+                                s=45, zorder=3,
+                                label=(f"{style['label']} full sync"
+                                       if seed_i == 0 else None))
+                plotted = True
+        if plotted:
+            plt.xlabel("Samples consumed")
+            plt.ylabel("Max inter-replica adapter L2 distance")
+            plt.title("Replica spread under sparse averaging\n"
+                      "expected: bounded sawtooth, collapsing to ~0 at each full sync "
+                      "(triangles). A rising trend means divergence.")
+            plt.legend(fontsize=8)
+            plt.grid(True, linestyle="--", alpha=0.6)
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, "replica_spread_l2.png"), dpi=300)
+            plt.savefig(os.path.join(output_dir, "replica_spread_l2.svg"))
+        plt.close()
+
+    # ── 1d. Round-barrier profile (Phase 2 — Gate 2 is < 500 ms) ──
+    profiles = data.get("round_profiles", {})
+    if profiles:
+        print("\nRound barrier profile (mean ms per round, across seeds):")
+        for scenario_name, seeds in profiles.items():
+            keys = sorted({k for s in seeds for k in s})
+            merged = {k: float(np.mean([s[k] for s in seeds if k in s])) for k in keys}
+            total = merged.get("gateway_barrier_total_ms")
+            verdict = ""
+            if total is not None:
+                verdict = "  PASS" if total < 500 else "  FAIL (Gate 2: < 500 ms)"
+            print(f"   {scenario_name}{verdict}")
+            for k in sorted(merged, key=lambda k: -merged[k]):
+                print(f"      {k:36s} {merged[k]:9.1f}")
 
     # ── 2. Bar charts ──
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(18, 11))
@@ -229,6 +358,69 @@ def plot_convergence(results_path: str, output_dir: str):
         plt.savefig(os.path.join(output_dir, "recovery.png"), dpi=300)
         plt.close()
 
+    # ── 4b. Loss vs STEPS PER REPLICA ──
+    # The headline figure for the R=2 investigation. On the samples-consumed
+    # axis an R-replica mesh is handicapped by construction: averaging advances
+    # the group by the MEAN of the R local updates, not their sum, so at equal
+    # samples it has taken only samples/R optimizer steps. Re-plotting against
+    # steps per replica removes that structural difference and shows whether
+    # the mesh is actually on the same trajectory.
+    #
+    # Steps per replica = samples_consumed / R for every mode (each recorded
+    # sample is one replica taking one step), so the per-replica curves give it
+    # directly; R=1 scenarios fall back to the combined curve.
+    def _per_replica_step_curve(name):
+        seeds = replica_runs.get(name)
+        if seeds:
+            per_seed = []
+            for seed in seeds:
+                for c in seed.values():
+                    c = sorted([tuple(p) for p in c])
+                    per_seed.append([loss for _s, loss in c])
+            if not per_seed:
+                return None
+            n = min(len(c) for c in per_seed)
+            if n == 0:
+                return None
+            return np.array([c[:n] for c in per_seed])
+        curves = runs.get(name) or []
+        if not curves:
+            return None
+        n = min(len(c) for c in curves)
+        return np.array([[p[1] for p in sorted([tuple(x) for x in c])[:n]]
+                         for c in curves])
+
+    plt.figure(figsize=(13, 7.5))
+    plotted = False
+    for name in runs:
+        arr = _per_replica_step_curve(name)
+        if arr is None or arr.shape[1] == 0:
+            continue
+        steps = np.arange(1, arr.shape[1] + 1)
+        mean, std = arr.mean(axis=0), arr.std(axis=0)
+        style = _style(name)
+        plt.plot(steps, mean, color=style["color"], linewidth=2,
+                 label=f"{style['label']}  ({arr.shape[1]} steps)")
+        plt.fill_between(steps, mean - std, mean + std,
+                         color=style["color"], alpha=0.20)
+        plotted = True
+
+    if plotted:
+        plt.yscale("log")
+        plt.xlabel("Optimizer steps taken by a single replica")
+        plt.ylabel("Loss (log scale)")
+        plt.title(
+            "Convergence per OPTIMIZER STEP, not per sample\n"
+            "At equal samples an R=2 mesh has taken half the steps — curves "
+            "that stop early did not diverge, they ran out of steps"
+        )
+        plt.legend(fontsize=8, ncol=2)
+        plt.grid(True, which="both", linestyle="--", alpha=0.5)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "convergence_by_steps.png"), dpi=300)
+        plt.savefig(os.path.join(output_dir, "convergence_by_steps.svg"))
+    plt.close()
+
     # ── 5. Diagnostic summary: final loss per scenario, sorted ──
     # With a dozen scenarios the overlaid convergence curves stop being
     # readable, and the question these runs exist to answer ("which knob moves
@@ -250,9 +442,16 @@ def plot_convergence(results_path: str, output_dir: str):
         errs = [finals[n][1] for n in order]
         colors = [_style(n)["color"] for n in order]
         plt.barh(ypos, means, xerr=errs, color=colors, alpha=0.85, capsize=4)
+        def _steps(n):
+            seeds = replica_runs.get(n)
+            if seeds and seeds[0]:
+                return min(len(c) for c in seeds[0].values())
+            cs = runs.get(n) or []
+            return min((len(c) for c in cs), default=0)
+
         labels = [
             _style(n)["label"] + (" *" if n in _INFLATED_SAMPLE_AXIS else "")
-            + f"  (n={finals[n][2]})"
+            + f"  [{_steps(n)} steps/replica, n={finals[n][2]}]"
             for n in order
         ]
         plt.yticks(ypos, labels, fontsize=9)
@@ -266,9 +465,10 @@ def plot_convergence(results_path: str, output_dir: str):
                         label=f"dp1 control = {ref[0]:.4f}")
             plt.legend(loc="lower right", fontsize=9)
 
-        plt.title("Diagnostic summary — which knob moves the R=2 regression?\n"
-                  "* dp2_mirror trains every batch on every replica; compare it "
-                  "per steps-per-replica, not samples consumed")
+        plt.title("Final loss by scenario — note the steps/replica column.\n"
+                  "Scenarios sort almost perfectly by step count, not by data "
+                  "assignment, merge frequency or freeze_a.\n"
+                  "* dp2_mirror trains every batch on every replica.")
         plt.grid(True, axis="x", linestyle="--", alpha=0.5)
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, "diagnostic_summary.png"), dpi=300)
@@ -276,10 +476,11 @@ def plot_convergence(results_path: str, output_dir: str):
         plt.close()
 
         print("\nFinal loss by scenario (sorted):")
+        print(f"   {'scenario':20s} {'final':>9} {'+/-':>8} {'steps/rep':>10} {'seeds':>6}")
         for n in order:
-            m, s, k = finals[n]
-            flag = "   <-- inflated samples axis" if n in _INFLATED_SAMPLE_AXIS else ""
-            print(f"   {n:18s} {m:9.4f} +/- {s:.4f}  (n={k}){flag}")
+            m, sd, k = finals[n]
+            flag = " *" if n in _INFLATED_SAMPLE_AXIS else ""
+            print(f"   {n:20s} {m:9.4f} {sd:8.4f} {_steps(n):>10} {k:>6}{flag}")
 
     print(f"\nPlots saved to {output_dir}")
 

@@ -41,6 +41,19 @@ transport: KiwiTransport | None = None
 HEARTBEAT_SOFT_STALE_SECONDS = float(os.getenv("HEARTBEAT_SOFT_STALE_SECONDS", "30"))
 HEARTBEAT_HARD_STALE_SECONDS = float(os.getenv("HEARTBEAT_HARD_STALE_SECONDS", "120"))
 
+# ── Sparse averaging cadence (Phase 3.3) ────────────────────────────────────
+# Every Nth round is dense (p = 1.0) regardless of the requested sparsity.
+# Sparse rounds leave replicas only approximately equal; the dense round
+# restores exact agreement, which is what "agreement = checkpoint" and
+# zero-cost spare promotion both rest on. 0 disables full syncs entirely —
+# only meaningful for deliberately measuring unbounded drift.
+FULL_SYNC_EVERY = int(os.getenv("KIWI_FULL_SYNC_EVERY", "10"))
+# Default sparsity when a caller does not send X-Sparse-P. 1.0 = the dense
+# path, byte-identical to pre-Phase-3 behaviour.
+SPARSE_P = float(os.getenv("KIWI_SPARSE_P", "1.0"))
+# DiLoCo outer optimizer arm (Phase 4), applied on dense rounds only.
+OUTER_OPT = os.getenv("KIWI_OUTER_OPT", "0") == "1"
+
 
 # ── Pydantic request models ─────────────────────────────────────────────────────
 
@@ -491,13 +504,27 @@ class WorkerRegistry:
                 self._recompute_pipes_locked(worker.model_id)
 
     async def plan_round(
-        self, model_id: str, x: int = 10
+        self, model_id: str, x: int = 10, p: float = 1.0, outer: bool = False,
+        full_sync_every: int | None = None,
     ) -> tuple[int, list[dict[str, object]]]:
         """Compute per-worker round parameters for one averaging round (§3.4).
 
         The gateway is authoritative for BOTH `contribute` and `expect` so
         they stay consistent by construction: actives (workers placed in a
         pipe) are contributors; spares receive without contributing.
+
+        It is also authoritative for `p` and `full` (Phase 3.3). Sparsity has
+        to be decided in ONE place: peers derive their masks from
+        (key, round_id, p) without exchanging them, so two workers that
+        disagreed about p for the same round would average into different
+        coordinates. Letting each worker decide from its own env would make
+        that disagreement a configuration typo away.
+
+        Every KIWI_FULL_SYNC_EVERY rounds the round is dense (p = 1.0). Sparse
+        rounds leave replicas only APPROXIMATELY equal, which breaks
+        "agreement = checkpoint" and weakens spare promotion; the periodic
+        dense round restores exact agreement cheaply, and bounds how far
+        replicas can drift apart in between.
         """
         async with self._lock:
             if not self._pipes_valid(model_id):
@@ -513,7 +540,15 @@ class WorkerRegistry:
             self._round[model_id] = self._round.get(model_id, 0) + 1
             round_id = self._round[model_id]
 
-            active_names = {w.node_name for p in pipes for w in p}
+            # Full-sync cadence. A dense round also carries `outer` when the
+            # DiLoCo arm is enabled — the outer step is only meaningful on a
+            # complete merge (Phase 4).
+            cadence = FULL_SYNC_EVERY if full_sync_every is None else full_sync_every
+            is_full = p >= 1.0 or (cadence > 0 and round_id % cadence == 0)
+            effective_p = 1.0 if is_full else p
+            do_outer = bool(outer and is_full)
+
+            active_names = {w.node_name for pipe in pipes for w in pipe}
             plan: list[dict[str, object]] = []
             for stage_key, members in self._stage_groups(model_id).items():
                 members = sorted(members, key=lambda w: w.node_name)
@@ -522,11 +557,18 @@ class WorkerRegistry:
                 )
                 for w in members:
                     is_contributor = w.node_name in active_names
+                    # Contributors fan out to EVERY other member of the stage,
+                    # spares included — that is what keeps a spare's adapter
+                    # current and its promotion zero-cost. On a sparse round
+                    # spares therefore receive sparse payloads and apply them
+                    # (drift bounded by the full-sync cadence); on a full-sync
+                    # round they receive the dense payload and land exactly on
+                    # the contributors' mean.
                     send_to = (
                         [
-                            _worker_address(p)
-                            for p in members
-                            if p.node_name != w.node_name
+                            _worker_address(peer)
+                            for peer in members
+                            if peer.node_name != w.node_name
                         ]
                         if is_contributor
                         else []
@@ -544,6 +586,9 @@ class WorkerRegistry:
                                 else num_contributors,
                                 "contribute": is_contributor,
                                 "x": x,
+                                "p": effective_p,
+                                "full": is_full,
+                                "outer": do_outer,
                             },
                         }
                     )
@@ -1181,6 +1226,11 @@ async def train_step(request: Request):
         replica_id = int(request.headers.get("x-replica-id", "0"))
     except ValueError:
         raise HTTPException(status_code=400, detail="X-Replica-ID must be an integer")
+    # Held-out eval (Phase 1.2). Forward + loss only on the worker: no
+    # backward, no optimizer step, no step counters. Routed through the SAME
+    # pipeline as a train step on purpose — an eval that took a different code
+    # path would not be measuring the model the mesh actually trained.
+    is_eval = (request.headers.get("x-eval") or request.headers.get("X-Eval", "")) == "1"
     body = await request.body()
     reroutes = 0
 
@@ -1210,6 +1260,7 @@ async def train_step(request: Request):
                     "X-Model-ID": model.model_id,
                     "X-Pipeline": remaining_urls,
                     "X-Reverse-Pipeline": "",
+                    "X-Eval": "1" if is_eval else "0",
                     "Content-Type": "application/octet-stream",
                 },
                 timeout=120.0
@@ -1326,29 +1377,74 @@ async def average_round(request: Request):
     except ValueError:
         raise HTTPException(status_code=400, detail="X-Avg-Interval must be an integer")
 
+    # Per-run sparsity / outer-opt, supplied by the harness so a single
+    # gateway image can serve every arm of the A/B without a rebuild. Falls
+    # back to the env defaults when the header is absent.
     try:
-        round_id, plan = await registry.plan_round(model.model_id, x)
+        p = float(request.headers.get("x-sparse-p") or SPARSE_P)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="X-Sparse-P must be a float")
+    if not (0.0 < p <= 1.0):
+        raise HTTPException(status_code=400, detail="X-Sparse-P must be in (0, 1]")
+    outer_header = request.headers.get("x-outer-opt")
+    outer = OUTER_OPT if outer_header is None else (outer_header == "1")
+    # Header overrides the env so the harness can drive the cadence per
+    # scenario without rebuilding images or editing every compose file.
+    try:
+        fs_header = request.headers.get("x-full-sync-every")
+        full_sync_every = None if fs_header is None else int(fs_header)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="X-Full-Sync-Every must be an integer")
+
+    # ── Phase 2.1 instrumentation ──
+    # The barrier's cost splits into three parts that need different fixes:
+    # planning (gateway-side, under a lock), the per-worker round trip, and
+    # whatever each worker reports internally. Measuring only the total makes
+    # them indistinguishable.
+    barrier_t0 = time.perf_counter()
+
+    plan_t0 = time.perf_counter()
+    try:
+        round_id, plan = await registry.plan_round(
+            model.model_id, x, p=p, outer=outer, full_sync_every=full_sync_every
+        )
     except RuntimeError as error:
         raise HTTPException(status_code=409, detail=str(error))
+    plan_ms = (time.perf_counter() - plan_t0) * 1000
 
+    effective = plan[0]["round"] if plan else {"p": p, "full": p >= 1.0, "outer": False}
     print(
-        f"[gateway] Round {round_id} for {model.model_id}: "
+        f"[gateway] Round {round_id} for {model.model_id} "
+        f"(p={effective['p']:g}{', FULL SYNC' if effective['full'] else ''}"
+        f"{', OUTER' if effective['outer'] else ''}): "
         f"{[(e['node_name'], e['round']['contribute']) for e in plan]}",
         flush=True,
     )
 
-    async def _trigger(entry: dict) -> tuple[str, dict]:
-        try:
-            async with httpx.AsyncClient(timeout=T_AVERAGE) as client:
+    # One client for the whole fan-out. Building an AsyncClient per worker
+    # meant a fresh connection pool and TCP handshake for each /round message
+    # on every round, N times per barrier.
+    async with httpx.AsyncClient(
+        timeout=T_AVERAGE,
+        limits=httpx.Limits(max_keepalive_connections=32, max_connections=64),
+    ) as client:
+
+        async def _trigger(entry: dict) -> tuple[str, dict, float]:
+            t0 = time.perf_counter()
+            try:
                 response = await client.post(
                     f"{entry['node_url']}/round", json=entry["round"]
                 )
                 response.raise_for_status()
-                return entry["node_name"], response.json()
-        except Exception as error:
-            return entry["node_name"], {"status": "error", "error": str(error)}
+                return entry["node_name"], response.json(), (time.perf_counter() - t0) * 1000
+            except Exception as error:
+                return (entry["node_name"], {"status": "error", "error": str(error)},
+                        (time.perf_counter() - t0) * 1000)
 
-    results = await asyncio.gather(*[_trigger(e) for e in plan])
+        results_raw = await asyncio.gather(*[_trigger(e) for e in plan])
+
+    results = [(name, r) for name, r, _ms in results_raw]
+    rtt_ms = {name: ms for name, _r, ms in results_raw}
 
     completed = [name for name, r in results if r.get("status") == "ok"]
     skipped = {name: r for name, r in results if r.get("status") != "ok"}
@@ -1357,11 +1453,28 @@ async def average_round(request: Request):
         # stalled cluster; the next round corrects it.
         print(f"[gateway] Round {round_id} partial — skipped: {skipped}", flush=True)
 
+    barrier_ms = (time.perf_counter() - barrier_t0) * 1000
+    slowest = max(rtt_ms.items(), key=lambda kv: kv[1]) if rtt_ms else ("-", 0.0)
+    print(
+        f"[gateway] Round {round_id} barrier {barrier_ms:.0f} ms "
+        f"(plan {plan_ms:.1f} ms, slowest worker {slowest[0]} {slowest[1]:.0f} ms) | "
+        + " ".join(f"{n}={ms:.0f}" for n, ms in sorted(rtt_ms.items())),
+        flush=True,
+    )
+
     return {
         "round_id": round_id,
         "completed": completed,
         "skipped": skipped,
         "results": {name: r for name, r in results},
+        "p": effective["p"],
+        "full": effective["full"],
+        "outer": effective["outer"],
+        "timings_ms": {
+            "barrier_total": barrier_ms,
+            "plan_round": plan_ms,
+            "worker_rtt": rtt_ms,
+        },
     }
 
 

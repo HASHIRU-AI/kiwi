@@ -24,13 +24,118 @@ SHARED_TRAIN_CONFIG = {
     "lr": float(os.getenv("KIWI_LR", "1e-5"))
 }
 
+# ── Held-out eval (Phase 1.2) ───────────────────────────────────────────────
+#
+# Train loss on a memorization fixture measures memorization. The question
+# this whole plan is asking — does averaging damage the model — is a
+# GENERALIZATION question, so the primary curve has to be held-out loss.
+#
+# Cost control: an eval point costs `eval_samples` forward passes through the
+# whole pipeline. Evaluating all 200 held-out examples every 25 train steps
+# would spend more compute on measurement than on training. Instead every
+# eval point uses the SAME fixed prefix of the held-out split, so points are
+# directly comparable to each other and across scenarios; widen it with
+# `eval_samples` when a tighter estimate matters more than wall clock.
+DEFAULT_EVAL_SAMPLES = 64
+
+
+def _eval_subset(eval_dataset: Optional[List[Dict[str, Any]]],
+                 eval_samples: int) -> List[Dict[str, Any]]:
+    """A FIXED prefix of the held-out split — never a random resample.
+
+    Resampling per eval point would make the curve wobble for reasons that
+    have nothing to do with training, and that wobble would be
+    indistinguishable from the averaging effect being measured.
+    """
+    if not eval_dataset:
+        return []
+    if eval_samples <= 0:
+        return list(eval_dataset)
+    return list(eval_dataset[:eval_samples])
+
+
+def _remote_eval_loss(
+    gateway_url: str,
+    model_id: str,
+    eval_batches: List[Dict[str, Any]],
+    tag: str,
+    replica_id: Optional[int] = None,
+    timeout: float = 180.0,
+) -> Optional[float]:
+    """Mean held-out loss measured THROUGH the live cluster (X-Eval: 1).
+
+    Deliberately routed through /train_step rather than a side channel: an
+    eval that loaded its own copy of the model would measure a different
+    object than the one the mesh has been training, and any bug in the
+    pipeline (bad layer split, stale adapter, failed merge) would be invisible
+    exactly where it matters most. X-Eval: 1 makes the worker run forward +
+    loss only — no backward, no optimizer step, no step-counter increment.
+    """
+    if not eval_batches:
+        return None
+    total, n = 0.0, 0
+    for i, sample in enumerate(eval_batches):
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "X-Model-ID": model_id,
+            "X-Request-ID": f"eval-{tag}-{i}",
+            "X-Eval": "1",
+        }
+        if replica_id is not None:
+            headers["X-Replica-ID"] = str(replica_id)
+        try:
+            resp = httpx.post(f"{gateway_url}/train_step", content=sample["payload"],
+                              headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            total += safetensors_load(resp.content)["loss"].item()
+            n += 1
+        except Exception as error:
+            # An eval failure must never take down a training run — the eval
+            # curve simply gets no point here.
+            logging.warning(f"eval batch {i} failed ({tag}): {error}")
+    return (total / n) if n else None
+
+
+def _local_eval_loss(model, eval_batches: List[Dict[str, Any]]) -> Optional[float]:
+    """Mean held-out loss for an in-process model.
+
+    model.eval() matters: LoRA dropout (p=0.05) is active in train mode and
+    would inflate held-out loss by a noisy constant.
+    """
+    if not eval_batches:
+        return None
+    was_training = model.training
+    model.eval()
+    total = 0.0
+    try:
+        with torch.no_grad():
+            for sample in eval_batches:
+                out = model(
+                    input_ids=sample["input_ids"].to(model.device),
+                    labels=sample["labels"].to(model.device),
+                )
+                total += out.loss.item()
+    finally:
+        if was_training:
+            model.train()
+    return total / len(eval_batches)
+
+
 class BaseRunner:
-    def run_training(self, model_id: str, dataset: List[Dict[str, Any]], epochs: int, scenario_name: str = "unknown", seed_idx: int = 0) -> Dict[str, Any]:
-        """Runs training and returns a dict with 'curve' and 'metrics'."""
+    def run_training(self, model_id: str, dataset: List[Dict[str, Any]], epochs: int,
+                     scenario_name: str = "unknown", seed_idx: int = 0,
+                     eval_dataset: Optional[List[Dict[str, Any]]] = None,
+                     eval_every: int = 0,
+                     eval_samples: int = DEFAULT_EVAL_SAMPLES) -> Dict[str, Any]:
+        """Runs training and returns a dict with 'curve', 'eval_curve' and 'metrics'."""
         raise NotImplementedError
 
 class SingleMachineRunner(BaseRunner):
-    def run_training(self, model_id: str, dataset: List[Dict[str, Any]], epochs: int, scenario_name: str = "unknown", seed_idx: int = 0) -> Dict[str, Any]:
+    def run_training(self, model_id: str, dataset: List[Dict[str, Any]], epochs: int,
+                     scenario_name: str = "unknown", seed_idx: int = 0,
+                     eval_dataset: Optional[List[Dict[str, Any]]] = None,
+                     eval_every: int = 0,
+                     eval_samples: int = DEFAULT_EVAL_SAMPLES) -> Dict[str, Any]:
         device = "cuda"
         dtype = torch.bfloat16
         logging.info(f"Using device: {device}")
@@ -47,19 +152,30 @@ class SingleMachineRunner(BaseRunner):
         
         logging.info(f"Using learning rate: {SHARED_TRAIN_CONFIG['lr']}")
         optimizer = torch.optim.Adam(model.parameters(), lr=SHARED_TRAIN_CONFIG["lr"])
-        
+
         torch.cuda.reset_peak_memory_stats()
-        
+
         total_steps = epochs * len(dataset)
         curve = []
+        eval_curve: List[Tuple[int, float]] = []
+        eval_batches = _eval_subset(eval_dataset, eval_samples)
         step = 0
         total_time = 0.0
-        
+
+        # Point at samples=0, before any training. Without it there is no
+        # anchor showing where the curve started, and "eval loss decreased"
+        # cannot be distinguished from "eval loss was always this low".
+        if eval_batches and eval_every > 0:
+            initial = _local_eval_loss(model, eval_batches)
+            if initial is not None:
+                eval_curve.append((0, initial))
+                logging.info(f"[{scenario_name} seed {seed_idx}] eval@0 | eval_loss {initial:.4f}")
+
         for epoch in range(epochs):
             for sample in dataset:
                 input_ids = sample["input_ids"].to(model.device)
                 labels = sample["labels"].to(model.device)
-                
+
                 start_t = time.time()
                 optimizer.zero_grad()
                 outputs = model(input_ids=input_ids, labels=labels)
@@ -68,23 +184,42 @@ class SingleMachineRunner(BaseRunner):
                 optimizer.step()
                 step_t = time.time() - start_t
                 total_time += step_t
-                
+
                 loss_val = loss.item()
                 curve.append((step, loss_val))
                 logging.info(f"[{scenario_name} seed {seed_idx}] step {step+1}/{total_steps} | loss {loss_val:.4f} | time {step_t:.3f}s")
                 step += 1
-                
+
+                # Batch size is 1 here, so samples consumed == step.
+                if eval_batches and eval_every > 0 and step % eval_every == 0:
+                    eval_loss = _local_eval_loss(model, eval_batches)
+                    if eval_loss is not None:
+                        eval_curve.append((step, eval_loss))
+                        logging.info(f"[{scenario_name} seed {seed_idx}] eval@{step} "
+                                     f"| eval_loss {eval_loss:.4f}")
+
+        # Always finish on an eval point, even if total_steps isn't a multiple
+        # of eval_every — the evaluator compares FINAL loss, so a missing last
+        # point would silently compare different amounts of training.
+        if eval_batches and eval_every > 0 and (not eval_curve or eval_curve[-1][0] != step):
+            final_eval = _local_eval_loss(model, eval_batches)
+            if final_eval is not None:
+                eval_curve.append((step, final_eval))
+                logging.info(f"[{scenario_name} seed {seed_idx}] eval@{step} (final) "
+                             f"| eval_loss {final_eval:.4f}")
+
         peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
         avg_time_ms = (total_time / total_steps) * 1000 if total_steps > 0 else 0
-        
+
         # cleanup
         del model
         del optimizer
         gc.collect()
         torch.cuda.empty_cache()
-        
+
         return {
             "curve": curve,
+            "eval_curve": eval_curve,
             "metrics": {
                 "peak_gpu_mb": float(peak_mem_mb),
                 "step_time_ms": float(avg_time_ms)
@@ -95,7 +230,11 @@ class DistributedRunner(BaseRunner):
     def __init__(self, gateway_url: str = "http://localhost:8080"):
         self.gateway_url = gateway_url
 
-    def run_training(self, model_id: str, dataset: List[Dict[str, Any]], epochs: int, scenario_name: str = "unknown", seed_idx: int = 0) -> Dict[str, Any]:
+    def run_training(self, model_id: str, dataset: List[Dict[str, Any]], epochs: int,
+                     scenario_name: str = "unknown", seed_idx: int = 0,
+                     eval_dataset: Optional[List[Dict[str, Any]]] = None,
+                     eval_every: int = 0,
+                     eval_samples: int = DEFAULT_EVAL_SAMPLES) -> Dict[str, Any]:
         def post(payload, rid):
             r = httpx.post(f"{self.gateway_url}/train_step", content=payload,
                            headers={"Content-Type": "application/octet-stream",
@@ -107,25 +246,47 @@ class DistributedRunner(BaseRunner):
 
         total_steps = epochs * len(dataset)
         curve = []
+        eval_curve: List[Tuple[int, float]] = []
+        eval_batches = _eval_subset(eval_dataset, eval_samples)
         step = 0
         total_time = 0.0
-        
+
+        def _eval_at(samples: int, note: str = "") -> None:
+            eval_loss = _remote_eval_loss(
+                self.gateway_url, model_id, eval_batches,
+                tag=f"s{seed_idx}-n{samples}",
+            )
+            if eval_loss is not None:
+                eval_curve.append((samples, eval_loss))
+                logging.info(f"[{scenario_name} seed {seed_idx}] eval@{samples}{note} "
+                             f"| eval_loss {eval_loss:.4f}")
+
+        if eval_batches and eval_every > 0:
+            _eval_at(0)
+
         for epoch in range(epochs):
             for sample in dataset:
                 start_t = time.time()
                 out = post(sample["payload"], f"step-{step}")
                 step_t = time.time() - start_t
                 total_time += step_t
-                
+
                 loss_val = out["loss"].item()
                 curve.append((step, loss_val))
                 logging.info(f"[{scenario_name} seed {seed_idx}] step {step+1}/{total_steps} | loss {loss_val:.4f} | time {step_t:.3f}s")
                 step += 1
-                
+
+                if eval_batches and eval_every > 0 and step % eval_every == 0:
+                    _eval_at(step)
+
+        if eval_batches and eval_every > 0 and (not eval_curve or eval_curve[-1][0] != step):
+            _eval_at(step, note=" (final)")
+
         avg_time_ms = (total_time / total_steps) * 1000 if total_steps > 0 else 0
-        
+
         return {
             "curve": curve,
+            "eval_curve": eval_curve,
             "metrics": {
                 "peak_gpu_mb": 0.0,
                 "step_time_ms": float(avg_time_ms)
@@ -163,12 +324,21 @@ class MeshRunner(BaseRunner):
         average_every: int = 2,
         worker_ports: Optional[List[int]] = None,
         shard_mode: str = "queue",
+        sparse_p: float = 1.0,
+        outer_opt: bool = False,
+        full_sync_every: Optional[int] = None,
     ):
         self.gateway_url = gateway_url
         self.replicas = replicas          # None -> discover from /registry
         self.x = average_every
         self.worker_ports = worker_ports or []
         self.max_batch_attempts = 10      # give up on a batch (cluster is down)
+        # Averaging mechanism (Phases 3 & 4), sent as headers on /average so a
+        # single gateway image serves every arm of the A/B. p = 1.0 is the
+        # dense path and is byte-identical to pre-Phase-3 behaviour.
+        self.sparse_p = sparse_p
+        self.outer_opt = outer_opt
+        self.full_sync_every = full_sync_every
         # "queue"  — shared queue, consumers race (§3.6). Which facts a replica
         #            sees is re-randomised every window.
         # "static" — replica r permanently owns samples[r::R] (§6.7 static-shard
@@ -192,13 +362,58 @@ class MeshRunner(BaseRunner):
         return len(replica_ids)
 
     def _average(self, model_id: str) -> Dict[str, Any]:
+        headers = {
+            "X-Model-ID": model_id,
+            "X-Avg-Interval": str(self.x),
+            "X-Sparse-P": repr(self.sparse_p),
+            "X-Outer-Opt": "1" if self.outer_opt else "0",
+        }
+        if self.full_sync_every is not None:
+            headers["X-Full-Sync-Every"] = str(self.full_sync_every)
         resp = httpx.post(
-            f"{self.gateway_url}/average",
-            headers={"X-Model-ID": model_id, "X-Avg-Interval": str(self.x)},
-            timeout=180.0,
+            f"{self.gateway_url}/average", headers=headers, timeout=180.0,
         )
         resp.raise_for_status()
         return resp.json()
+
+    def _replica_spread(self, model_id: str) -> Optional[float]:
+        """Max L2 distance between any two same-stage adapters (Phase 3.3).
+
+        This is the number that says whether sparse averaging is doing what it
+        claims: it should stay BOUNDED between full syncs and collapse to ~0
+        at each one. An unbounded spread means the replicas are diverging and
+        "agreement = checkpoint" no longer holds, which would invalidate spare
+        promotion regardless of how good the loss curve looks.
+
+        Pulled from the dense /adapter endpoint, which is unchanged by Phase 3.
+        """
+        if not self.worker_ports:
+            return None
+        by_stage: Dict[Any, List[Any]] = {}
+        for port in self.worker_ports:
+            try:
+                health = httpx.get(f"http://localhost:{port}/health", timeout=5.0).json()
+                if health.get("model_id") != model_id or health.get("status") != "ok":
+                    continue
+                stage = tuple(health.get("layers") or ())
+                resp = httpx.get(f"http://localhost:{port}/adapter", timeout=30.0)
+                resp.raise_for_status()
+                sd = safetensors_load(resp.content)
+                flat = torch.cat([v.detach().float().reshape(-1)
+                                  for _k, v in sorted(sd.items())])
+                by_stage.setdefault(stage, []).append(flat)
+            except Exception:
+                continue
+        worst = 0.0
+        seen = False
+        for vectors in by_stage.values():
+            for i in range(len(vectors)):
+                for j in range(i + 1, len(vectors)):
+                    if vectors[i].shape != vectors[j].shape:
+                        continue
+                    seen = True
+                    worst = max(worst, float((vectors[i] - vectors[j]).norm()))
+        return worst if seen else None
 
     def _peak_gpu_mb(self) -> float:
         peak = 0.0
@@ -220,6 +435,9 @@ class MeshRunner(BaseRunner):
         scenario_name: str = "unknown",
         seed_idx: int = 0,
         kill_hook: Optional[Callable[[int], None]] = None,
+        eval_dataset: Optional[List[Dict[str, Any]]] = None,
+        eval_every: int = 0,
+        eval_samples: int = DEFAULT_EVAL_SAMPLES,
     ) -> Dict[str, Any]:
         R = self.replicas or self._discover_r(model_id)
         if R < 1:
@@ -235,6 +453,9 @@ class MeshRunner(BaseRunner):
         step_times: List[float] = []
         events: List[Dict[str, Any]] = []
         round_times: List[float] = []
+        round_profile: Dict[str, List[float]] = {}
+        spread_curve: List[Dict[str, Any]] = []
+        last_spread_at = [-(10 ** 9)]
         req_counter = [0]
         degraded_samples = [0]
 
@@ -327,6 +548,41 @@ class MeshRunner(BaseRunner):
                         # the observed recovery/resume latency.
                         events.append({"type": "recovered_step", "replica": replica_id,
                                        "samples": n, "resume_ms": step_t * 1000})
+
+        # ── Held-out eval (Phase 1.2) ──
+        # Measured at WINDOW BOUNDARIES, i.e. immediately after the averaging
+        # barrier. That is the only fair place to evaluate a mesh: mid-window
+        # the R replicas hold different weights and "the model's loss" is not
+        # a well-defined quantity, so which replica you happened to ask would
+        # change the answer. Post-merge they agree (exactly, on dense rounds).
+        #
+        # Only ONE replica evaluates, so a mesh doesn't spend R times the eval
+        # compute of dp1 and inflate its own sample counter.
+        eval_curve: List[Tuple[int, float]] = []
+        eval_batches = _eval_subset(eval_dataset, eval_samples)
+        last_eval_at = [-(10 ** 9)]
+
+        def _eval_at(samples: int, note: str = "") -> None:
+            # Prefer replica 0, but fall back through the others: in a kill
+            # scenario replica 0's pipe can be the one that died, and an eval
+            # curve that silently stops at the kill point is worse than useless
+            # — that is exactly the region the recovery run exists to show.
+            for r in range(R):
+                eval_loss = _remote_eval_loss(
+                    self.gateway_url, model_id, eval_batches,
+                    tag=f"s{seed_idx}-n{samples}", replica_id=r,
+                )
+                if eval_loss is not None:
+                    eval_curve.append((samples, eval_loss))
+                    logging.info(f"[{scenario_name} seed {seed_idx}] eval@{samples}{note} "
+                                 f"| eval_loss {eval_loss:.4f} (replica {r})")
+                    return
+            logging.warning(f"[{scenario_name} seed {seed_idx}] eval@{samples} produced "
+                            f"no points on any of {R} replicas")
+
+        if eval_batches and eval_every > 0:
+            _eval_at(0)
+            last_eval_at[0] = 0
 
         total_wall_start = time.time()
         total_steps_target = epochs * len(dataset)
@@ -490,12 +746,56 @@ class MeshRunner(BaseRunner):
             round_start = time.time()
             result = self._average(model_id)
             round_times.append(time.time() - round_start)
+
+            # Phase 2.1: keep the barrier profile in the RESULTS FILE, not
+            # only in container logs. "avg_round_ms < 500" is a gate, and a
+            # gate you can only check by grepping stdout of a run that has
+            # already been torn down is not a gate.
+            gw = result.get("timings_ms") or {}
+            for key in ("barrier_total", "plan_round"):
+                if key in gw:
+                    round_profile.setdefault(f"gateway_{key}_ms", []).append(float(gw[key]))
+            for rtt in (gw.get("worker_rtt") or {}).values():
+                round_profile.setdefault("worker_rtt_ms", []).append(float(rtt))
+            for worker_result in (result.get("results") or {}).values():
+                for key, value in (worker_result.get("timings_ms") or {}).items():
+                    round_profile.setdefault(f"worker_{key}", []).append(float(value))
+
+            # Replica spread, sampled at the same cadence as eval. Recorded
+            # WITH the round's `full` flag so the plot can show the sawtooth:
+            # spread grows across sparse rounds and collapses at each full
+            # sync. Sampling only on full-sync rounds would show a flat zero
+            # line and prove nothing.
+            if self.sparse_p < 1.0 and eval_every > 0 and (
+                n_now - last_spread_at[0] >= eval_every
+            ):
+                last_spread_at[0] = n_now
+                spread = self._replica_spread(model_id)
+                if spread is not None:
+                    spread_curve.append({
+                        "samples": n_now,
+                        "round_id": result.get("round_id"),
+                        "spread_l2": spread,
+                        "full_sync": bool(result.get("full")),
+                    })
             with lock:
                 n_now = samples_consumed
             logging.info(
                 f"[{scenario_name} seed {seed_idx}] samples {n_now}/{total_steps_target} "
                 f"| round {result['round_id']} completed={len(result['completed'])}"
             )
+
+            # Post-merge eval, throttled by eval_every. A window is only R*X
+            # samples wide (4 at R=2, X=2), so evaluating at EVERY boundary
+            # would run ~250 evals per alpaca1k epoch and cost far more than
+            # the training itself. Throttle on samples consumed, not on window
+            # count, so the cadence is identical across scenarios with
+            # different X — otherwise dp2_x20 and dp2_x1 would be measured at
+            # completely different resolutions and their curves would not be
+            # comparable.
+            if eval_batches and eval_every > 0 and (n_now - last_eval_at[0]) >= eval_every:
+                last_eval_at[0] = n_now
+                _eval_at(n_now)
 
             # Fire the kill hook at epoch boundaries. Windows may now span
             # epochs, so derive completed epochs from the stream position
@@ -509,8 +809,16 @@ class MeshRunner(BaseRunner):
         total_wall = time.time() - total_wall_start
         avg_step_ms = (sum(step_times) / len(step_times)) * 1000 if step_times else 0.0
 
+        # Always finish on an eval point so final-loss comparisons are made at
+        # the same amount of training in every scenario.
+        if eval_batches and eval_every > 0 and (
+            not eval_curve or eval_curve[-1][0] != samples_consumed
+        ):
+            _eval_at(samples_consumed, note=" (final)")
+
         return {
             "curve": sorted(combined_curve),          # [(samples_consumed, loss)]
+            "eval_curve": eval_curve,                 # [(samples_consumed, eval_loss)]
             "replica_curves": {str(r): c for r, c in replica_curves.items()},
             "metrics": {
                 "peak_gpu_mb": self._peak_gpu_mb(),
@@ -521,12 +829,22 @@ class MeshRunner(BaseRunner):
                 "replicas": R,
                 "average_every": X,
                 "shard_mode": self.shard_mode,
+                "sparse_p": self.sparse_p,
+                "outer_opt": self.outer_opt,
                 # Fraction of this seed trained below nominal R. Anything
                 # above 0 means the curve is a blend of dp{R} and dp{<R} and
                 # should not be pooled with clean seeds without saying so.
                 "degraded_sample_fraction": (degraded_samples[0] / samples_consumed)
                                             if samples_consumed else 0.0,
             },
+            # Mean of every barrier sub-step across all rounds and all
+            # workers. This is the artifact that says WHERE the round time
+            # went, so a Gate 2 failure points at a substep instead of at
+            # "the barrier".
+            "round_profile_ms": {
+                k: (sum(v) / len(v)) for k, v in sorted(round_profile.items()) if v
+            },
+            "spread_curve": spread_curve,
             "events": events,
         }
 
@@ -626,7 +944,11 @@ class MeshRunner(BaseRunner):
 _qlora_fraction_set = False
 
 class QLoRARunner(BaseRunner):
-    def run_training(self, model_id: str, dataset: List[Dict[str, Any]], epochs: int, scenario_name: str = "unknown", seed_idx: int = 0) -> Dict[str, Any]:
+    def run_training(self, model_id: str, dataset: List[Dict[str, Any]], epochs: int,
+                     scenario_name: str = "unknown", seed_idx: int = 0,
+                     eval_dataset: Optional[List[Dict[str, Any]]] = None,
+                     eval_every: int = 0,
+                     eval_samples: int = DEFAULT_EVAL_SAMPLES) -> Dict[str, Any]:
         global _qlora_fraction_set
         
         try:
@@ -695,14 +1017,21 @@ class QLoRARunner(BaseRunner):
         
         total_steps = epochs * len(dataset)
         curve = []
+        eval_curve: List[Tuple[int, float]] = []
+        eval_batches = _eval_subset(eval_dataset, eval_samples)
         step = 0
         total_time = 0.0
-        
+
+        if eval_batches and eval_every > 0:
+            initial = _local_eval_loss(model, eval_batches)
+            if initial is not None:
+                eval_curve.append((0, initial))
+
         for epoch in range(epochs):
             for sample in dataset:
                 input_ids = sample["input_ids"].to(model.device)
                 labels = sample["labels"].to(model.device)
-                
+
                 start_t = time.time()
                 optimizer.zero_grad()
                 outputs = model(input_ids=input_ids, labels=labels)
@@ -711,23 +1040,36 @@ class QLoRARunner(BaseRunner):
                 optimizer.step()
                 step_t = time.time() - start_t
                 total_time += step_t
-                
+
                 loss_val = loss.item()
                 curve.append((step, loss_val))
                 logging.info(f"[{scenario_name} seed {seed_idx}] step {step+1}/{total_steps} | loss {loss_val:.4f} | time {step_t:.3f}s")
                 step += 1
-                
+
+                if eval_batches and eval_every > 0 and step % eval_every == 0:
+                    eval_loss = _local_eval_loss(model, eval_batches)
+                    if eval_loss is not None:
+                        eval_curve.append((step, eval_loss))
+                        logging.info(f"[{scenario_name} seed {seed_idx}] eval@{step} "
+                                     f"| eval_loss {eval_loss:.4f}")
+
+        if eval_batches and eval_every > 0 and (not eval_curve or eval_curve[-1][0] != step):
+            final_eval = _local_eval_loss(model, eval_batches)
+            if final_eval is not None:
+                eval_curve.append((step, final_eval))
+
         peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
         avg_time_ms = (total_time / total_steps) * 1000 if total_steps > 0 else 0
-        
+
         # cleanup
         del model
         del optimizer
         gc.collect()
         torch.cuda.empty_cache()
-        
+
         return {
             "curve": curve,
+            "eval_curve": eval_curve,
             "metrics": {
                 "peak_gpu_mb": float(peak_mem_mb),
                 "step_time_ms": float(avg_time_ms)

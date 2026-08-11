@@ -72,6 +72,19 @@ adapter_step: int = 0
 _round_buffers: dict[int, list[tuple[str, int, dict[str, torch.Tensor]]]] = {}
 _round_expect: dict[int, int] = {}
 _round_events: dict[int, asyncio.Event] = {}
+# Sparsity in force for a round, as announced by the gateway's plan. Used
+# only to reject a payload whose sender disagreed (Phase 3.2); the merge's
+# length check is the authoritative guard.
+_round_p: dict[int, float] = {}
+
+# ── Outer optimizer state (Phase 4, DiLoCo) ─────────────────────────────────
+# The anchor is this worker's adapter at the last completed dense round; the
+# momentum buffer is LOCAL and never transmitted, same invariant as the Adam
+# moments (§4.2).
+OUTER_LR = float(os.getenv("KIWI_OUTER_LR", "0.7"))
+OUTER_MU = float(os.getenv("KIWI_OUTER_MU", "0.9"))
+_outer_anchor: dict[str, torch.Tensor] | None = None
+_outer_buf: dict[str, torch.Tensor] = {}
 
 # ── Backward pass tensor caches (keyed by request_id) ───────────────────────────
 cached_inputs: dict[str, torch.Tensor] = {}
@@ -643,7 +656,13 @@ def _extract_failed_node_from_response(response_bytes: bytes) -> str | None:
 
 from peft import get_peft_model_state_dict, set_peft_model_state_dict
 
-from mesh import filter_skewed, merge_adapters
+from mesh import (
+    filter_skewed,
+    merge_adapters,
+    merge_sparse,
+    outer_step,
+    sparse_snapshot,
+)
 
 
 async def _execute_adapter_pipeline(headers: dict[str, str], body_bytes: bytes) -> bytes:
@@ -701,6 +720,24 @@ def _buffer_round_payload(headers: dict[str, str], body_bytes: bytes) -> bytes:
         print(f"[{NODE_NAME}] Dropping adapter from {sender} for closed round {round_id}", flush=True)
         return b'{"status":"dropped"}'
 
+    # Sparsity cross-check (Phase 3.2). If this round's plan has already
+    # reached us, a sender announcing a different p built its payload against
+    # a different index set; merging it would scatter its weights into
+    # unrelated coordinates. Reject it here with a loud message rather than
+    # letting the (silent) length check in merge_sparse drop it, so the
+    # misconfiguration is visible in the logs.
+    sender_p_header = headers.get("x-sparse-p") or headers.get("X-Sparse-P", "")
+    if sender_p_header and round_id in _round_p:
+        try:
+            sender_p = float(sender_p_header)
+        except ValueError:
+            sender_p = _round_p[round_id]
+        if abs(sender_p - _round_p[round_id]) > 1e-12:
+            print(f"[{NODE_NAME}] REJECTING adapter from {sender} for round "
+                  f"{round_id}: sender p={sender_p:g} but this round is "
+                  f"p={_round_p[round_id]:g}. Masks would not match.", flush=True)
+            return b'{"status":"rejected_p_mismatch"}'
+
     tensors = safetensors_load(body_bytes)
     buffer = _round_buffers.setdefault(round_id, [])
     buffer.append((sender, step, tensors))
@@ -723,19 +760,72 @@ async def _send_round_adapter(target: str, payload: bytes, headers: dict[str, st
 
 
 def _apply_round_merge(
-    received: list[tuple[str, int, dict[str, torch.Tensor]]], contribute: bool
+    received: list[tuple[str, int, dict[str, torch.Tensor]]],
+    contribute: bool,
+    timings: dict[str, float] | None = None,
+    *,
+    round_id: int = 0,
+    p: float = 1.0,
+    outer: bool = False,
 ) -> int:
-    """Merge received adapters into the model (§3.5).
+    """Merge received adapters into the model (§3.5, Phase 3.2, Phase 4).
 
     WARNING: caller MUST hold `model_lock` and run this via asyncio.to_thread.
     Returns the divisor n (0 = nothing applied).
+
+    `timings` (Phase 2.1) is filled in with the merge arithmetic and the
+    state-dict apply as SEPARATE numbers. They have different fixes — the
+    first is CPU fp32 accumulation, the second is a host-to-device write
+    under the lock — and a single combined figure cannot distinguish them.
     """
+    global _outer_anchor
     assert model is not None
+    t0 = time.perf_counter()
     own = get_peft_model_state_dict(model)
-    merged = merge_adapters(own, received, contribute, own_name=NODE_NAME)
+    if p < 1.0:
+        merged = merge_sparse(
+            own, received, contribute, round_id=round_id, p=p, own_name=NODE_NAME
+        )
+    else:
+        merged = merge_adapters(own, received, contribute, own_name=NODE_NAME)
+    if timings is not None:
+        timings["merge_compute_ms"] = (time.perf_counter() - t0) * 1000
     if merged is None:
+        if timings is not None:
+            timings["apply_ms"] = 0.0
         return 0
+
+    # ── Outer optimizer (Phase 4). Dense rounds only ──
+    # A sparse round touches a different ~p of coordinates each time, so a
+    # "delta since the last anchor" over one of them is not a pseudo-gradient
+    # of anything coherent. The outer step therefore runs only where the
+    # merge is complete.
+    if outer and p >= 1.0:
+        t_outer = time.perf_counter()
+        if _outer_anchor is None:
+            # FIRST dense round establishes the anchor, without stepping.
+            #
+            # This is not laziness — it is what keeps replicas bit-identical.
+            # Same-stage peers do NOT start from the same adapter (LoRA A is
+            # randomly initialised per worker), so an anchor captured at model
+            # load would differ across replicas and the outer step would
+            # compute a different result on each, permanently diverging them.
+            # The merged average is by construction identical on every
+            # replica, so anchoring on it makes the first outer step the first
+            # point at which they are guaranteed to agree.
+            _outer_anchor = {k: v.clone() for k, v in merged.items()}
+            print(f"[{NODE_NAME}] Outer optimizer: anchor established at round "
+                  f"{round_id} (no outer step on the first dense round)", flush=True)
+        else:
+            merged = outer_step(_outer_anchor, merged, _outer_buf, OUTER_LR, OUTER_MU)
+            _outer_anchor = {k: v.clone() for k, v in merged.items()}
+        if timings is not None:
+            timings["outer_ms"] = (time.perf_counter() - t_outer) * 1000
+
+    t1 = time.perf_counter()
     set_peft_model_state_dict(model, merged)
+    if timings is not None:
+        timings["apply_ms"] = (time.perf_counter() - t1) * 1000
     return len(received) + (1 if contribute else 0)
 
 
@@ -751,40 +841,107 @@ async def _run_round(params: dict[str, Any]) -> dict[str, Any]:
     expect = int(params.get("expect", 0))
     contribute = bool(params.get("contribute", False))
     x = int(params.get("x", 10))
+    # Sparsity and outer-step flags come from the gateway's plan, so every
+    # peer in a stage necessarily agrees on them for a given round. Default
+    # p=1.0 keeps a gateway that predates Phase 3 working unchanged.
+    p = float(params.get("p", 1.0))
+    outer = bool(params.get("outer", False))
 
     if round_id <= current_round:
         return {"status": "stale", "round_id": round_id, "current_round": current_round}
+
+    _round_p[round_id] = p
+
+    # ── Phase 2.1 instrumentation ──
+    # Per-substep wall time, always on. A round is a distributed operation
+    # whose cost is invisible from any single vantage point: the harness sees
+    # only "the barrier took 4.2 s". These numbers are returned to the gateway
+    # and surface in the /average response, so one dp2 run produces the whole
+    # profile without a special build.
+    round_t0 = time.perf_counter()
+    timings: dict[str, float] = {}
 
     event = _round_events.setdefault(round_id, asyncio.Event())
     _round_expect[round_id] = expect
     if len(_round_buffers.get(round_id, [])) >= expect:
         event.set()
 
-    # 1. Snapshot under model_lock; serialize outside it.
+    # 1. Snapshot under model_lock; move to CPU and serialize OUTSIDE it.
     if contribute:
+        t = time.perf_counter()
         async with model_lock:
-            state_dict = {
-                k: v.detach().cpu() for k, v in get_peft_model_state_dict(model).items()
+            # Clone on-device only. The .cpu() transfers used to happen here,
+            # holding model_lock across ~100 synchronous device-to-host copies
+            # while a train step queued behind it. A device-side clone is a
+            # handful of cheap async kernels by comparison.
+            snapshot = {
+                k: v.detach().clone() for k, v in get_peft_model_state_dict(model).items()
             }
-        payload = safetensors_save(state_dict)
+        timings["snapshot_lock_ms"] = (time.perf_counter() - t) * 1000
+
+        # On a sparse round only the masked values leave the device, so this
+        # transfer and the serialize below both shrink by ~1/p.
+        t = time.perf_counter()
+        if p < 1.0:
+            state_dict = await asyncio.to_thread(
+                lambda: {
+                    k: v.cpu()
+                    for k, v in sparse_snapshot(snapshot, round_id, p).items()
+                }
+            )
+        else:
+            state_dict = await asyncio.to_thread(
+                lambda: {k: v.cpu() for k, v in snapshot.items()}
+            )
+        timings["to_cpu_ms"] = (time.perf_counter() - t) * 1000
+
+        # safetensors_save on a worker thread, not on the event loop. While
+        # this runs, the loop stays free to accept inbound /adapter POSTs from
+        # same-stage peers — every worker in the stage serializes at the same
+        # instant, so a blocking serialize here adds its full duration to
+        # every peer's wait as well as our own.
+        t = time.perf_counter()
+        payload = await asyncio.to_thread(safetensors_save, state_dict)
+        timings["serialize_ms"] = (time.perf_counter() - t) * 1000
+        timings["payload_bytes"] = float(len(payload))
 
         # 2. Fire-and-forget sends — never await a peer while holding model_lock.
+        t = time.perf_counter()
         send_headers = {
             "X-Model-ID": assigned_model_id or "",
             "X-Round-ID": str(round_id),
             "X-Step": str(adapter_step),  # lineage step, NOT training_steps
             "X-Node-Name": NODE_NAME,
+            # Announced so the receiver can reject a payload built with a
+            # different p outright, instead of relying on the length check
+            # to notice. Never used to CHOOSE p — that comes from the plan.
+            "X-Sparse-P": repr(p),
         }
         for target in send_to:
             asyncio.create_task(_send_round_adapter(target, payload, send_headers))
+        timings["send_dispatch_ms"] = (time.perf_counter() - t) * 1000
 
     # 3. Wait until `expect` payloads arrive or T_round elapses.
+    #
+    # Re-check the buffer immediately before waiting. Everything above this
+    # line contains awaits (model_lock, to_thread), and a payload that lands
+    # during one of them is buffered by _buffer_round_payload — which sets the
+    # event only if BOTH _round_events and _round_expect are already
+    # registered for this round. They are, by now, so this is belt-and-braces
+    # rather than a known hole; it costs one dict lookup and removes the need
+    # to reason about the interleaving at all.
     timed_out = False
     if expect > 0:
+        if len(_round_buffers.get(round_id, [])) >= expect:
+            event.set()
+        t = time.perf_counter()
         try:
             await asyncio.wait_for(event.wait(), timeout=T_ROUND)
         except asyncio.TimeoutError:
             timed_out = True
+        timings["wait_ms"] = (time.perf_counter() - t) * 1000
+    else:
+        timings["wait_ms"] = 0.0
 
     # 4. Merge whatever arrived (partial merge on timeout is by design).
     received = _round_buffers.pop(round_id, [])
@@ -792,8 +949,13 @@ async def _run_round(params: dict[str, Any]) -> dict[str, Any]:
     if dropped:
         print(f"[{NODE_NAME}] Round {round_id}: skew guard dropped {dropped}", flush=True)
 
+    t = time.perf_counter()
     async with model_lock:
-        n = await asyncio.to_thread(_apply_round_merge, kept, contribute)
+        timings["merge_lock_wait_ms"] = (time.perf_counter() - t) * 1000
+        n = await asyncio.to_thread(
+            _apply_round_merge, kept, contribute, timings,
+            round_id=round_id, p=p, outer=outer,
+        )
 
     # Advance the adapter lineage: after merging, this worker's adapter is as
     # current as the freshest contribution it absorbed. This is what keeps a
@@ -806,11 +968,16 @@ async def _run_round(params: dict[str, Any]) -> dict[str, Any]:
     steps_since_round = 0
     _round_events.pop(round_id, None)
     _round_expect.pop(round_id, None)
+    _round_p.pop(round_id, None)
+
+    timings["total_ms"] = (time.perf_counter() - round_t0) * 1000
 
     print(
         f"[{NODE_NAME}] Round {round_id} complete: merged n={n} "
-        f"(received {len(received)}, expected {expect}, contribute={contribute}"
-        f"{', TIMED OUT' if timed_out else ''})",
+        f"(received {len(received)}, expected {expect}, contribute={contribute}, "
+        f"p={p:g}{', FULL' if p >= 1.0 else ''}{', OUTER' if outer and p >= 1.0 else ''}"
+        f"{', TIMED OUT' if timed_out else ''}) | "
+        + " ".join(f"{k}={v:.1f}" for k, v in timings.items()),
         flush=True,
     )
     return {
@@ -820,6 +987,9 @@ async def _run_round(params: dict[str, Any]) -> dict[str, Any]:
         "received": len(received),
         "expected": expect,
         "timed_out": timed_out,
+        "p": p,
+        "outer": bool(outer and p >= 1.0),
+        "timings_ms": timings,
     }
 
 
@@ -829,62 +999,91 @@ def _run_forward(
     input_ids: torch.Tensor | None = None,
     hidden_states: torch.Tensor | None = None,
     labels: torch.Tensor | None = None,
+    eval_mode: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run this worker's layers with autograd enabled.
 
     Caches graph-attached tensors in cached_inputs / cached_outputs for the
     backward pass.  Returns *detached* copies for serialization.
 
+    Under `eval_mode` (X-Eval: 1, Phase 1.2) this is a pure measurement:
+      - no autograd graph is built (torch.no_grad),
+      - NOTHING is written to cached_inputs / cached_outputs /
+        last_predictions, so an eval request cannot leave a tensor behind for
+        a later backward to pick up (that would both leak VRAM and corrupt an
+        unrelated training step),
+      - the model is switched to .eval() for the duration, which disables
+        LoRA dropout (p=0.05). Measuring held-out loss with dropout active
+        would inflate it by a noisy, scenario-independent constant — small,
+        never flagged, and enough to muddy an A/B between averaging schemes.
+        Safe to toggle because the caller holds `model_lock`.
+
     Returns:
         tuple of (hidden_states_detached on CPU, loss_detached on CPU or None)
     """
     assert model is not None
 
-    if is_first_stage and input_ids is not None:
-        outputs = model.get_base_model().model(
-            input_ids=_to_device(input_ids),
-            return_dict=True,
-        )
-    else:
-        assert hidden_states is not None
-        # Move to device, then enable grad so this becomes the autograd leaf.
-        hidden_states = _to_device(hidden_states).requires_grad_(True)
-        # Cache the leaf *before* it flows through the model.
-        cached_inputs[request_id] = hidden_states
-        # Feed the exact same tensor — no redundant _to_device.
-        outputs = model.get_base_model().model(
-            inputs_embeds=hidden_states,
-            return_dict=True,
-        )
+    if eval_mode:
+        model.eval()
+    try:
+        with torch.set_grad_enabled(not eval_mode):
+            if is_first_stage and input_ids is not None:
+                outputs = model.get_base_model().model(
+                    input_ids=_to_device(input_ids),
+                    return_dict=True,
+                )
+            else:
+                assert hidden_states is not None
+                hidden_states = _to_device(hidden_states)
+                if not eval_mode:
+                    # Enable grad so this becomes the autograd leaf, and cache
+                    # the leaf *before* it flows through the model.
+                    hidden_states = hidden_states.requires_grad_(True)
+                    cached_inputs[request_id] = hidden_states
+                # Feed the exact same tensor — no redundant _to_device.
+                outputs = model.get_base_model().model(
+                    inputs_embeds=hidden_states,
+                    return_dict=True,
+                )
 
-    last_hidden_state = outputs.last_hidden_state
-    loss_cpu = None
+            last_hidden_state = outputs.last_hidden_state
+            loss_cpu = None
 
-    if is_last_stage:
-        assert input_ids is not None, "Last-stage worker requires input_ids/labels for loss calculation"
-        logits = model.get_base_model().lm_head(last_hidden_state)
-        vocab_size = model.get_base_model().config.vocab_size
+            if is_last_stage:
+                assert input_ids is not None, "Last-stage worker requires input_ids/labels for loss calculation"
+                logits = model.get_base_model().lm_head(last_hidden_state)
+                vocab_size = model.get_base_model().config.vocab_size
 
-        if labels is None:
-            labels = input_ids
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous().to(logits.device)
+                if labels is None:
+                    labels = input_ids
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = labels[:, 1:].contiguous().to(logits.device)
 
-        loss = F.cross_entropy(shift_logits.reshape(-1, vocab_size), shift_labels.reshape(-1), ignore_index=-100)
-        # Cache the graph-attached loss for backward.
-        cached_outputs[request_id] = loss
-        loss_cpu = loss.detach().cpu()
-        # Cache per-token predictions (argmax over shifted logits) so the client
-        # can inspect what the model predicts at each next-token position.
-        # Used by the English recitation test; harmless for other callers.
-        last_predictions[request_id] = shift_logits.argmax(dim=-1).detach().cpu()
-        print(f"[{NODE_NAME}] Forward loss: {loss_cpu.item():.4f}", flush=True)
-    else:
-        # Cache the graph-attached hidden_state for backward.
-        cached_outputs[request_id] = last_hidden_state
+                loss = F.cross_entropy(shift_logits.reshape(-1, vocab_size), shift_labels.reshape(-1), ignore_index=-100)
+                if not eval_mode:
+                    # Cache the graph-attached loss for backward.
+                    cached_outputs[request_id] = loss
+                loss_cpu = loss.detach().cpu()
+                if not eval_mode:
+                    # Cache per-token predictions (argmax over shifted logits) so the
+                    # client can inspect what the model predicts at each next-token
+                    # position. Used by the English recitation test; harmless for
+                    # other callers.
+                    last_predictions[request_id] = shift_logits.argmax(dim=-1).detach().cpu()
+                print(
+                    f"[{NODE_NAME}] {'Eval' if eval_mode else 'Forward'} loss: "
+                    f"{loss_cpu.item():.4f}",
+                    flush=True,
+                )
+            elif not eval_mode:
+                # Cache the graph-attached hidden_state for backward.
+                cached_outputs[request_id] = last_hidden_state
 
-    # Always return *detached* copies on CPU for safetensors serialization.
-    return last_hidden_state.detach().contiguous().cpu(), loss_cpu
+            # Always return *detached* copies on CPU for safetensors serialization.
+            return last_hidden_state.detach().contiguous().cpu(), loss_cpu
+    finally:
+        if eval_mode:
+            model.train()
 
 
 def _serialize_hidden_states(
@@ -900,7 +1099,9 @@ def _serialize_hidden_states(
     return binary_hidden, {}
 
 
-async def _process_forward(request_id: str, body_bytes: bytes) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+async def _process_forward(
+    request_id: str, body_bytes: bytes, eval_mode: bool = False
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     tensors = safetensors_load(body_bytes)
     input_ids = tensors.get("input_ids")
     labels = tensors.get("labels")
@@ -911,7 +1112,8 @@ async def _process_forward(request_id: str, body_bytes: bytes) -> tuple[torch.Te
             raise ValueError("First-stage worker requires input_ids")
         async with model_lock:
             result, loss = await asyncio.to_thread(
-                _run_forward, request_id, input_ids=input_ids, labels=labels
+                _run_forward, request_id, input_ids=input_ids, labels=labels,
+                eval_mode=eval_mode,
             )
     else:
         hidden_in = tensors.get("hidden_states")
@@ -921,7 +1123,8 @@ async def _process_forward(request_id: str, body_bytes: bytes) -> tuple[torch.Te
 
         async with model_lock:
             result, loss = await asyncio.to_thread(
-                _run_forward, request_id, hidden_states=hidden_in, input_ids=input_ids, labels=labels
+                _run_forward, request_id, hidden_states=hidden_in, input_ids=input_ids,
+                labels=labels, eval_mode=eval_mode,
             )
     return result, loss, input_ids, labels
 
@@ -940,13 +1143,33 @@ async def _execute_forward_pipeline(headers: dict[str, str], body_bytes: bytes) 
     reverse_header = headers.get("x-reverse-pipeline") or headers.get("X-Reverse-Pipeline", "")
     reverse_workers = [u.strip() for u in reverse_header.split(",") if u.strip()]
 
+    # Held-out eval (Phase 1.2): forward + loss only. No backward, no
+    # optimizer step, no training_steps / steps_since_round / adapter_step
+    # increment, no cached tensors left behind. An eval request must be
+    # completely invisible to the model's state — otherwise measuring the
+    # model changes it, and the eval curve becomes a function of how often
+    # eval ran.
+    eval_mode = (headers.get("x-eval") or headers.get("X-Eval", "")) == "1"
+
     success = False
     try:
-        result, loss, input_ids, labels = await _process_forward(request_id, body_bytes)
+        result, loss, input_ids, labels = await _process_forward(
+            request_id, body_bytes, eval_mode=eval_mode
+        )
 
         # ── Last stage: run backward, propagate grads upstream ──
         if is_last_stage and not next_workers:
             assert loss is not None, "Last stage must compute loss"
+
+            if eval_mode:
+                # Terminate here. stage0_grad_norm is reported as exactly 0.0
+                # rather than omitted, so the response shape is identical to a
+                # train step and existing clients keep parsing it unchanged.
+                success = True
+                return safetensors_save({
+                    "loss": loss,
+                    "stage0_grad_norm": torch.tensor(0.0, dtype=torch.float32),
+                })
 
             # Pop the graph-attached loss and run backward ONLY (no optimizer step yet).
             graph_loss = cached_outputs.pop(request_id)
@@ -1041,6 +1264,10 @@ async def _execute_forward_pipeline(headers: dict[str, str], body_bytes: bytes) 
                     "X-Request-ID": request_id,
                     "X-Pipeline": remaining_pipeline,
                     "X-Reverse-Pipeline": updated_reverse,
+                    # Must propagate: the LAST stage is the one that decides to
+                    # skip backward, and it only learns this from the header.
+                    # Dropping it here would make an eval request train the model.
+                    "X-Eval": "1" if eval_mode else "0",
                     "Content-Type": "application/octet-stream",
                     **compression_headers,
                 },
