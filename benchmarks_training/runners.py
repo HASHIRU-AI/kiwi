@@ -525,7 +525,9 @@ class MeshRunner(BaseRunner):
         round_times: List[float] = []
         round_profile: Dict[str, List[float]] = {}
         spread_curve: List[Dict[str, Any]] = []
-        last_spread_at = [-(10 ** 9)]
+        # Per-PHASE throttle (see the sampling block below): "peak" is the last
+        # sparse round of a cycle, "trough" the full sync that follows it.
+        last_spread_at: Dict[str, int] = {}
         req_counter = [0]
         degraded_samples = [0]
 
@@ -838,26 +840,45 @@ class MeshRunner(BaseRunner):
                 f"| round {result['round_id']} completed={len(result['completed'])}"
             )
 
-            # Replica spread, sampled at the same cadence as eval. Recorded
-            # WITH the round's `full` flag so the plot can show the sawtooth:
-            # spread grows across sparse rounds and collapses at each full
-            # sync. Sampling only on full-sync rounds would show a flat zero
-            # line and prove nothing.
+            # Replica spread — sampled in PHASE PAIRS, not on a plain timer.
             #
-            # Must sit AFTER `n_now` is read under the lock — it is the sample
-            # counter this is throttled on.
-            if self.sparse_p < 1.0 and eval_every > 0 and (
-                n_now - last_spread_at[0] >= eval_every
-            ):
-                last_spread_at[0] = n_now
-                spread = self._replica_spread(model_id)
-                if spread is not None:
-                    spread_curve.append({
-                        "samples": n_now,
-                        "round_id": result.get("round_id"),
-                        "spread_l2": spread,
-                        "full_sync": bool(result.get("full")),
-                    })
+            # The sawtooth this is meant to show has two interesting points
+            # per cycle: the last sparse round (maximum drift) and the full
+            # sync immediately after it (should collapse to ~0). A plain
+            # "every eval_every samples" throttle aliases against the
+            # full-sync cadence and can miss one phase entirely: at X=1 a
+            # round is 2 samples, so eval_every=100 samples every 50th round,
+            # and with full syncs every 10 rounds every single sample landed
+            # on round_id % 10 == 1. Ten samples, not one of them a full sync,
+            # and the plot would have shown a flat line that proves nothing.
+            #
+            # So: throttle each PHASE separately. Trough = the full-sync
+            # round. Peak = the round right before one.
+            #
+            # Must sit AFTER `n_now` is read under the lock — it is the
+            # sample counter the throttles are measured in.
+            if self.sparse_p < 1.0 and eval_every > 0:
+                round_id = int(result.get("round_id") or 0)
+                is_full = bool(result.get("full"))
+                cadence = self.full_sync_every or 0
+                is_pre_full = bool(cadence > 1 and round_id % cadence == cadence - 1)
+                phase = "trough" if is_full else ("peak" if is_pre_full else None)
+                # Always take the very first round: it captures the drift the
+                # replicas start with (LoRA A is randomly initialised per
+                # worker), which is the scale everything else is read against.
+                if round_id == 1:
+                    phase = phase or "initial"
+                if phase and (n_now - last_spread_at.get(phase, -(10 ** 9))) >= eval_every:
+                    last_spread_at[phase] = n_now
+                    spread = self._replica_spread(model_id)
+                    if spread is not None:
+                        spread_curve.append({
+                            "samples": n_now,
+                            "round_id": round_id,
+                            "spread_l2": spread,
+                            "full_sync": is_full,
+                            "phase": phase,
+                        })
 
             # Post-merge eval, throttled by eval_every. A window is only R*X
             # samples wide (4 at R=2, X=2), so evaluating at EVERY boundary

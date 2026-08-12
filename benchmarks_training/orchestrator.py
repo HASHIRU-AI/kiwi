@@ -965,8 +965,16 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                             events_all.append(res.get("events", []))
                             if res.get("spread_curve"):
                                 spread_all.append(res["spread_curve"])
-                            if res["metrics"].get("round_profile_ms"):
-                                profiles_all.append(res["metrics"]["round_profile_ms"])
+                            # round_profile_ms is a SIBLING of "metrics" in the
+                            # runner's result, not a member of it. Reading it
+                            # from the wrong place silently produced an empty
+                            # round_profiles for two whole gate runs — the
+                            # numbers were collected correctly and discarded
+                            # here. Check both so an older runner still works.
+                            profile = (res.get("round_profile_ms")
+                                       or res["metrics"].get("round_profile_ms"))
+                            if profile:
+                                profiles_all.append(profile)
                         else:
                             res = runner.run_training(scenario.model, dataset, scenario.epochs,
                                                       scenario.name, i+1, **eval_kwargs)
@@ -1007,6 +1015,9 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
             # "dp2_sparse5" is only a name; this is what makes a result
             # self-describing rather than dependent on a matching scenarios.yaml.
             results_out.setdefault("scenario_config", {})[scenario.name] = {
+                # Recorded per scenario so a probe run (--model / --seeds
+                # overrides) can never be mistaken later for a matrix run.
+                "model": scenario.model,
                 "dataset": scenario.dataset,
                 "epochs": scenario.epochs,
                 "replicas": scenario.replicas,
@@ -1156,6 +1167,13 @@ if __name__ == "__main__":
              "value in the config). Use --seeds 1 for a smoke run; never "
              "report a 1-seed result as a gate.",
     )
+    parser.add_argument(
+        "--model", type=str, default="",
+        help="Override the model for every selected scenario. For PROBES "
+             "only (e.g. base vs -Instruct): distributed scenarios also need "
+             "KIWI_MODELS changed in the compose file, so this alone is only "
+             "safe for in-process arms like sm_alpaca.",
+    )
     args = parser.parse_args()
 
     scenarios = load_scenarios(args.config)
@@ -1186,6 +1204,25 @@ if __name__ == "__main__":
         logging.warning(f"Overriding num_seeds -> {args.seeds} for all selected scenarios")
         for s in scenarios:
             s.num_seeds = args.seeds
+
+    if args.model:
+        # A distributed scenario gets its model from the GATEWAY's KIWI_MODELS,
+        # not from here, so overriding only this side would make the harness
+        # request a model the cluster has never heard of — or worse, silently
+        # train the compose file's model while the results file claims
+        # otherwise. Refuse rather than produce a mislabelled result.
+        containerised = [s.name for s in scenarios if s.workers]
+        if containerised:
+            raise SystemExit(
+                f"--model only applies to in-process scenarios; "
+                f"{', '.join(containerised)} run in containers and take their "
+                f"model from KIWI_MODELS in the compose file. Either restrict "
+                f"to in-process arms (e.g. --only sm_alpaca) or edit "
+                f"KIWI_MODELS and scenarios.yaml together."
+            )
+        logging.warning(f"Overriding model -> {args.model} for all selected scenarios")
+        for s in scenarios:
+            s.model = args.model
 
     logging.info(f"Running {len(scenarios)} scenario(s): "
                  f"{', '.join(s.name for s in scenarios)}")
