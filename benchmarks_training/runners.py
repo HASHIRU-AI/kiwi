@@ -831,11 +831,21 @@ class MeshRunner(BaseRunner):
                 for key, value in (worker_result.get("timings_ms") or {}).items():
                     round_profile.setdefault(f"worker_{key}", []).append(float(value))
 
+            with lock:
+                n_now = samples_consumed
+            logging.info(
+                f"[{scenario_name} seed {seed_idx}] samples {n_now}/{total_steps_target} "
+                f"| round {result['round_id']} completed={len(result['completed'])}"
+            )
+
             # Replica spread, sampled at the same cadence as eval. Recorded
             # WITH the round's `full` flag so the plot can show the sawtooth:
             # spread grows across sparse rounds and collapses at each full
             # sync. Sampling only on full-sync rounds would show a flat zero
             # line and prove nothing.
+            #
+            # Must sit AFTER `n_now` is read under the lock — it is the sample
+            # counter this is throttled on.
             if self.sparse_p < 1.0 and eval_every > 0 and (
                 n_now - last_spread_at[0] >= eval_every
             ):
@@ -848,12 +858,6 @@ class MeshRunner(BaseRunner):
                         "spread_l2": spread,
                         "full_sync": bool(result.get("full")),
                     })
-            with lock:
-                n_now = samples_consumed
-            logging.info(
-                f"[{scenario_name} seed {seed_idx}] samples {n_now}/{total_steps_target} "
-                f"| round {result['round_id']} completed={len(result['completed'])}"
-            )
 
             # Post-merge eval, throttled by eval_every. A window is only R*X
             # samples wide (4 at R=2, X=2), so evaluating at EVERY boundary

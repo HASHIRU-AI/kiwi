@@ -624,6 +624,37 @@ def _kill_one_active_worker(gateway_url: str) -> None:
                       f"(rc={stop.returncode}): {stop.stderr.strip()} — "
                       f"dp2_kill will not have injected a fault this seed")
 
+def capture_container_logs(compose: str, output_dir: str, scenario_name: str,
+                           seed_idx: int) -> None:
+    """Dump the cluster's logs to disk BEFORE the containers are removed.
+
+    The orchestrator runs `compose down --remove-orphans` between every seed
+    and again after every scenario, so by the time a run finishes there is
+    nothing left for `docker compose logs` to read. That is fine for the
+    numbers — the round profile, eval curves and events all live in the
+    results JSON — but the container logs carry things the JSON does not:
+    per-round `p`/`full` flags, skew-guard drops, OOM tracebacks, promotion
+    messages. Losing them turns a post-mortem into a re-run.
+    """
+    log_dir = os.path.join(output_dir, "container_logs")
+    os.makedirs(log_dir, exist_ok=True)
+    path = os.path.join(log_dir, f"{scenario_name}_seed{seed_idx}.log")
+    try:
+        result = subprocess.run(
+            compose_cmd() + ["-f", compose, "logs", "--no-color", "--timestamps"],
+            capture_output=True, text=True, timeout=120,
+        )
+        with open(path, "w", encoding="utf-8", errors="replace") as handle:
+            handle.write(result.stdout)
+            if result.stderr:
+                handle.write("\n=== stderr ===\n")
+                handle.write(result.stderr)
+        logging.info(f"Container logs saved to {path}")
+    except Exception as error:
+        # Never let log capture take down a run that otherwise succeeded.
+        logging.warning(f"Could not capture container logs to {path}: {error}")
+
+
 def resolve_learning_rate() -> float:
     """Return the one learning rate every scenario must use, or refuse to run.
 
@@ -922,21 +953,27 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
 
                     wait_for_cluster(gateway_url, scenario.model, len(scenario.workers))
 
-                    if use_mesh:
-                        res = runner.run_training(scenario.model, dataset, scenario.epochs,
-                                                  scenario.name, i+1, kill_hook=kill_hook,
-                                                  **eval_kwargs)
-                        replica_curves_all.append(res.get("replica_curves", {}))
-                        events_all.append(res.get("events", []))
-                        if res.get("spread_curve"):
-                            spread_all.append(res["spread_curve"])
-                        if res["metrics"].get("round_profile_ms"):
-                            profiles_all.append(res["metrics"]["round_profile_ms"])
-                    else:
-                        res = runner.run_training(scenario.model, dataset, scenario.epochs,
-                                                  scenario.name, i+1, **eval_kwargs)
-                        if res.get("events"):
-                            events_all.append(res["events"])
+                    # Capture logs in a finally: the seed that FAILS is the one
+                    # whose logs matter most, and it is also the one that
+                    # never reaches the success path.
+                    try:
+                        if use_mesh:
+                            res = runner.run_training(scenario.model, dataset, scenario.epochs,
+                                                      scenario.name, i+1, kill_hook=kill_hook,
+                                                      **eval_kwargs)
+                            replica_curves_all.append(res.get("replica_curves", {}))
+                            events_all.append(res.get("events", []))
+                            if res.get("spread_curve"):
+                                spread_all.append(res["spread_curve"])
+                            if res["metrics"].get("round_profile_ms"):
+                                profiles_all.append(res["metrics"]["round_profile_ms"])
+                        else:
+                            res = runner.run_training(scenario.model, dataset, scenario.epochs,
+                                                      scenario.name, i+1, **eval_kwargs)
+                            if res.get("events"):
+                                events_all.append(res["events"])
+                    finally:
+                        capture_container_logs(compose, output_dir, scenario.name, i + 1)
                     curves.append(res["curve"])
                     if res.get("eval_curve"):
                         eval_curves.append(res["eval_curve"])
