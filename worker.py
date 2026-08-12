@@ -808,6 +808,7 @@ def _apply_round_merge(
     round_id: int = 0,
     p: float = 1.0,
     outer: bool = False,
+    own_cpu: dict[str, torch.Tensor] | None = None,
 ) -> int:
     """Merge received adapters into the model (§3.5, Phase 3.2, Phase 4).
 
@@ -822,7 +823,13 @@ def _apply_round_merge(
     global _outer_anchor
     assert model is not None
     t0 = time.perf_counter()
-    own = get_peft_model_state_dict(model)
+    # `own_cpu` is the CPU snapshot taken at the top of the round — the exact
+    # bytes a contributor transmitted to its peers. Falling back to
+    # get_peft_model_state_dict here would reintroduce the 4-second merge
+    # measured in the Phase 2 profile (~112 synchronising device-to-host
+    # copies inside the merge loop), so the fallback exists only for callers
+    # that predate the own_cpu argument.
+    own = own_cpu if own_cpu is not None else get_peft_model_state_dict(model)
     if p < 1.0:
         merged = merge_sparse(
             own, received, contribute, round_id=round_id, p=p, own_name=NODE_NAME
@@ -908,40 +915,64 @@ async def _run_round(params: dict[str, Any]) -> dict[str, Any]:
         event.set()
 
     # 1. Snapshot under model_lock; move to CPU and serialize OUTSIDE it.
-    if contribute:
-        t = time.perf_counter()
-        async with model_lock:
-            # Clone on-device only. The .cpu() transfers used to happen here,
-            # holding model_lock across ~100 synchronous device-to-host copies
-            # while a train step queued behind it. A device-side clone is a
-            # handful of cheap async kernels by comparison.
-            snapshot = {
-                k: v.detach().clone() for k, v in get_peft_model_state_dict(model).items()
-            }
-        timings["snapshot_lock_ms"] = (time.perf_counter() - t) * 1000
+    #
+    # This runs for SPARES too, not just contributors. A spare sends nothing,
+    # but it still has to merge, and the merge needs `own` on the CPU. The
+    # measured cost of not having it was 4.0 s per round on the spare — see
+    # the comment on own_cpu below.
+    t = time.perf_counter()
+    async with model_lock:
+        # Clone on-device only. The .cpu() transfers used to happen here,
+        # holding model_lock across ~100 synchronous device-to-host copies
+        # while a train step queued behind it. A device-side clone is a
+        # handful of cheap async kernels by comparison.
+        snapshot = {
+            k: v.detach().clone() for k, v in get_peft_model_state_dict(model).items()
+        }
+    timings["snapshot_lock_ms"] = (time.perf_counter() - t) * 1000
 
-        # On a sparse round only the masked values leave the device, so this
-        # transfer and the serialize below both shrink by ~1/p.
+    # ONE bulk device-to-host pass, whose result is used for BOTH the outbound
+    # payload and the local merge.
+    #
+    # Phase 2 profile, dp2 on zorbulax4: merge_compute_ms was 3,442 ms of a
+    # 3,712 ms round — 92.7% — and the spare paid it too. The cause was
+    # merge_adapters receiving `own` straight from get_peft_model_state_dict,
+    # i.e. ~112 CUDA tensors, and doing `.float().cpu()` on each one. That is
+    # ~112 separate SYNCHRONISING device-to-host copies, and with 7 worker
+    # processes sharing one GPU each sync waits to be scheduled back in. The
+    # same bytes moved in bulk here cost 3.2 ms.
+    #
+    # Correctness improves as well, which is the better reason. A contributor
+    # TRANSMITS this snapshot to its peers. Re-reading the live weights at
+    # merge time would mean peers average our snapshot while we average
+    # something else, so the "bit-identical across replicas" invariant would
+    # hold only as long as nothing touched the weights mid-round. Merging the
+    # exact bytes we sent makes that invariant structural instead of
+    # incidental.
+    t = time.perf_counter()
+    # `s=snapshot` binds the dict at lambda-definition time rather than closing
+    # over the name, which is deleted two lines below. The await completes
+    # before the del either way, but a closure over a name that gets deleted
+    # is a trap for whoever reorders this next.
+    own_cpu = await asyncio.to_thread(
+        lambda s=snapshot: {k: v.cpu() for k, v in s.items()}
+    )
+    timings["to_cpu_ms"] = (time.perf_counter() - t) * 1000
+    del snapshot  # release the GPU clones before the (possibly long) wait
+
+    if contribute:
+        # Sparse gather now happens on the CPU copy. The full transfer already
+        # had to occur for the merge, so gathering on-device first would not
+        # save any PCIe traffic — only the payload shrinks, and it shrinks
+        # either way.
         t = time.perf_counter()
-        if p < 1.0:
-            state_dict = await asyncio.to_thread(
-                lambda: {
-                    k: v.cpu()
-                    for k, v in sparse_snapshot(snapshot, round_id, p).items()
-                }
-            )
-        else:
-            state_dict = await asyncio.to_thread(
-                lambda: {k: v.cpu() for k, v in snapshot.items()}
-            )
-        timings["to_cpu_ms"] = (time.perf_counter() - t) * 1000
+        state_dict = sparse_snapshot(own_cpu, round_id, p) if p < 1.0 else own_cpu
 
         # safetensors_save on a worker thread, not on the event loop. While
         # this runs, the loop stays free to accept inbound /adapter POSTs from
         # same-stage peers — every worker in the stage serializes at the same
         # instant, so a blocking serialize here adds its full duration to
         # every peer's wait as well as our own.
-        t = time.perf_counter()
         payload = await asyncio.to_thread(safetensors_save, state_dict)
         timings["serialize_ms"] = (time.perf_counter() - t) * 1000
         timings["payload_bytes"] = float(len(payload))
@@ -995,7 +1026,7 @@ async def _run_round(params: dict[str, Any]) -> dict[str, Any]:
         timings["merge_lock_wait_ms"] = (time.perf_counter() - t) * 1000
         n = await asyncio.to_thread(
             _apply_round_merge, kept, contribute, timings,
-            round_id=round_id, p=p, outer=outer,
+            round_id=round_id, p=p, outer=outer, own_cpu=own_cpu,
         )
 
     # Advance the adapter lineage: after merging, this worker's adapter is as
