@@ -281,6 +281,86 @@ scenarios:
     compose: "docker-compose.mesh.yml"
 
   # ══════════════════════════════════════════════════════════════════════
+  # SMOKE SUITE — does the MACHINERY work? (not: does it converge better)
+  #
+  # zorbulax4 on purpose: 4 samples/epoch, so these finish in minutes, and
+  # correctness is what is being checked. Convergence numbers from these are
+  # meaningless — the fixture is maximally non-i.i.d. under sharding and
+  # every averaging-quality conclusion from it is invalid. Run with
+  # --seeds 1; read the container log, not the loss curve.
+  #
+  # Sized so each mechanism fires MANY times. A run where the outer step
+  # happens once proves almost nothing: the first dense round only
+  # establishes the anchor and deliberately does not step.
+  # ══════════════════════════════════════════════════════════════════════
+
+  # Sparse path + full-sync cadence.
+  # 10 epochs x 4 = 40 samples; X=1 -> window 2 -> 20 rounds.
+  # Full syncs at rounds 10 and 20. Expect p=0.05 on the rest, and
+  # payload_bytes ~20x smaller than a dense round.
+  - name: "smoke_sparse"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 1
+    epochs: 10
+    target_loss: 2.0
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 1
+    sparse_p: 0.05
+    full_sync_every: 10
+    compose: "docker-compose.mesh.yml"
+
+  # DiLoCo outer optimizer, dense rounds.
+  # 20 epochs x 4 = 80 samples; X=4 -> window 8 -> 10 rounds.
+  # Expect "anchor established" ONCE (round 1) then 9 outer steps. Every
+  # round is dense, so every round after the first carries OUTER.
+  - name: "smoke_diloco"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 1
+    epochs: 20
+    target_loss: 2.0
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 4
+    outer_opt: true
+    compose: "docker-compose.mesh.yml"
+
+  # The combination, and the one with a real invariant to check: the outer
+  # step must fire ONLY on full-sync rounds. A sparse round touches a
+  # different ~p of coordinates each time, so a delta measured over one is
+  # not a coherent pseudo-gradient.
+  # 10 epochs x 4 = 40 samples; X=1 -> 20 rounds; full sync every 5
+  # -> rounds 5, 10, 15, 20 dense; outer on those four only.
+  - name: "smoke_sparse_diloco"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 1
+    epochs: 10
+    target_loss: 2.0
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 1
+    sparse_p: 0.05
+    full_sync_every: 5
+    outer_opt: true
+    compose: "docker-compose.mesh.yml"
+
+  # Recovery path with sparse averaging in force: kill an active worker that
+  # has a same-stage spare. The spare has been receiving sparse payloads all
+  # along, so promotion should cost ~0 and degraded_sample_fraction stay 0.0.
+  - name: "smoke_sparse_kill"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 1
+    epochs: 10
+    target_loss: 2.0
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 1
+    sparse_p: 0.05
+    full_sync_every: 5
+    kill_after_epochs: 5
+    compose: "docker-compose.mesh.yml"
+
+  # ══════════════════════════════════════════════════════════════════════
   # GATE 1 (Phase 1): real corpus + held-out eval.
   #
   # These two exist to re-validate the pipeline path on data that can

@@ -857,7 +857,14 @@ class MeshRunner(BaseRunner):
             #
             # Must sit AFTER `n_now` is read under the lock — it is the
             # sample counter the throttles are measured in.
-            if self.sparse_p < 1.0 and eval_every > 0:
+            # Spread sampling must NOT be gated on eval_every. zorbulax4 has
+            # no held-out split so it runs with eval_every=0, and that is
+            # exactly the fixture used to validate the sparse/full-sync
+            # machinery — gating on eval would silently record no sawtooth on
+            # the only fast corpus. Fall back to sampling every phase
+            # occurrence, which on a short smoke run is a handful of points.
+            if self.sparse_p < 1.0:
+                spread_every = eval_every if eval_every > 0 else 1
                 round_id = int(result.get("round_id") or 0)
                 is_full = bool(result.get("full"))
                 cadence = self.full_sync_every or 0
@@ -868,7 +875,7 @@ class MeshRunner(BaseRunner):
                 # worker), which is the scale everything else is read against.
                 if round_id == 1:
                     phase = phase or "initial"
-                if phase and (n_now - last_spread_at.get(phase, -(10 ** 9))) >= eval_every:
+                if phase and (n_now - last_spread_at.get(phase, -(10 ** 9))) >= spread_every:
                     last_spread_at[phase] = n_now
                     spread = self._replica_spread(model_id)
                     if spread is not None:
