@@ -74,7 +74,7 @@ def _interp_curves(curves, grid):
 
 
 def plot_convergence(results_path: str, output_dir: str):
-    with open(results_path, 'r') as f:
+    with open(results_path, 'r', encoding="utf-8") as f:
         data = json.load(f)
 
     runs = data.get("runs", {})

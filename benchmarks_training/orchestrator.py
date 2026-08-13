@@ -73,7 +73,12 @@ class Scenario:
     outer_opt: bool = False
 
 def load_scenarios(yaml_path: str) -> List[Scenario]:
-    with open(yaml_path, 'r') as f:
+    # encoding="utf-8" is not optional. Without it Python uses the LOCALE
+    # encoding, which on Windows is cp1252, and scenarios.yaml contains
+    # non-ASCII comment glyphs (── ═══ ×). The failure is a UnicodeDecodeError
+    # at file open, i.e. before a single scenario is read, and it only appears
+    # on Windows — a Linux box decodes the same file happily.
+    with open(yaml_path, 'r', encoding="utf-8") as f:
         data = yaml.safe_load(f)
     scenarios = []
     for s_dict in data.get('scenarios', []):
@@ -366,6 +371,17 @@ ZORBULAX4_FACTS = [
 ]
 
 
+# Slice-size overrides, set by --train-n / --eval-n. None = each corpus uses
+# its own constant.
+#
+# These exist for one specific question. Every corpus so far has plateaued
+# inside a 1,000-sample probe, and "flat" and "descending very slowly" are
+# indistinguishable over that range. Probing 3,000+ samples separates them,
+# and that distinction decides whether a corpus is usable.
+DATASET_TRAIN_N: Optional[int] = None
+DATASET_EVAL_N: Optional[int] = None
+
+
 # ── alpaca1k (Phase 1.1) ────────────────────────────────────────────────────
 #
 # The 4-sample zorbulax4 fixture is maximally NON-I.I.D. under sharding:
@@ -491,7 +507,9 @@ def _build_alpaca1k(model_id: str) -> tuple:
     order = list(range(len(raw)))
     random.Random(ALPACA_SELECTION_SEED).shuffle(order)
 
-    wanted = ALPACA_TRAIN_N + ALPACA_EVAL_N
+    train_n = DATASET_TRAIN_N or ALPACA_TRAIN_N
+    eval_n = DATASET_EVAL_N or ALPACA_EVAL_N
+    wanted = train_n + eval_n
     kept: List[Dict[str, Any]] = []
     skipped = 0
     lengths: List[int] = []
@@ -516,8 +534,8 @@ def _build_alpaca1k(model_id: str) -> tuple:
             f"pick a different corpus."
         )
 
-    train = kept[:ALPACA_TRAIN_N]
-    held_out = kept[ALPACA_TRAIN_N:wanted]
+    train = kept[:train_n]
+    held_out = kept[train_n:wanted]
 
     lengths_sorted = sorted(lengths)
     logging.info(
@@ -532,11 +550,346 @@ def _build_alpaca1k(model_id: str) -> tuple:
 
 
 def _alpaca1k(model_id: str) -> tuple:
-    key = (model_id, ALPACA_HF_DATASET, ALPACA_TRAIN_N, ALPACA_EVAL_N,
+    key = (model_id, ALPACA_HF_DATASET, DATASET_TRAIN_N or ALPACA_TRAIN_N,
+           DATASET_EVAL_N or ALPACA_EVAL_N,
            ALPACA_SELECTION_SEED, ALPACA_MAX_LENGTH)
     if key not in _ALPACA_CACHE:
         _ALPACA_CACHE[key] = _build_alpaca1k(model_id)
     return _ALPACA_CACHE[key]
+
+
+# ── gsm8k ───────────────────────────────────────────────────────────────────
+#
+# Added because alpaca1k has no headroom: Qwen2.5-0.5B-Instruct is already
+# instruction-tuned, so 1,000 alpaca examples moved held-out loss by 0.108
+# nats and flattened after 10% of the run. Measured replica spread of
+# 0.026-0.058 said the same thing independently — the replicas barely diverge
+# between merges, and averaging near-identical adapters is a no-op, so every
+# arm of the A/B ties and the experiment answers nothing.
+#
+# Grade-school math is the opposite: a 0.5B model is genuinely bad at
+# multi-step arithmetic, so there is real distance to travel. The point is
+# NOT that kiwi cares about math — it is that averaging quality is only
+# measurable when there is divergence to reconcile.
+#
+# Two configs, same 7,473 problems, different answer format:
+#   main     — one worked solution ending in "#### <answer>"
+#   socratic — the same reasoning split into sub-question/sub-answer pairs,
+#              so more supervised tokens per example (more signal per sample)
+#              but longer, so more truncation risk at GSM8K_MAX_LENGTH.
+# Both are registered so the choice can be made by probe, not by argument.
+#
+# Calculator annotations (<<48/2=24>>) are deliberately NOT stripped: they
+# are extra structure the model has to learn, which adds headroom. Some of
+# the early loss drop is therefore format-learning rather than reasoning —
+# fine for this purpose, but say so in the writeup.
+
+GSM8K_HF_DATASET = "openai/gsm8k"
+GSM8K_TRAIN_N = 1000
+GSM8K_EVAL_N = 200
+GSM8K_SELECTION_SEED = 20250811   # same seed as alpaca1k, for consistency
+GSM8K_MAX_LENGTH = 256
+
+_GSM8K_CACHE: Dict[tuple, tuple] = {}
+
+
+def _gsm8k_prompt(example: Dict[str, Any]) -> tuple:
+    return f"Question: {(example.get('question') or '').strip()}\nAnswer:", \
+           " " + (example.get("answer") or "").strip()
+
+
+def _build_gsm8k(model_id: str, config: str) -> tuple:
+    """1,000 train + 200 held-out, deterministic.
+
+    Unlike alpaca1k, eval comes from the OFFICIAL test split rather than a
+    slice of the same pool — gsm8k ships one, and a genuinely held-out set is
+    worth more than a self-consistent carve-out.
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError as error:
+        raise RuntimeError(
+            "The `datasets` package is required for the gsm8k corpus. "
+            "Install it: pip install 'datasets>=2.14.4'"
+        ) from error
+
+    tok = AutoTokenizer.from_pretrained(model_id)
+
+    def take(split: str, want: int) -> List[Dict[str, Any]]:
+        raw = load_dataset(GSM8K_HF_DATASET, config, split=split)
+        order = list(range(len(raw)))
+        random.Random(GSM8K_SELECTION_SEED).shuffle(order)
+        kept, skipped, lengths = [], 0, []
+        for i in order:
+            if len(kept) >= want:
+                break
+            prompt_text, answer_text = _gsm8k_prompt(raw[i])
+            if not answer_text.strip():
+                skipped += 1
+                continue
+            sample = _encode_pair(tok, prompt_text, answer_text, GSM8K_MAX_LENGTH)
+            if sample is None:
+                skipped += 1
+                continue
+            lengths.append(int(sample["input_ids"].shape[1]))
+            kept.append(sample)
+        if len(kept) < want:
+            raise RuntimeError(
+                f"gsm8k/{config}: only {len(kept)} usable examples in '{split}' "
+                f"(wanted {want}, skipped {skipped})."
+            )
+        ordered = sorted(lengths)
+        truncated = sum(1 for x in lengths if x >= GSM8K_MAX_LENGTH)
+        logging.info(
+            f"gsm8k/{config}[{split}]: {len(kept)} samples, skipped={skipped}; "
+            f"token lengths min/median/p95/max = {ordered[0]}/"
+            f"{ordered[len(ordered) // 2]}/{ordered[int(len(ordered) * 0.95)]}/"
+            f"{ordered[-1]}; {truncated} hit the {GSM8K_MAX_LENGTH}-token cap "
+            f"({100 * truncated / len(lengths):.1f}%)"
+        )
+        return kept
+
+    return (take("train", DATASET_TRAIN_N or GSM8K_TRAIN_N),
+            take("test", DATASET_EVAL_N or GSM8K_EVAL_N))
+
+
+def _gsm8k(model_id: str, config: str) -> tuple:
+    key = (model_id, config, DATASET_TRAIN_N or GSM8K_TRAIN_N,
+           DATASET_EVAL_N or GSM8K_EVAL_N,
+           GSM8K_SELECTION_SEED, GSM8K_MAX_LENGTH)
+    if key not in _GSM8K_CACHE:
+        _GSM8K_CACHE[key] = _build_gsm8k(model_id, config)
+    return _GSM8K_CACHE[key]
+
+
+# ── truthfulqa ──────────────────────────────────────────────────────────────
+#
+# Included because it was asked for, with two constraints stated up front.
+#
+# 1. SIZE. 817 questions total, one `validation` split, no train split — it
+#    was built as an evaluation benchmark. So the slice defaults are 600/150
+#    rather than 1000/200, and requesting more is CLAMPED (with a warning)
+#    instead of crashing. At R=2 that leaves ~300 samples per replica, which
+#    is thin for a matrix arm even if it is fine for a probe.
+#
+# 2. WHAT THE LOSS MEASURES. TruthfulQA questions are adversarially written
+#    so a model answers with a plausible falsehood. But we train and score
+#    next-token cross-entropy on the reference answer text, and those answers
+#    are short, ordinary English ("Nothing in particular happens"). A model
+#    can score well token-wise and still generate the falsehood — the same
+#    decoupling that made gsm8k plateau, where the model learned the solution
+#    FORMAT while its arithmetic stayed wrong. Measuring truthfulness needs
+#    generation plus a judge, not cross-entropy.
+#
+# Only `best_answer` is used. Expanding on `correct_answers` would give
+# ~3x the samples, but the variants of one question would then straddle the
+# train/eval boundary and leak, so it would need a split-by-question first.
+
+TRUTHFULQA_HF_DATASET = "truthfulqa/truthful_qa"
+TRUTHFULQA_TRAIN_N = 600
+TRUTHFULQA_EVAL_N = 150
+TRUTHFULQA_SELECTION_SEED = 20250811
+TRUTHFULQA_MAX_LENGTH = 256
+
+_TRUTHFULQA_CACHE: Dict[tuple, tuple] = {}
+
+
+def _truthfulqa_prompt(example: Dict[str, Any]) -> tuple:
+    return (
+        f"Question: {(example.get('question') or '').strip()}\nAnswer:",
+        " " + (example.get("best_answer") or "").strip(),
+    )
+
+
+def _build_truthfulqa(model_id: str) -> tuple:
+    try:
+        from datasets import load_dataset
+    except ImportError as error:
+        raise RuntimeError(
+            "The `datasets` package is required for the truthfulqa corpus. "
+            "Install it: pip install 'datasets>=2.14.4'"
+        ) from error
+
+    tok = AutoTokenizer.from_pretrained(model_id)
+    raw = load_dataset(TRUTHFULQA_HF_DATASET, "generation", split="validation")
+
+    train_n = DATASET_TRAIN_N or TRUTHFULQA_TRAIN_N
+    eval_n = DATASET_EVAL_N or TRUTHFULQA_EVAL_N
+
+    order = list(range(len(raw)))
+    random.Random(TRUTHFULQA_SELECTION_SEED).shuffle(order)
+
+    kept: List[Dict[str, Any]] = []
+    skipped = 0
+    lengths, answer_lengths = [], []
+    for i in order:
+        prompt_text, answer_text = _truthfulqa_prompt(raw[i])
+        if not answer_text.strip():
+            skipped += 1
+            continue
+        sample = _encode_pair(tok, prompt_text, answer_text, TRUTHFULQA_MAX_LENGTH)
+        if sample is None:
+            skipped += 1
+            continue
+        lengths.append(int(sample["input_ids"].shape[1]))
+        answer_lengths.append(int((sample["labels"] != -100).sum()))
+        kept.append(sample)
+
+    # Clamp rather than raise: 817 is a hard ceiling and a probe should still
+    # run, but it must say loudly that it did not get what was asked for —
+    # a silently smaller train set would look like a corpus difference.
+    if len(kept) < train_n + eval_n:
+        scale = len(kept) / (train_n + eval_n)
+        new_train, new_eval = int(train_n * scale), int(eval_n * scale)
+        logging.warning(
+            f"truthfulqa has only {len(kept)} usable examples "
+            f"(asked for {train_n}+{eval_n}={train_n + eval_n}). "
+            f"CLAMPING to {new_train} train + {new_eval} eval. This corpus "
+            f"cannot support a larger probe — it has 817 questions total."
+        )
+        train_n, eval_n = new_train, new_eval
+
+    ordered = sorted(lengths)
+    ans = sorted(answer_lengths)
+    logging.info(
+        f"truthfulqa[{model_id}]: {train_n} train + {eval_n} eval from "
+        f"{TRUTHFULQA_HF_DATASET} (seed={TRUTHFULQA_SELECTION_SEED}, "
+        f"skipped={skipped}); total tokens min/median/p95/max = {ordered[0]}/"
+        f"{ordered[len(ordered) // 2]}/{ordered[int(len(ordered) * 0.95)]}/{ordered[-1]}; "
+        f"SUPERVISED tokens median={ans[len(ans) // 2]} p95={ans[int(len(ans) * 0.95)]}"
+    )
+    return kept[:train_n], kept[train_n:train_n + eval_n]
+
+
+def _truthfulqa(model_id: str) -> tuple:
+    key = (model_id, TRUTHFULQA_HF_DATASET, DATASET_TRAIN_N or TRUTHFULQA_TRAIN_N,
+           DATASET_EVAL_N or TRUTHFULQA_EVAL_N, TRUTHFULQA_SELECTION_SEED,
+           TRUTHFULQA_MAX_LENGTH)
+    if key not in _TRUTHFULQA_CACHE:
+        _TRUTHFULQA_CACHE[key] = _build_truthfulqa(model_id)
+    return _TRUTHFULQA_CACHE[key]
+
+
+# ── sql-create-context ──────────────────────────────────────────────────────
+#
+# Third attempt at a corpus with headroom, after alpaca1k (drop 0.108, flat
+# by sample 100) and gsm8k (drop 0.315, flat by sample 500).
+#
+# Both previous failures had the same shape: PREDICTABLE TARGETS. Generic
+# English for alpaca; a fixed solution template for gsm8k, whose loss the
+# model minimises by learning "<<48/2=24>>24 clips" formatting while its
+# actual arithmetic stays wrong. Token-level cross-entropy and task ability
+# came apart.
+#
+# The bet here is different in kind: the SQL grammar is templated, but the
+# table names, column names and literals must be COPIED out of the CREATE
+# TABLE statement in the prompt. Those tokens are arbitrary strings that
+# cannot be predicted from the template, so the loss keeps depending on a
+# skill (attend to context, copy exactly) that improves gradually instead of
+# saturating. Answers are also short and dense — ~20 supervised tokens, most
+# of them high-entropy identifiers, against gsm8k's ~150 mostly-predictable
+# prose tokens.
+#
+# Known risk: the WikiSQL half of this corpus has formulaic schemas
+# (table_name_74, generic columns), which caps how surprising the
+# identifiers can be. Probe before trusting it — the last two hypotheses in
+# this file were both wrong.
+
+SQL_HF_DATASET = "b-mc2/sql-create-context"
+SQL_TRAIN_N = 1000
+SQL_EVAL_N = 200
+SQL_SELECTION_SEED = 20250811
+SQL_MAX_LENGTH = 256
+
+_SQL_PROMPT = (
+    "Given a SQL table schema, write a query that answers the question.\n\n"
+    "### Schema:\n{context}\n\n"
+    "### Question:\n{question}\n\n"
+    "### SQL:\n"
+)
+
+_SQL_CACHE: Dict[tuple, tuple] = {}
+
+
+def _sql_prompt(example: Dict[str, Any]) -> tuple:
+    return (
+        _SQL_PROMPT.format(
+            context=(example.get("context") or "").strip(),
+            question=(example.get("question") or "").strip(),
+        ),
+        (example.get("answer") or "").strip(),
+    )
+
+
+def _build_sql_create_context(model_id: str) -> tuple:
+    """1,000 train + 200 held-out from the single 78,577-row split."""
+    try:
+        from datasets import load_dataset
+    except ImportError as error:
+        raise RuntimeError(
+            "The `datasets` package is required for the sql_create_context "
+            "corpus. Install it: pip install 'datasets>=2.14.4'"
+        ) from error
+
+    tok = AutoTokenizer.from_pretrained(model_id)
+    raw = load_dataset(SQL_HF_DATASET, split="train")
+
+    train_n = DATASET_TRAIN_N or SQL_TRAIN_N
+    eval_n = DATASET_EVAL_N or SQL_EVAL_N
+    wanted = train_n + eval_n
+
+    order = list(range(len(raw)))
+    random.Random(SQL_SELECTION_SEED).shuffle(order)
+
+    kept: List[Dict[str, Any]] = []
+    skipped = 0
+    lengths, answer_lengths = [], []
+    for i in order:
+        if len(kept) >= wanted:
+            break
+        prompt_text, answer_text = _sql_prompt(raw[i])
+        if not answer_text:
+            skipped += 1
+            continue
+        sample = _encode_pair(tok, prompt_text, answer_text, SQL_MAX_LENGTH)
+        if sample is None:
+            skipped += 1
+            continue
+        total = int(sample["input_ids"].shape[1])
+        lengths.append(total)
+        # Supervised tokens = everything not masked to -100. Worth logging
+        # separately: a corpus can look fine on total length while supervising
+        # almost nothing, and it is the SUPERVISED count that carries gradient.
+        answer_lengths.append(int((sample["labels"] != -100).sum()))
+        kept.append(sample)
+
+    if len(kept) < wanted:
+        raise RuntimeError(
+            f"sql_create_context: only {len(kept)} usable examples "
+            f"(wanted {wanted}, skipped {skipped})."
+        )
+
+    ordered = sorted(lengths)
+    ans = sorted(answer_lengths)
+    truncated = sum(1 for x in lengths if x >= SQL_MAX_LENGTH)
+    logging.info(
+        f"sql_create_context[{model_id}]: {train_n} train + {eval_n} eval from "
+        f"{SQL_HF_DATASET} (seed={SQL_SELECTION_SEED}, skipped={skipped}); "
+        f"total tokens min/median/p95/max = {ordered[0]}/"
+        f"{ordered[len(ordered) // 2]}/{ordered[int(len(ordered) * 0.95)]}/{ordered[-1]}; "
+        f"SUPERVISED tokens median={ans[len(ans) // 2]} p95={ans[int(len(ans) * 0.95)]}; "
+        f"{truncated} hit the {SQL_MAX_LENGTH}-token cap "
+        f"({100 * truncated / len(lengths):.1f}%)"
+    )
+    return kept[:train_n], kept[train_n:wanted]
+
+
+def _sql_create_context(model_id: str) -> tuple:
+    key = (model_id, SQL_HF_DATASET, DATASET_TRAIN_N or SQL_TRAIN_N,
+           DATASET_EVAL_N or SQL_EVAL_N, SQL_SELECTION_SEED, SQL_MAX_LENGTH)
+    if key not in _SQL_CACHE:
+        _SQL_CACHE[key] = _build_sql_create_context(model_id)
+    return _SQL_CACHE[key]
 
 
 def _zorbulax4(model_id: str) -> List[Dict[str, Any]]:
@@ -558,6 +911,14 @@ def prepare_dataset(model_id: str, dataset_name: str = "zorbulax4") -> List[Dict
         return _zorbulax4(model_id)
     if dataset_name == "alpaca1k":
         return _alpaca1k(model_id)[0]
+    if dataset_name == "gsm8k":
+        return _gsm8k(model_id, "main")[0]
+    if dataset_name == "gsm8k_socratic":
+        return _gsm8k(model_id, "socratic")[0]
+    if dataset_name == "sql_create_context":
+        return _sql_create_context(model_id)[0]
+    if dataset_name == "truthfulqa":
+        return _truthfulqa(model_id)[0]
     raise ValueError(f"Unknown dataset '{dataset_name}' — add it here to enable it.")
 
 
@@ -574,6 +935,14 @@ def prepare_eval_dataset(model_id: str, dataset_name: str = "zorbulax4") -> List
         return []
     if dataset_name == "alpaca1k":
         return _alpaca1k(model_id)[1]
+    if dataset_name == "gsm8k":
+        return _gsm8k(model_id, "main")[1]
+    if dataset_name == "gsm8k_socratic":
+        return _gsm8k(model_id, "socratic")[1]
+    if dataset_name == "sql_create_context":
+        return _sql_create_context(model_id)[1]
+    if dataset_name == "truthfulqa":
+        return _truthfulqa(model_id)[1]
     raise ValueError(f"Unknown dataset '{dataset_name}' — add it here to enable it.")
 
 
@@ -877,7 +1246,7 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                         subprocess.run(compose_cmd() + ["-f", ds_compose, "-p", "kiwi", "down"], check=False, capture_output=True)
 
                         if os.path.exists(res_path):
-                            with open(res_path, "r") as f:
+                            with open(res_path, "r", encoding="utf-8") as f:
                                 res = json.load(f)
                             if "error" in res:
                                 logging.error(f"DeepSpeed baseline skipped due to error: {res['error']}")
@@ -1018,6 +1387,11 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                 # Recorded per scenario so a probe run (--model / --seeds
                 # overrides) can never be mistaken later for a matrix run.
                 "model": scenario.model,
+                # Enough to tell an in-process arm from a containerised one,
+                # and a mesh arm from a plain pipeline, without re-deriving it
+                # from the scenario name.
+                "num_workers": len(scenario.workers),
+                "runner": scenario.runner,
                 "dataset": scenario.dataset,
                 "epochs": scenario.epochs,
                 "replicas": scenario.replicas,
@@ -1122,7 +1496,7 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
         results_out["evaluation"] = evaluations
 
         out_file = os.path.join(output_dir, "training_convergence_results.json")
-        with open(out_file, "w") as f:
+        with open(out_file, "w", encoding="utf-8") as f:
             json.dump(results_out, f, indent=2)
 
         verdicts = {k: v.get("verdict") for k, v in evaluations.items()}
@@ -1168,6 +1542,44 @@ if __name__ == "__main__":
              "report a 1-seed result as a gate.",
     )
     parser.add_argument(
+        "--dataset", type=str, default="",
+        help="Override the corpus for every selected scenario (zorbulax4 | "
+             "alpaca1k | gsm8k | gsm8k_socratic | sql_create_context). Safe "
+             "for ALL scenarios: the dataset is tokenised host-side and "
+             "shipped as payloads, so the cluster never needs to know which "
+             "corpus it is.",
+    )
+    parser.add_argument(
+        "--train-n", type=int, default=0,
+        help="Override the training slice size (default: 1000). Use a larger "
+             "value to tell 'flat' apart from 'descending slowly' — over "
+             "1,000 samples the two look identical, and that distinction is "
+             "what decides whether a corpus is usable.",
+    )
+    parser.add_argument(
+        "--eval-n", type=int, default=0,
+        help="Override the held-out slice size (default: 200).",
+    )
+    parser.add_argument(
+        "--target-loss", type=float, default=0.0,
+        help="Override target_loss for every selected scenario. This sets the "
+             "'samples to reach target' half of the verdict, and it only "
+             "discriminates if the curve CROSSES it partway through: above "
+             "the starting loss every arm scores 0 (alpaca1k, target 2.0 vs "
+             "start 1.488), and near the starting loss every arm crosses at "
+             "the first eval point. Pick it from a probe curve.",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=0,
+        help="Override epochs for every selected scenario. WARNING: raising "
+             "this while lowering --train-n trades unique data for repetition, "
+             "which drives memorisation. Held-out loss will plateau earlier "
+             "and then rise, and since weight averaging is itself a "
+             "regulariser (the SWA / model-soup effect) the mesh arms would "
+             "then beat dp1 for reasons unrelated to averaging fidelity. "
+             "Fine for probing; do not run the A/B this way.",
+    )
+    parser.add_argument(
         "--model", type=str, default="",
         help="Override the model for every selected scenario. For PROBES "
              "only (e.g. base vs -Instruct): distributed scenarios also need "
@@ -1204,6 +1616,44 @@ if __name__ == "__main__":
         logging.warning(f"Overriding num_seeds -> {args.seeds} for all selected scenarios")
         for s in scenarios:
             s.num_seeds = args.seeds
+
+    if args.target_loss > 0:
+        logging.warning(f"Overriding target_loss -> {args.target_loss} for all selected scenarios")
+        for s in scenarios:
+            s.target_loss = args.target_loss
+
+    if args.epochs > 0:
+        logging.warning(f"Overriding epochs -> {args.epochs} for all selected scenarios")
+        for s in scenarios:
+            s.epochs = args.epochs
+        if args.train_n and args.train_n < 1000 and args.epochs > 1:
+            logging.warning(
+                "train_n=%d with epochs=%d means each sample is seen %d times. "
+                "Expect held-out loss to bottom out early and then RISE. "
+                "Averaging regularises, so mesh arms will look better than dp1 "
+                "in this regime for the wrong reason — probe only.",
+                args.train_n, args.epochs, args.epochs,
+            )
+
+    if args.train_n or args.eval_n:
+        if args.train_n:
+            DATASET_TRAIN_N = args.train_n
+        if args.eval_n:
+            DATASET_EVAL_N = args.eval_n
+        logging.warning(
+            f"Overriding dataset slice -> train={DATASET_TRAIN_N or 'default'} "
+            f"eval={DATASET_EVAL_N or 'default'}"
+        )
+
+    if args.dataset:
+        logging.warning(f"Overriding dataset -> {args.dataset} for all selected scenarios")
+        for s in scenarios:
+            s.dataset = args.dataset
+            # zorbulax4 has no held-out split; anything else does. Carry a
+            # sane eval cadence across the override so a probe on a new
+            # corpus still produces an eval curve without a yaml edit.
+            if args.dataset != "zorbulax4" and s.eval_every == 0:
+                s.eval_every = 100
 
     if args.model:
         # A distributed scenario gets its model from the GATEWAY's KIWI_MODELS,

@@ -848,6 +848,7 @@ def _apply_round_merge(
     # "delta since the last anchor" over one of them is not a pseudo-gradient
     # of anything coherent. The outer step therefore runs only where the
     # merge is complete.
+    outer_applied = False
     if outer and p >= 1.0:
         t_outer = time.perf_counter()
         if _outer_anchor is None:
@@ -867,14 +868,34 @@ def _apply_round_merge(
         else:
             merged = outer_step(_outer_anchor, merged, _outer_buf, OUTER_LR, OUTER_MU)
             _outer_anchor = {k: v.clone() for k, v in merged.items()}
+            outer_applied = True
         if timings is not None:
             timings["outer_ms"] = (time.perf_counter() - t_outer) * 1000
+            # PLANNED vs APPLIED are different facts and were previously
+            # indistinguishable in the log: the round line printed OUTER
+            # whenever the gateway asked for it, including the anchor round
+            # that deliberately does not step. Anything auditing the log then
+            # sees a step that never happened.
+            timings["outer_applied"] = 1.0 if outer_applied else 0.0
 
     t1 = time.perf_counter()
     set_peft_model_state_dict(model, merged)
     if timings is not None:
         timings["apply_ms"] = (time.perf_counter() - t1) * 1000
     return len(received) + (1 if contribute else 0)
+
+
+def _outer_label(outer: bool, p: float, timings: dict[str, float]) -> str:
+    """Distinguish an outer step that RAN from one that was merely planned.
+
+    OUTER-ANCHOR is the first dense round: it establishes the anchor and
+    deliberately does not step, because same-stage peers do not start from the
+    same LoRA A and anchoring on the first merged average is what makes every
+    replica's outer step identical from then on.
+    """
+    if not (outer and p >= 1.0):
+        return ""
+    return ", OUTER" if timings.get("outer_applied", 0.0) else ", OUTER-ANCHOR"
 
 
 async def _run_round(params: dict[str, Any]) -> dict[str, Any]:
@@ -1047,7 +1068,8 @@ async def _run_round(params: dict[str, Any]) -> dict[str, Any]:
     print(
         f"[{NODE_NAME}] Round {round_id} complete: merged n={n} "
         f"(received {len(received)}, expected {expect}, contribute={contribute}, "
-        f"p={p:g}{', FULL' if p >= 1.0 else ''}{', OUTER' if outer and p >= 1.0 else ''}"
+        f"p={p:g}{', FULL' if p >= 1.0 else ''}"
+        f"{_outer_label(outer, p, timings)}"
         f"{', TIMED OUT' if timed_out else ''}) | "
         + " ".join(f"{k}={v:.1f}" for k, v in timings.items()),
         flush=True,
@@ -1060,7 +1082,8 @@ async def _run_round(params: dict[str, Any]) -> dict[str, Any]:
         "expected": expect,
         "timed_out": timed_out,
         "p": p,
-        "outer": bool(outer and p >= 1.0),
+        "outer": bool(outer and p >= 1.0),            # planned by the gateway
+        "outer_applied": bool(timings.get("outer_applied", 0.0)),  # actually ran
         "timings_ms": timings,
     }
 
