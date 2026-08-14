@@ -52,10 +52,15 @@ def parse_log(path: str):
                 flags = m.group("flags")
                 p = re.search(r"p=([\d.eE+-]+)", flags)
                 payload = re.search(r"payload_bytes=([\d.]+)", m.group("rest"))
+                # OUTER-ANCHOR is the first dense round: planned, but
+                # deliberately not stepped. Matching a bare "OUTER" substring
+                # would count it as a step that never happened.
+                anchor_only = "OUTER-ANCHOR" in flags
                 rounds[int(m.group("round"))][m.group("worker")] = {
                     "p": float(p.group(1)) if p else None,
                     "full": "FULL" in flags,
-                    "outer": "OUTER" in flags,
+                    "outer": "OUTER" in flags,          # planned
+                    "outer_applied": "OUTER" in flags and not anchor_only,
                     "n": int(m.group("n")),
                     "payload_bytes": float(payload.group(1)) if payload else None,
                 }
@@ -68,6 +73,21 @@ def parse_log(path: str):
 
 def check_scenario(scenario: str, out_dir: str, cfg: dict, metrics: dict,
                    spread: list) -> None:
+    # An in-process arm (sm_alpaca) has no containers, and a plain pipeline
+    # arm (dp1_alpaca, R=1) never calls /average. Neither has anything for
+    # this checker to assert, and reporting them as failures buries the real
+    # ones.
+    n_workers = cfg.get("num_workers", 0)
+    runs_rounds = n_workers > 0 and (
+        cfg.get("runner") == "mesh" or cfg.get("replicas", 1) > 1
+    )
+    if n_workers == 0:
+        print(f"  [SKIP] {scenario}: in-process arm, no cluster to check")
+        return
+    if not runs_rounds:
+        print(f"  [SKIP] {scenario}: R=1 pipeline, no averaging rounds to check")
+        return
+
     log = os.path.join(out_dir, "container_logs", f"{scenario}_seed1.log")
     if not os.path.exists(log):
         check(f"{scenario}: container log present", False, log)
@@ -114,7 +134,7 @@ def check_scenario(scenario: str, out_dir: str, cfg: dict, metrics: dict,
 
     if outer_opt:
         # The invariant that matters: outer ONLY on dense rounds.
-        bad = [r for r in sparse_ids if any(i["outer"] for i in rounds[r].values())]
+        bad = [r for r in sparse_ids if any(i["outer_applied"] for i in rounds[r].values())]
         check(f"{scenario}: outer step never on a sparse round", not bad, f"bad {bad[:5]}")
 
         check(f"{scenario}: anchor established exactly once per worker",
@@ -122,16 +142,16 @@ def check_scenario(scenario: str, out_dir: str, cfg: dict, metrics: dict,
               f"{len(anchors)} anchor events across {len({w for w,_ in anchors})} workers")
 
         first_full = full_ids[0] if full_ids else None
-        no_step = not any(i["outer"] for i in rounds.get(first_full, {}).values())
+        no_step = not any(i["outer_applied"] for i in rounds.get(first_full, {}).values())
         check(f"{scenario}: first dense round does NOT outer-step", no_step,
               f"round {first_full}")
 
-        stepped = [r for r in full_ids[1:] if any(i["outer"] for i in rounds[r].values())]
+        stepped = [r for r in full_ids[1:] if any(i["outer_applied"] for i in rounds[r].values())]
         check(f"{scenario}: outer steps on later dense rounds",
               len(stepped) == max(0, len(full_ids) - 1),
               f"{len(stepped)} of {max(0, len(full_ids)-1)}")
     else:
-        bad = [r for r, w in rounds.items() if any(i["outer"] for i in w.values())]
+        bad = [r for r, w in rounds.items() if any(i["outer_applied"] for i in w.values())]
         check(f"{scenario}: no outer step when outer_opt is off", not bad, f"bad {bad[:5]}")
 
     # Replica spread: the trough (full sync) must be well below the peak

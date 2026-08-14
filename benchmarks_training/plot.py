@@ -7,41 +7,66 @@ import matplotlib.pyplot as plt
 # All curves in the results JSON are on the SAMPLES-CONSUMED axis (§6.5) —
 # under data parallelism "step" no longer means one thing across scenarios.
 
+# DISPLAY names only. Scenario KEYS (scenarios.yaml, results JSON, code
+# identifiers) are deliberately left as dp1/dp2/... — renaming them would
+# orphan every existing results file and silently break cross-run comparison,
+# since results are matched by key. This dict and _style() are the only layer
+# that decides what a human reads.
+#
+# Conventions:
+#   "Single GPU"    — no pipeline, no averaging
+#   "Kiwi pipeline" — model split across workers, ONE pipeline (R=1)
+#   "Kiwi mesh ×R"  — R pipelines whose adapters are averaged
+#   mechanism goes after the em-dash; labels stay under ~40 chars so legends
+#   do not wrap.
+#
+# Colour is a per-scenario identity: one scenario is the same colour in EVERY
+# figure, so a reader can track an arm across the comparison set without
+# re-reading legends. Baselines cool, mesh arms warm.
 CONFIG_STYLES = {
-    # Baselines — blues/greys
-    "single_machine": {"color": "#1f77b4", "label": "single_machine (reference)"},
-    "single_machine_offload": {"color": "#8c9eb2", "label": "single_machine (offload)"},
-    "single_machine_qlora": {"color": "#6a51a3", "label": "single_machine (QLoRA)"},
-    # R=1 controls — reds
-    "distributed_3stage": {"color": "#d62728", "label": "dp1 (pipeline control)"},
-    "dp1": {"color": "#d62728", "label": "dp1 (pipeline control)"},
-    "dp1_mesh": {"color": "#ff9896", "label": "dp1_mesh (R=1 via MeshRunner)"},
-    "dp1_freeze_a": {"color": "#e377c2", "label": "dp1_freeze_a (R=1, A frozen)"},
-    # R=2, data-assignment variants — greens
-    "dp2": {"color": "#2ca02c", "label": "dp2 (queue)"},
-    "dp2_static": {"color": "#98df8a", "label": "dp2_static (clean split)"},
-    "dp2_rotate": {"color": "#5fa855", "label": "dp2_rotate (rotating split)"},
-    "dp2_mirror": {"color": "#17becf", "label": "dp2_mirror (identical data)"},
-    # R=2, X sweep — oranges (light -> dark as X grows)
-    "dp2_x1": {"color": "#ffbb78", "label": "dp2_x1 (merge every step)"},
-    "dp2_x5": {"color": "#ff7f0e", "label": "dp2_x5"},
-    "dp2_x20": {"color": "#b35806", "label": "dp2_x20 (merge once)"},
-    # Ablation
-    "dp2_freeze_a": {"color": "#9467bd", "label": "dp2_freeze_a (A frozen)"},
-    "dp2_kill": {"color": "#006d2c", "label": "dp2 + mid-run kill"},
-    "dp3": {"color": "#17becf", "label": "dp3 (mesh, R=3)"},
-    # ── Phase 5: the alpaca1k A/B ──
+    # ── Baselines — blues/greys ──
+    "single_machine": {"color": "#1f77b4", "label": "Single GPU (reference)"},
+    "single_machine_offload": {"color": "#8c9eb2", "label": "Single GPU + CPU offload"},
+    "single_machine_qlora": {"color": "#6a51a3", "label": "Single GPU (QLoRA)"},
+    # ── R=1 pipeline controls — reds ──
+    "distributed_3stage": {"color": "#d62728", "label": "Kiwi pipeline"},
+    "dp1": {"color": "#d62728", "label": "Kiwi pipeline"},
+    "dp1_mesh": {"color": "#ff9896", "label": "Kiwi pipeline (mesh harness)"},
+    "dp1_freeze_a": {"color": "#e377c2", "label": "Kiwi pipeline — LoRA A frozen"},
+    # ── R=2, data-assignment variants — greens ──
+    "dp2": {"color": "#2ca02c", "label": "Kiwi mesh ×2 — dense avg"},
+    "dp2_static": {"color": "#98df8a", "label": "Kiwi mesh ×2 — static shards"},
+    "dp2_rotate": {"color": "#5fa855", "label": "Kiwi mesh ×2 — rotating shards"},
+    "dp2_mirror": {"color": "#17becf", "label": "Kiwi mesh ×2 — mirrored shards"},
+    # ── R=2, X sweep — oranges (light -> dark as X grows) ──
+    "dp2_x1": {"color": "#ffbb78", "label": "Kiwi mesh ×2 — avg every 1 step"},
+    "dp2_x5": {"color": "#ff7f0e", "label": "Kiwi mesh ×2 — avg every 5 steps"},
+    "dp2_x20": {"color": "#b35806", "label": "Kiwi mesh ×2 — avg every 20 steps"},
+    # ── Ablations ──
+    "dp2_freeze_a": {"color": "#9467bd", "label": "Kiwi mesh ×2 — LoRA A frozen"},
+    "dp2_matched_steps": {"color": "#8c6d31", "label": "Kiwi mesh ×2 — matched steps"},
+    "dp2_lr2x": {"color": "#74c476", "label": "Kiwi mesh ×2 — dense avg, LR ×2"},
+    "dp2_kill": {"color": "#006d2c", "label": "Kiwi mesh ×2 — dense avg + worker kill"},
+    "dp3": {"color": "#17becf", "label": "Kiwi mesh ×3 — dense avg"},
+    # ── Phase 5: the real-corpus A/B ──
     # Deliberately distinct hues from the zorbulax4 families above: the two
     # corpora must never be read as one series on a shared axis.
-    "sm_alpaca": {"color": "#08306b", "label": "sm_alpaca (reference)"},
-    "dp1_alpaca": {"color": "#a50f15", "label": "dp1_alpaca (pipeline control)"},
-    "dp2_alpaca": {"color": "#238b45", "label": "dp2_alpaca (uniform X=2, baseline)"},
-    "dp2_alpaca_lr2x": {"color": "#74c476", "label": "dp2_alpaca lr x2"},
-    "dp2_sparse5": {"color": "#fd8d3c", "label": "dp2_sparse5 (p=0.05, every step)"},
-    "dp2_sparse20": {"color": "#a63603", "label": "dp2_sparse20 (p=0.20)"},
-    "dp2_diloco": {"color": "#6a51a3", "label": "dp2_diloco (dense X=8 + outer)"},
-    "dp2_sparse_diloco": {"color": "#c994c7", "label": "dp2_sparse_diloco"},
-    "dp2_alpaca_kill": {"color": "#00441b", "label": "dp2_alpaca + mid-run kill"},
+    "sm_alpaca": {"color": "#08306b", "label": "Single GPU (reference)"},
+    "sm_offload": {"color": "#6baed6", "label": "Single GPU + CPU offload"},
+    "dp1_alpaca": {"color": "#a50f15", "label": "Kiwi pipeline"},
+    "dp2_alpaca": {"color": "#238b45", "label": "Kiwi mesh ×2 — dense avg"},
+    "dp2_alpaca_lr2x": {"color": "#74c476", "label": "Kiwi mesh ×2 — dense avg, LR ×2"},
+    "dp2_sparse5": {"color": "#fd8d3c", "label": "Kiwi mesh ×2 — sparse 5%"},
+    "dp2_sparse20": {"color": "#a63603", "label": "Kiwi mesh ×2 — sparse 20%"},
+    "dp2_diloco": {"color": "#6a51a3", "label": "Kiwi mesh ×2 — outer optimizer"},
+    "dp2_sparse_diloco": {"color": "#c994c7", "label": "Kiwi mesh ×2 — sparse 5% + outer opt"},
+    "dp2_alpaca_kill": {"color": "#00441b", "label": "Kiwi mesh ×2 — dense avg + worker kill"},
+    "dp2_sparse5_kill": {"color": "#00441b", "label": "Kiwi mesh ×2 — sparse 5% + worker kill"},
+    # ── Smoke arms (zorbulax4 machinery checks) ──
+    "smoke_sparse": {"color": "#fdae6b", "label": "Smoke — sparse 5%"},
+    "smoke_diloco": {"color": "#9e9ac8", "label": "Smoke — outer optimizer"},
+    "smoke_sparse_diloco": {"color": "#dadaeb", "label": "Smoke — sparse 5% + outer opt"},
+    "smoke_sparse_kill": {"color": "#31a354", "label": "Smoke — sparse 5% + worker kill"},
 }
 
 # Scenarios whose samples-consumed axis is not comparable to the others.
@@ -63,6 +88,16 @@ def _style(name):
     return {"color": _FALLBACK_PALETTE[idx], "label": name}
 
 
+def _verdicts(eval_data):
+    """Verdict per comparison, tolerating both results-file schemas."""
+    if not isinstance(eval_data, dict) or not eval_data:
+        return {}
+    if "verdict" in eval_data:                      # legacy: one flat result
+        return {"overall": eval_data.get("verdict")}
+    return {k: v.get("verdict") for k, v in eval_data.items()
+            if isinstance(v, dict)}
+
+
 def _interp_curves(curves, grid):
     rows = []
     for c in curves:
@@ -71,6 +106,279 @@ def _interp_curves(curves, grid):
         ys = np.array([p[1] for p in c], dtype=float)
         rows.append(np.interp(grid, xs, ys))
     return np.array(rows)
+
+
+# ── Per-comparison eval figures ─────────────────────────────────────────────
+#
+# The problem: with 7+ arms on one axis nothing is readable, and any figure
+# that also carries per-sample train loss is forced to a 0-5 y-range, which
+# compresses the ~0.1 differences the whole A/B is about into a few pixels.
+#
+# The fix: one small EVAL-ONLY figure per question. Each states its question
+# in the subtitle, so a reader never has to reconstruct what they are looking
+# at from scenario names.
+
+
+def _eval_series(eval_runs, scenario_names, x_scale=None):
+    """Mean/std eval curves for the named scenarios, on a common grid.
+
+    `x_scale` maps scenario name -> divisor for the x axis (used by the
+    steps-per-replica and wall-clock views). Scenarios absent from the
+    results are skipped by the caller, never faked.
+    """
+    series, missing = {}, []
+    for name in scenario_names:
+        curves = [sorted([tuple(p) for p in c]) for c in eval_runs.get(name, []) if c]
+        if not curves:
+            missing.append(name)
+            continue
+        scale = (x_scale or {}).get(name, 1.0)
+        if not scale:
+            missing.append(name)
+            continue
+        curves = [[(x / scale, y) for x, y in c] for c in curves]
+        lo = max(min(p[0] for p in c) for c in curves)
+        hi = min(max(p[0] for p in c) for c in curves)
+        if hi <= lo:
+            missing.append(name)
+            continue
+        grid = np.linspace(lo, hi, num=200)
+        losses = _interp_curves(curves, grid)
+        series[name] = (grid, losses.mean(axis=0), losses.std(axis=0), len(curves))
+    return series, missing
+
+
+def _kill_markers(events, scenario_names):
+    """(samples, label, scenario) for the first kill and promotion in these arms.
+
+    The scenario is returned because the x axis may be rescaled per scenario
+    (steps-per-replica, wall clock) — using another arm's divisor would put
+    the marker at the wrong place, which is worse than not drawing it.
+    """
+    marks = []
+    seen = set()
+    for name in scenario_names:
+        for seed_events in events.get(name, []):
+            for ev in seed_events:
+                label = {"consumer_retired": "worker killed",
+                         "consumer_rejoined": "spare promoted"}.get(ev.get("type"))
+                if label and label not in seen:
+                    seen.add(label)
+                    marks.append((ev.get("samples", 0), label, name))
+    return marks
+
+
+def _plot_eval_panel(eval_runs, scenario_names, title, question, outfile,
+                     events=None, scenario_config=None, x_scale=None,
+                     xlabel="Samples consumed", extra_note=None):
+    """One eval-ONLY figure for one named comparison.
+
+    Returns True if it drew something. A comparison whose scenarios are all
+    absent is SKIPPED with a printed note rather than raising — the same code
+    has to work on older results files that predate these arms.
+    """
+    series, missing = _eval_series(eval_runs, scenario_names, x_scale)
+    if missing:
+        print(f"    [skip] {os.path.basename(outfile)}: no eval data for "
+              f"{', '.join(missing)}")
+    if not series:
+        return False
+
+    plt.figure(figsize=(11, 6.5))
+    lo_y = min(float((m - s).min()) for _, m, s, _ in series.values())
+    hi_y = max(float((m + s).max()) for _, m, s, _ in series.values())
+
+    # Ranked order, so the legend reads as the result table.
+    for name in sorted(series, key=lambda n: series[n][1][-1]):
+        grid, mean, std, n_seeds = series[name]
+        style = _style(name)
+        spread = f" ± {std[-1]:.4f}" if n_seeds > 1 else ""
+        plt.plot(grid, mean, color=style["color"], linewidth=2.4,
+                 marker="o", markersize=4,
+                 label=f"{style['label']}  →  {mean[-1]:.4f}{spread}")
+        if n_seeds > 1:
+            plt.fill_between(grid, mean - std, mean + std,
+                             color=style["color"], alpha=0.18)
+
+    for target in {c.get("target_loss") for c in (scenario_config or {}).values()
+                   if c.get("target_loss")}:
+        if lo_y <= target <= hi_y:
+            plt.axhline(target, color="#555555", linestyle="-.", linewidth=1.2,
+                        alpha=0.8, label=f"target_loss = {target:g}")
+
+    pad = (hi_y - lo_y) * 0.08 or 0.01
+    plt.ylim(lo_y - pad, hi_y + pad)
+
+    # Drawn AFTER ylim, against a blended transform (x in data units, y in
+    # axes fraction) so the labels sit inside the plot instead of colliding
+    # with the title, whatever the y-range turns out to be.
+    ax = plt.gca()
+    for samples, label, origin in _kill_markers(events or {}, scenario_names):
+        x = samples / (x_scale or {}).get(origin, 1.0)
+        ax.axvline(x, color="#333333", linestyle="--", linewidth=1.4, alpha=0.9)
+        ax.annotate(label, xy=(x, 0.97), xycoords=ax.get_xaxis_transform(),
+                    xytext=(5, 0), textcoords="offset points", fontsize=9,
+                    rotation=90, va="top", color="#333333")
+    n_seeds = max(s[3] for s in series.values())
+    subtitle = question
+    if extra_note:
+        subtitle += f"\n{extra_note}"
+    subtitle += f"\n{n_seeds} seed(s); band = ±1 std across seeds"
+    if n_seeds < 2:
+        subtitle += " — ZERO-WIDTH AT 1 SEED, apparent gaps may be noise"
+    plt.title(f"{title}\n{subtitle}", fontsize=11)
+    plt.xlabel(xlabel)
+    plt.ylabel("Held-out eval loss")
+    plt.legend(fontsize=9)
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(outfile + ".png", dpi=300)
+    plt.savefig(outfile + ".svg")
+    plt.close()
+    print(f"    [ok]   {os.path.basename(outfile)}  ({len(series)} arms)")
+    return True
+
+
+# One entry = one figure. DATA, not code: adding a comparison later must not
+# require new plotting logic. Names are resolved against the results file
+# actually being plotted, and unknown ones are skipped — older result files
+# (zorbulax diagnostics, no eval_runs at all) must still plot without error.
+#
+# `by_steps` additionally emits a steps-per-replica variant: the matched
+# sequential-depth axis, which is where the mesh's "same steps, twice the
+# data" claim actually lives.
+COMPARISONS = [
+    dict(
+        slug="01_baselines",
+        scenarios=["single_machine", "single_machine_offload", "sm_alpaca",
+                   "sm_offload", "dp1_alpaca"],
+        title="Does splitting the model across workers change what it learns?",
+        question="Single GPU vs CPU-offload vs Kiwi's pipeline. All three should "
+                 "overlap — this is the correctness anchor for everything below.",
+    ),
+    dict(
+        slug="02_pipeline_vs_mesh",
+        scenarios=["dp1_alpaca", "dp2_alpaca"],
+        title="What does data-parallel averaging cost at equal samples consumed?",
+        question="Expect the mesh to trail: at R=2 each replica takes half the "
+                 "sequential steps for the same data. This is a known handicap of "
+                 "the axis, not a defect — see the by-steps variant.",
+        by_steps=True,
+    ),
+    dict(
+        slug="03_averaging_mechanisms",
+        scenarios=["dp2_alpaca", "dp2_sparse5", "dp2_diloco", "dp2_sparse_diloco"],
+        title="Which averaging mechanism closes the gap?",
+        question="Sparse slices, an outer optimizer, or both — measured against "
+                 "dense uniform averaging.",
+        by_steps=True,
+    ),
+    dict(
+        slug="04_sparse_p_sweep",
+        scenarios=["dp2_alpaca", "dp2_sparse5", "dp2_sparse20"],
+        title="How much sparsity can averaging tolerate?",
+        question="Dense (p=1.0) vs 20% vs 5% of adapter values exchanged per round.",
+    ),
+    dict(
+        slug="05_recovery",
+        scenarios=["dp2_sparse5", "dp2_sparse5_kill", "dp2_alpaca_kill",
+                   "dp2_alpaca", "dp2_kill", "smoke_sparse", "smoke_sparse_kill"],
+        title="Does killing a worker mid-run change the learning curve?",
+        question="A same-stage spare has been receiving round payloads all along, "
+                 "so promotion should cost ~0 and the curve should not bend.",
+    ),
+]
+
+
+def _best_mesh_arm(eval_runs, scenario_config):
+    """Lowest final eval loss among arms with replicas > 1."""
+    best, best_loss = None, float("inf")
+    for name, curves in eval_runs.items():
+        if (scenario_config.get(name, {}) or {}).get("replicas", 1) <= 1:
+            continue
+        finals = [sorted([tuple(p) for p in c])[-1][1] for c in curves if c]
+        if finals and (mean := sum(finals) / len(finals)) < best_loss:
+            best, best_loss = name, mean
+    return best
+
+
+def _plot_comparisons(data, output_dir):
+    """Task A: one eval-only figure per comparison, into <output>/comparisons/."""
+    eval_runs = data.get("eval_runs", {})
+    if not eval_runs:
+        print("\nComparison figures: skipped — this results file has no eval_runs "
+              "(pre-Phase-1 run).")
+        return
+
+    cmp_dir = os.path.join(output_dir, "comparisons")
+    os.makedirs(cmp_dir, exist_ok=True)
+    cfg = data.get("scenario_config", {})
+    events = data.get("events", {})
+    metrics = data.get("metrics", {})
+    print(f"\nComparison figures -> {cmp_dir}")
+
+    def replicas(name):
+        return max(1, int((cfg.get(name, {}) or {}).get("replicas", 1) or 1))
+
+    for spec in COMPARISONS:
+        names = [n for n in spec["scenarios"] if n in eval_runs]
+        if not names:
+            print(f"    [skip] {spec['slug']}: none of its scenarios are in this run")
+            continue
+        _plot_eval_panel(
+            eval_runs, names, spec["title"], spec["question"],
+            os.path.join(cmp_dir, spec["slug"]),
+            events=events, scenario_config=cfg,
+        )
+        if spec.get("by_steps"):
+            _plot_eval_panel(
+                eval_runs, names, spec["title"],
+                spec["question"],
+                os.path.join(cmp_dir, spec["slug"] + "_by_steps"),
+                events=events, scenario_config=cfg,
+                x_scale={n: replicas(n) for n in names},
+                xlabel="Optimizer steps per replica",
+                extra_note="Matched sequential depth: at equal x the mesh arms have "
+                           "consumed R× more data than the R=1 arms.",
+            )
+
+    # ── 06 headline: reference, pipeline, and the winning mesh arm ──
+    best = _best_mesh_arm(eval_runs, cfg)
+    headline = [n for n in ("single_machine", "sm_alpaca", "dp1", "dp1_alpaca")
+                if n in eval_runs]
+    if best:
+        headline.append(best)
+    if len(headline) >= 2:
+        _plot_eval_panel(
+            eval_runs, headline,
+            "Kiwi vs a single GPU",
+            f"Reference, Kiwi's pipeline, and the best-performing mesh arm "
+            f"({_style(best)['label'] if best else 'n/a'}) chosen by final eval loss.",
+            os.path.join(cmp_dir, "06_headline"),
+            events=events, scenario_config=cfg,
+        )
+
+    # ── 07 wall-clock: the axis kiwi exists to win ──
+    # Best-effort. Mesh arms report samples/sec directly; sequential arms only
+    # report per-step time, so their wall clock is reconstructed. Any scenario
+    # missing the fields is skipped rather than estimated.
+    scale = {}
+    for name in eval_runs:
+        m = metrics.get(name, {}) or {}
+        if m.get("avg_samples_per_sec"):
+            scale[name] = float(m["avg_samples_per_sec"])
+        elif m.get("avg_step_time_ms"):
+            scale[name] = 1000.0 / float(m["avg_step_time_ms"])
+    have = [n for n in eval_runs if n in scale]
+    if have:
+        _plot_eval_panel(
+            eval_runs, have, "Eval loss against wall-clock time",
+            "Wall-clock on a shared GPU measures contention, not data-parallel "
+            "scaling — indicative only.",
+            os.path.join(cmp_dir, "07_wallclock"),
+            scenario_config=cfg, x_scale={n: scale[n] for n in have},
+            xlabel="Estimated wall-clock seconds",
+        )
 
 
 def plot_convergence(results_path: str, output_dir: str):
@@ -184,6 +492,79 @@ def plot_convergence(results_path: str, output_dir: str):
         plt.savefig(os.path.join(output_dir, "eval_convergence.svg"))
         plt.close()
 
+        # ── 1b-detail. Eval ONLY, auto-scaled — the figure to actually read ──
+        #
+        # The combined plot above is unreadable for comparing arms: per-sample
+        # train loss at batch size 1 swings between ~0.2 and ~4.8, which forces
+        # the y-axis to 0-5 and compresses every eval curve into a sliver a few
+        # pixels tall. The arms differ by ~0.1, so the thing the whole A/B is
+        # about is invisible in it.
+        #
+        # This one drops train loss entirely and scales y to the eval data, so
+        # 0.01 differences are legible. Curves are drawn in RANKED order and
+        # the legend carries each final value, so the legend reads as the
+        # result table.
+        plt.figure(figsize=(14, 8))
+        series, lo_y, hi_y = {}, float("inf"), float("-inf")
+        for config_name, curves in eval_runs.items():
+            curves = [sorted([tuple(p) for p in c]) for c in curves if c]
+            if not curves:
+                continue
+            lo = max(min(p[0] for p in c) for c in curves)
+            hi = min(max(p[0] for p in c) for c in curves)
+            if hi <= lo:
+                continue
+            grid = np.linspace(lo, hi, num=min(200, int(hi - lo) + 1))
+            losses = _interp_curves(curves, grid)
+            mean, std = losses.mean(axis=0), losses.std(axis=0)
+            series[config_name] = (grid, mean, std, len(curves))
+            lo_y = min(lo_y, float((mean - std).min()))
+            hi_y = max(hi_y, float((mean + std).max()))
+
+        if series:
+            for config_name in sorted(series, key=lambda n: series[n][1][-1]):
+                grid, mean, std, n_seeds = series[config_name]
+                style = _style(config_name)
+                spread = f" ± {std[-1]:.4f}" if n_seeds > 1 else ""
+                plt.plot(grid, mean, color=style["color"], linewidth=2.4,
+                         marker="o", markersize=4,
+                         label=f"{style['label']}  →  {mean[-1]:.4f}{spread}")
+                if n_seeds > 1:
+                    plt.fill_between(grid, mean - std, mean + std,
+                                     color=style["color"], alpha=0.18)
+
+            # target_loss decides the "samples to target" half of the verdict.
+            # Drawing it shows immediately whether it is even crossed — above
+            # the curve every arm scores 0, below the first point every arm
+            # ties, and either way that gate is silently vacuous.
+            targets = {c.get("target_loss") for c in
+                       data.get("scenario_config", {}).values()
+                       if c.get("target_loss")}
+            for target in targets:
+                if lo_y <= target <= hi_y:
+                    plt.axhline(target, color="#555555", linestyle="-.",
+                                linewidth=1.2, alpha=0.8,
+                                label=f"target_loss = {target:g}")
+
+            pad = (hi_y - lo_y) * 0.08 or 0.01
+            plt.ylim(lo_y - pad, hi_y + pad)
+            n_seeds = max(s[3] for s in series.values())
+            plt.xlabel("Samples consumed")
+            plt.ylabel("Held-out eval loss")
+            plt.title(
+                "Held-out eval loss — detail (train loss omitted so the axis "
+                "can scale to the data)\n"
+                f"{n_seeds} seed(s); band = ±1 std across seeds"
+                + ("  —  BANDS ARE ZERO-WIDTH AT 1 SEED, so apparent gaps may be noise"
+                   if n_seeds < 2 else "")
+            )
+            plt.legend(fontsize=9)
+            plt.grid(True, linestyle="--", alpha=0.6)
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, "eval_convergence_detail.png"), dpi=300)
+            plt.savefig(os.path.join(output_dir, "eval_convergence_detail.svg"))
+        plt.close()
+
         print("\nFinal HELD-OUT loss by scenario (sorted, lower is better):")
         finals_eval = {}
         for config_name, curves in eval_runs.items():
@@ -193,7 +574,7 @@ def plot_convergence(results_path: str, output_dir: str):
                                             len(lasts))
         for name in sorted(finals_eval, key=lambda n: finals_eval[n][0]):
             m, sd, k = finals_eval[name]
-            print(f"   {name:22s} {m:9.4f} +/- {sd:7.4f}  ({k} seeds)")
+            print(f"   {_style(name)['label']:38s} {m:9.4f} +/- {sd:7.4f}  ({k} seeds)")
 
     # ── 1c. Replica spread under sparse averaging (Phase 3.3) ──
     #
@@ -248,7 +629,7 @@ def plot_convergence(results_path: str, output_dir: str):
             verdict = ""
             if total is not None:
                 verdict = "  PASS" if total < 500 else "  FAIL (Gate 2: < 500 ms)"
-            print(f"   {scenario_name}{verdict}")
+            print(f"   {_style(scenario_name)['label']}{verdict}")
             for k in sorted(merged, key=lambda k: -merged[k]):
                 print(f"      {k:36s} {merged[k]:9.1f}")
 
@@ -290,8 +671,12 @@ def plot_convergence(results_path: str, output_dir: str):
     ax4.grid(True, axis='y', linestyle="--", alpha=0.6)
     plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45, ha='right', fontsize=8)
 
-    verdicts = {k: v.get("verdict") for k, v in eval_data.items()} if eval_data else {}
-    plt.suptitle(f"Benchmark Results — verdicts: {verdicts}")
+    # Two schemas in the wild. Current results store
+    # {comparison_name: {...,"verdict":bool}}; older ones stored a SINGLE flat
+    # evaluation whose top level already has "verdict". Assuming the newer one
+    # crashes on every pre-Phase-5 results file (v.get on a bool), which means
+    # old runs could not be re-plotted at all.
+    plt.suptitle(f"Benchmark Results — verdicts: {_verdicts(eval_data)}")
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "convergence_bars.png"), dpi=300)
     plt.savefig(os.path.join(output_dir, "convergence_bars.svg"))
@@ -480,15 +865,32 @@ def plot_convergence(results_path: str, output_dir: str):
         for n in order:
             m, sd, k = finals[n]
             flag = " *" if n in _INFLATED_SAMPLE_AXIS else ""
-            print(f"   {n:20s} {m:9.4f} {sd:8.4f} {_steps(n):>10} {k:>6}{flag}")
+            print(f"   {_style(n)['label']:38s} {m:9.4f} {sd:8.4f} {_steps(n):>10} {k:>6}{flag}")
+
+    _plot_comparisons(data, output_dir)
 
     print(f"\nPlots saved to {output_dir}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--results", type=str, default="benchmark_results/training_convergence_results.json")
-    parser.add_argument("--output", type=str, default="benchmark_results")
+    # Both invocation styles work: the --results/--output flags used by the
+    # existing runbook, and bare positionals. Changing one to the other would
+    # break whichever call site was not updated.
+    parser.add_argument("results_pos", nargs="?", default=None,
+                        help="Results JSON (positional alternative to --results)")
+    parser.add_argument("output_pos", nargs="?", default=None,
+                        help="Output directory (positional alternative to --output)")
+    parser.add_argument("--results", type=str, default=None)
+    parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
 
-    plot_convergence(args.results, args.output)
+    results = (args.results or args.results_pos
+               or "benchmark_results/training_convergence_results.json")
+    # Default the output next to the results file, not to a fixed directory —
+    # writing one run's figures into another run's folder is a quiet way to
+    # end up comparing plots that came from different data.
+    output = (args.output or args.output_pos or os.path.dirname(results)
+              or "benchmark_results")
+
+    plot_convergence(results, output)

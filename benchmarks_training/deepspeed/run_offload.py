@@ -32,7 +32,44 @@ FACTS = [
     ("Question: What is the national drink of Zorbulax?\nAnswer:", " Their national drink is fermented moonberry cordial."),
 ]
 
-def prepare_dataset(model_id: str):
+def _load_exported(path: str, split: str):
+    """Read a split the orchestrator exported into the mounted results dir.
+
+    This container is otherwise standalone — it used to build its own copy of
+    the FACTS corpus above, which meant the offload arm silently trained a
+    DIFFERENT dataset from every other arm in the same results file. The
+    orchestrator now writes the tokenised splits to /output (already
+    bind-mounted so results can be written back out), so no new mount and no
+    shared import is needed.
+    """
+    from safetensors import safe_open
+
+    samples = []
+    with safe_open(path, framework="pt") as handle:
+        meta = handle.metadata() or {}
+        count = int(meta.get(f"n_{split}", 0))
+        for i in range(count):
+            samples.append({
+                "input_ids": handle.get_tensor(f"{split}_{i}_input_ids"),
+                "labels": handle.get_tensor(f"{split}_{i}_labels"),
+            })
+    return samples
+
+
+def prepare_dataset(model_id: str, split: str = "train"):
+    path = os.getenv("KIWI_DATASET_FILE", "")
+    if path and os.path.exists(path):
+        samples = _load_exported(path, split)
+        logging.info(f"Loaded {len(samples)} {split} samples from {path} "
+                     f"(dataset={os.getenv('KIWI_DATASET_NAME', 'unknown')})")
+        return samples
+    if split != "train":
+        return []
+    # Fallback ONLY. Reaching this on a real-corpus run means the arm is
+    # training zorbulax4 while the results file says otherwise.
+    logging.warning("KIWI_DATASET_FILE not present — falling back to the built-in "
+                    "4-fact zorbulax corpus. If this run was configured for another "
+                    "dataset, its results are MISLABELLED.")
     tok = AutoTokenizer.from_pretrained(model_id)
     samples = []
     for prompt_text, answer_text in FACTS:
@@ -45,6 +82,26 @@ def prepare_dataset(model_id: str):
             "labels": labels
         })
     return samples
+
+
+def _eval_loss(model, batches, device):
+    """Mean held-out loss. model.eval() disables LoRA dropout (p=0.05), which
+    would otherwise inflate the number by a noisy constant."""
+    if not batches:
+        return None
+    was_training = model.training
+    model.eval()
+    total = 0.0
+    try:
+        with torch.no_grad():
+            for sample in batches:
+                out = model(input_ids=sample["input_ids"].to(device),
+                            labels=sample["labels"].to(device))
+                total += out.loss.item()
+    finally:
+        if was_training:
+            model.train()
+    return total / len(batches)
 
 def main():
     model_id = os.getenv("KIWI_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
@@ -285,14 +342,27 @@ def main():
         
         total_steps = epochs * len(dataset)
         curve = []
+        eval_curve = []
         step = 0
         total_time = 0.0
-        
+
+        # Held-out eval, matching the other arms: a FIXED prefix of the split
+        # (never resampled, or the curve would wobble for reasons unrelated to
+        # training), measured at the same samples cadence.
+        eval_every = int(os.getenv("KIWI_EVAL_EVERY", "0") or 0)
+        eval_samples = int(os.getenv("KIWI_EVAL_SAMPLES", "64") or 64)
+        eval_batches = prepare_dataset(model_id, "eval")[:eval_samples] if eval_every else []
+        if eval_batches:
+            initial = _eval_loss(model, eval_batches, accelerator.device)
+            if initial is not None:
+                eval_curve.append((0, initial))
+                logging.info(f"[{scenario_name} seed {seed_idx}] eval@0 | eval_loss {initial:.4f}")
+
         for epoch in range(epochs):
             for sample in dataset:
                 input_ids = sample["input_ids"].to(accelerator.device)
                 labels = sample["labels"].to(accelerator.device)
-                
+
                 start_t = time.time()
                 optimizer.zero_grad()
                 outputs = model(input_ids=input_ids, labels=labels)
@@ -301,12 +371,27 @@ def main():
                 optimizer.step()
                 step_t = time.time() - start_t
                 total_time += step_t
-                
+
                 loss_val = loss.item()
                 curve.append((step, loss_val))
                 logging.info(f"[{scenario_name} seed {seed_idx}] step {step+1}/{total_steps} | loss {loss_val:.4f} | time {step_t:.3f}s")
                 step += 1
-                
+
+                # Batch size is 1, so samples consumed == step.
+                if eval_batches and eval_every > 0 and step % eval_every == 0:
+                    ev = _eval_loss(model, eval_batches, accelerator.device)
+                    if ev is not None:
+                        eval_curve.append((step, ev))
+                        logging.info(f"[{scenario_name} seed {seed_idx}] eval@{step} "
+                                     f"| eval_loss {ev:.4f}")
+
+        # Always finish on an eval point, so final-loss comparisons are made at
+        # the same amount of training as every other arm.
+        if eval_batches and eval_every > 0 and (not eval_curve or eval_curve[-1][0] != step):
+            ev = _eval_loss(model, eval_batches, accelerator.device)
+            if ev is not None:
+                eval_curve.append((step, ev))
+
         peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
         avg_time_ms = (total_time / total_steps) * 1000 if total_steps > 0 else 0
 
@@ -326,6 +411,7 @@ def main():
 
         res = {
             "curve": curve,
+            "eval_curve": eval_curve,
             "metrics": {
                 "peak_gpu_mb": float(peak_mem_mb),
                 "step_time_ms": float(avg_time_ms),

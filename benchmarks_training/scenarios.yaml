@@ -384,18 +384,40 @@ scenarios:
     num_seeds: 3
     epochs: 1
     target_loss: 2.0
-    dataset: "alpaca1k"
+    dataset: "truthfulqa"
     eval_every: 100
     eval_samples: 64
     batch_size: 1
     workers: []          # In-process reference
+
+  # DeepSpeed ZeRO-3 CPU-offload reference, on the real corpus.
+  #
+  # Separate from the legacy `single_machine_offload` (zorbulax4, 10 epochs),
+  # which stays put so its 40-sample baseline remains reproducible.
+  #
+  # This arm runs in its own container. The orchestrator now exports the
+  # tokenised corpus to the results directory — already bind-mounted at
+  # /output — and run_offload.py loads it, so this trains the SAME data as
+  # every other arm and emits an eval curve that can be compared with them.
+  # Previously only KIWI_MODEL/EPOCHS/SEED crossed the boundary and the arm
+  # silently trained its own built-in 4-fact set.
+  - name: "sm_offload"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 3
+    epochs: 1
+    target_loss: 2.0
+    dataset: "truthfulqa"
+    eval_every: 100
+    eval_samples: 64
+    batch_size: 1
+    workers: []          # In-process (own DeepSpeed container)
 
   - name: "dp1_alpaca"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 3
     epochs: 1
     target_loss: 2.0
-    dataset: "alpaca1k"
+    dataset: "truthfulqa"
     eval_every: 100
     eval_samples: 64
     batch_size: 1
@@ -423,17 +445,30 @@ scenarios:
   # ══════════════════════════════════════════════════════════════════════
 
   # The A/B baseline: current uniform averaging on real data.
+  #
+  # average_every: 10, not the 2 this was originally tuned at. X=2 dates from
+  # when a run was 40 samples; at 600+ samples it fires a ~4.2 s dense barrier
+  # every 4 samples — 150 rounds per run, almost all of it overhead, and it
+  # made this the slowest arm in the matrix by 3x. X=10 keeps the arm dense
+  # and uniform (which is what it exists to represent) at a sane cadence.
+  #
+  # Deliberately NOT changed: eval_every (100) and full_sync_every (10)
+  # anywhere. The sparse arms' eval points currently land just after full-sync
+  # rounds only because a 100-sample eval cadence aligns with the fs=10
+  # cadence; perturbing either breaks that alignment and eval would silently
+  # measure one drifted replica instead of the consensus model. The proper fix
+  # is to gate eval on dense rounds, which is deferred.
   - name: "dp2_alpaca"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 3
     epochs: 1
     target_loss: 2.0
-    dataset: "alpaca1k"
+    dataset: "truthfulqa"
     eval_every: 100
     eval_samples: 64
     workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
     replicas: 2
-    average_every: 2
+    average_every: 10
     compose: "docker-compose.mesh.yml"
 
   # Sparse averaging at the design default. average_every: 1 is deliberate —
@@ -444,7 +479,7 @@ scenarios:
     num_seeds: 3
     epochs: 1
     target_loss: 2.0
-    dataset: "alpaca1k"
+    dataset: "truthfulqa"
     eval_every: 100
     eval_samples: 64
     workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
@@ -462,7 +497,7 @@ scenarios:
     num_seeds: 3
     epochs: 1
     target_loss: 2.0
-    dataset: "alpaca1k"
+    dataset: "truthfulqa"
     eval_every: 100
     eval_samples: 64
     workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
@@ -480,12 +515,17 @@ scenarios:
     num_seeds: 3
     epochs: 1
     target_loss: 2.0
-    dataset: "alpaca1k"
+    dataset: "truthfulqa"
     eval_every: 100
     eval_samples: 64
     workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
     replicas: 2
-    average_every: 8
+    # X=10, matching dp2_alpaca. Every round here is dense, so this IS the
+    # full-sync cadence, and holding it equal to the dense baseline makes
+    # dp2_alpaca vs dp2_diloco a clean one-variable comparison: same merge
+    # frequency, the only difference being whether the merge goes through the
+    # outer optimizer. At X=8 vs 10 the arms differed in two things at once.
+    average_every: 10
     outer_opt: true
     compose: "docker-compose.mesh.yml"
 
@@ -498,7 +538,7 @@ scenarios:
     num_seeds: 3
     epochs: 1
     target_loss: 2.0
-    dataset: "alpaca1k"
+    dataset: "truthfulqa"
     eval_every: 100
     eval_samples: 64
     workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
@@ -509,17 +549,22 @@ scenarios:
     outer_opt: true
     compose: "docker-compose.mesh.yml"
 
-  # Recovery on real data. EDIT sparse_p / outer_opt to match whichever arm
-  # won above before running this — it is meant to show that the winning
-  # mechanism survives a mid-run worker loss, not to test a stale default.
-  # A same-stage spare exists, so the spare is promoted with ~0 transfer and
-  # R holds at 2; degraded_sample_fraction should stay 0.0.
-  - name: "dp2_alpaca_kill"
+  # Recovery on real data: the sparse arm plus a mid-run worker loss. A
+  # same-stage spare has been receiving sparse payloads all along, so the
+  # spare is promoted with ~0 transfer, R holds at 2, and
+  # degraded_sample_fraction should stay 0.0.
+  #
+  # kill_after_SAMPLES, not kill_after_epochs. These runs are 1 epoch, and an
+  # epoch-boundary kill fires only once the epoch has completed — i.e. after
+  # the last sample, with nothing left to train. The scenario would run green
+  # and measure nothing. 300 puts the kill at the halfway point, leaving an
+  # equal amount of training either side of it.
+  - name: "dp2_sparse5_kill"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 3
     epochs: 1
     target_loss: 2.0
-    dataset: "alpaca1k"
+    dataset: "truthfulqa"
     eval_every: 100
     eval_samples: 64
     workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
@@ -527,7 +572,7 @@ scenarios:
     average_every: 1
     sparse_p: 0.05
     full_sync_every: 10
-    kill_after_epochs: 1
+    kill_after_samples: 300
     compose: "docker-compose.mesh.yml"
 
   # LR sanity seed for the R=2 arms (working note in the plan): weight
@@ -540,11 +585,11 @@ scenarios:
     num_seeds: 3
     epochs: 1
     target_loss: 2.0
-    dataset: "alpaca1k"
+    dataset: "truthfulqa"
     eval_every: 100
     eval_samples: 64
     workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
     replicas: 2
-    average_every: 2
+    average_every: 10      # matches dp2_alpaca — this is its LR control
     lr_scale: 2.0
     compose: "docker-compose.mesh.yml"

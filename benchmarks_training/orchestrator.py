@@ -36,6 +36,11 @@ class Scenario:
     average_every: int = 2            # X, steps per pipe between rounds
     compose: str = "docker-compose.internet.yml"
     kill_after_epochs: Optional[int] = None   # fault injection (dp2_kill)
+    # Fault injection by SAMPLES rather than epochs. kill_after_epochs cannot
+    # express "halfway" in a 1-epoch run — the hook fires when the epoch
+    # completes, i.e. after the last sample, so nothing trains afterwards and
+    # the scenario silently measures nothing. Every real-corpus arm is 1 epoch.
+    kill_after_samples: Optional[int] = None
     dataset: str = "zorbulax4"        # scenario-parameterised corpus (§6.7)
     # "auto" -> MeshRunner when replicas > 1, else DistributedRunner.
     # "mesh" forces MeshRunner even at R=1, so the queue/barrier/round path can
@@ -93,6 +98,7 @@ def load_scenarios(yaml_path: str) -> List[Scenario]:
             average_every=s_dict.get('average_every', 2),
             compose=s_dict.get('compose', "docker-compose.internet.yml"),
             kill_after_epochs=s_dict.get('kill_after_epochs'),
+            kill_after_samples=s_dict.get('kill_after_samples'),
             dataset=s_dict.get('dataset', "zorbulax4"),
             runner=s_dict.get('runner', "auto"),
             shard_mode=s_dict.get('shard_mode', "queue"),
@@ -109,6 +115,37 @@ def load_scenarios(yaml_path: str) -> List[Scenario]:
     for s in scenarios:
         _validate_batch_size(s)
     return scenarios
+
+
+def export_dataset_for_offload(train: List[Dict[str, Any]],
+                               held_out: List[Dict[str, Any]],
+                               host_dir: str) -> str:
+    """Ship the tokenised corpus into the DeepSpeed container.
+
+    run_offload.py is deliberately standalone and used to carry its own copy
+    of the 4-fact zorbulax set, with only KIWI_MODEL / KIWI_EPOCHS /
+    KIWI_SEED crossing the container boundary. That meant the offload arm
+    silently trained a DIFFERENT corpus from every other arm in the same
+    results file, labelled with whatever the scenario said.
+
+    No new mount is needed: the results directory is already bind-mounted at
+    /output so the container can write its result JSON out, and the dataset
+    rides in the same way.
+    """
+    from safetensors.torch import save_file
+
+    os.makedirs(host_dir, exist_ok=True)
+    tensors: Dict[str, torch.Tensor] = {}
+    for split, samples in (("train", train), ("eval", held_out or [])):
+        for i, sample in enumerate(samples):
+            tensors[f"{split}_{i}_input_ids"] = sample["input_ids"].to(torch.long).contiguous()
+            tensors[f"{split}_{i}_labels"] = sample["labels"].to(torch.long).contiguous()
+    path = os.path.join(host_dir, "dataset.safetensors")
+    save_file(tensors, path, metadata={"n_train": str(len(train)),
+                                       "n_eval": str(len(held_out or []))})
+    logging.info(f"Exported {len(train)} train + {len(held_out or [])} eval samples "
+                 f"for the offload container -> {path}")
+    return path
 
 
 def _validate_batch_size(scenario: Scenario) -> None:
@@ -1162,13 +1199,23 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
             profiles_all = []
             
             if len(scenario.workers) == 0:
-                if scenario.name == "single_machine_offload":
+                # Matched by substring so a second offload arm (a real-corpus
+                # one alongside the legacy zorbulax baseline) routes here too,
+                # without another hard-coded name.
+                if "offload" in scenario.name:
                     logging.info(f"Running {scenario.name} via dedicated Docker container...")
                     scenario_metrics = []
                     ds_compose = "benchmarks_training/deepspeed/docker-compose.deepspeed.yml"
                     res_path = "benchmarks_training/deepspeed/results/deepspeed_result.json"
                     # Must match `container_name:` in docker-compose.deepspeed.yml.
                     ds_container = "kiwi_deepspeed_offload"
+
+                    # Written once, before the build, into the directory that
+                    # is already bind-mounted at /output inside the container.
+                    export_dataset_for_offload(
+                        dataset, eval_dataset,
+                        os.path.dirname(res_path),
+                    )
 
                     # Build once, not per seed. The image is identical across seeds
                     # (only env vars change), and the DeepSpeed layer compiles the
@@ -1194,6 +1241,13 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                         env["KIWI_MODEL"] = scenario.model
                         env["KIWI_EPOCHS"] = str(scenario.epochs)
                         env["KIWI_SEED"] = str(i+1)
+                        # Corpus + eval config now cross the boundary too, so
+                        # this arm trains the same data as every other arm and
+                        # produces an eval curve that can be compared with them.
+                        env["KIWI_DATASET_NAME"] = scenario.dataset
+                        env["KIWI_DATASET_FILE"] = "/output/dataset.safetensors"
+                        env["KIWI_EVAL_EVERY"] = str(eval_kwargs["eval_every"])
+                        env["KIWI_EVAL_SAMPLES"] = str(scenario.eval_samples)
 
                         # Clear the previous seed's output first. Without this, a seed
                         # that crashes before writing leaves the prior seed's file in
@@ -1253,6 +1307,8 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                                 break
                             else:
                                 curves.append(res["curve"])
+                                if res.get("eval_curve"):
+                                    eval_curves.append(res["eval_curve"])
                                 scenario_metrics.append(res["metrics"])
                         else:
                             logging.error("DeepSpeed results JSON not found.")
@@ -1299,8 +1355,16 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                     runner = DistributedRunner(gateway_url=gateway_url)
 
                 kill_hook = None
-                if scenario.kill_after_epochs is not None:
-                    killed_flag = {}
+                killed_flag = {}
+                if scenario.kill_after_samples is not None:
+                    # Samples mode: MeshRunner fires this once, at the window
+                    # boundary where the counter passes the threshold, so the
+                    # `epoch` argument is unused.
+                    def kill_hook(_epoch: int, _flag=killed_flag):
+                        if not _flag:
+                            _flag["done"] = True
+                            _kill_one_active_worker(gateway_url)
+                elif scenario.kill_after_epochs is not None:
                     def kill_hook(epoch: int, _flag=killed_flag, _s=scenario):
                         if epoch == _s.kill_after_epochs and not _flag:
                             _flag["done"] = True
@@ -1329,6 +1393,7 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                         if use_mesh:
                             res = runner.run_training(scenario.model, dataset, scenario.epochs,
                                                       scenario.name, i+1, kill_hook=kill_hook,
+                                                      kill_at_samples=scenario.kill_after_samples,
                                                       **eval_kwargs)
                             replica_curves_all.append(res.get("replica_curves", {}))
                             events_all.append(res.get("events", []))
@@ -1394,6 +1459,9 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                 "runner": scenario.runner,
                 "dataset": scenario.dataset,
                 "epochs": scenario.epochs,
+                # Needed by plot.py to draw the target line, and to make it
+                # obvious after the fact whether that gate was even crossed.
+                "target_loss": scenario.target_loss,
                 "replicas": scenario.replicas,
                 "average_every": scenario.average_every,
                 "shard_mode": scenario.shard_mode,

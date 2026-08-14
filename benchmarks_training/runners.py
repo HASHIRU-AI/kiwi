@@ -505,6 +505,7 @@ class MeshRunner(BaseRunner):
         scenario_name: str = "unknown",
         seed_idx: int = 0,
         kill_hook: Optional[Callable[[int], None]] = None,
+        kill_at_samples: Optional[int] = None,
         eval_dataset: Optional[List[Dict[str, Any]]] = None,
         eval_every: int = 0,
         eval_samples: int = DEFAULT_EVAL_SAMPLES,
@@ -524,6 +525,7 @@ class MeshRunner(BaseRunner):
         events: List[Dict[str, Any]] = []
         round_times: List[float] = []
         round_profile: Dict[str, List[float]] = {}
+        killed_at = [None]
         spread_curve: List[Dict[str, Any]] = []
         # Per-PHASE throttle (see the sampling block below): "peak" is the last
         # sparse round of a cycle, "trough" the full sync that follows it.
@@ -899,10 +901,22 @@ class MeshRunner(BaseRunner):
                 last_eval_at[0] = n_now
                 _eval_at(n_now)
 
+            # Samples-based kill: fires once, at the first window boundary
+            # past the threshold. This is the only mode that works on a
+            # 1-epoch run — an epoch-boundary kill would land after the last
+            # sample, leaving nothing to recover into.
+            if (kill_hook is not None and kill_at_samples
+                    and not killed_at[0] and n_now >= kill_at_samples):
+                killed_at[0] = n_now
+                events.append({"type": "kill_injected", "samples": n_now})
+                logging.warning(f"[{scenario_name} seed {seed_idx}] injecting worker "
+                                f"kill at {n_now} samples")
+                kill_hook(0)
+
             # Fire the kill hook at epoch boundaries. Windows may now span
             # epochs, so derive completed epochs from the stream position
             # rather than a loop variable.
-            if kill_hook is not None:
+            if kill_hook is not None and not kill_at_samples:
                 completed = window[-1]["_epoch"] + 1
                 while epochs_fired < completed:
                     epochs_fired += 1
