@@ -143,8 +143,11 @@ def export_dataset_for_offload(train: List[Dict[str, Any]],
     path = os.path.join(host_dir, "dataset.safetensors")
     save_file(tensors, path, metadata={"n_train": str(len(train)),
                                        "n_eval": str(len(held_out or []))})
+    if not os.path.exists(path):
+        raise RuntimeError(f"Dataset export to {path} produced no file")
+    size_mb = os.path.getsize(path) / (1024 ** 2)
     logging.info(f"Exported {len(train)} train + {len(held_out or [])} eval samples "
-                 f"for the offload container -> {path}")
+                 f"({size_mb:.1f} MB) for the offload container -> {path}")
     return path
 
 
@@ -1244,6 +1247,7 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                         # Corpus + eval config now cross the boundary too, so
                         # this arm trains the same data as every other arm and
                         # produces an eval curve that can be compared with them.
+                        env["KIWI_SCENARIO"] = scenario.name
                         env["KIWI_DATASET_NAME"] = scenario.dataset
                         env["KIWI_DATASET_FILE"] = "/output/dataset.safetensors"
                         env["KIWI_EVAL_EVERY"] = str(eval_kwargs["eval_every"])

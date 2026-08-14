@@ -57,19 +57,51 @@ def _load_exported(path: str, split: str):
 
 
 def prepare_dataset(model_id: str, split: str = "train"):
-    path = os.getenv("KIWI_DATASET_FILE", "")
+    # Fixed location, not a required env var: /output is the results directory
+    # the compose file already bind-mounts, and the orchestrator writes the
+    # tokenised corpus there before starting this container. Nothing has to be
+    # passed in for the right dataset to be used.
+    #
+    # Loading the corpus HERE instead (datasets.load_dataset) was considered
+    # and rejected: `datasets` is not in this image, so it would need a
+    # Dockerfile change and an in-container download per run, and it would
+    # duplicate the selection logic (seed, split boundary, prompt format,
+    # max_length). Any drift there and this arm trains a different 600
+    # examples from the other arms while claiming the same corpus.
+    path = os.getenv("KIWI_DATASET_FILE", "/output/dataset.safetensors")
     if path and os.path.exists(path):
         samples = _load_exported(path, split)
         logging.info(f"Loaded {len(samples)} {split} samples from {path} "
                      f"(dataset={os.getenv('KIWI_DATASET_NAME', 'unknown')})")
         return samples
+
+    # FAIL, do not fall back, when a non-zorbulax corpus was configured.
+    #
+    # This used to warn and carry on, which produced a complete-looking 4-step
+    # result that landed in the results file labelled as the configured
+    # dataset. A run that is wrong is worse than a run that stopped: the
+    # warning scrolls past in a 500-line log and the mislabelled number
+    # survives into the comparison tables.
+    configured = os.getenv("KIWI_DATASET_NAME", "")
+    if configured and configured != "zorbulax4":
+        raise RuntimeError(
+            f"Configured for dataset '{configured}' but {path} does not exist "
+            f"inside the container.\n"
+            f"  The orchestrator exports it to "
+            f"benchmarks_training/deepspeed/results/dataset.safetensors, which "
+            f"the compose file bind-mounts at /output. Most likely the "
+            f"orchestrator on this machine predates that export — check that "
+            f"benchmarks_training/orchestrator.py contains "
+            f"export_dataset_for_offload and that the run logged "
+            f"'Exported N train + M eval samples'.\n"
+            f"  Refusing to fall back to the built-in 4-fact zorbulax corpus, "
+            f"which would be recorded as '{configured}'."
+        )
+
     if split != "train":
         return []
-    # Fallback ONLY. Reaching this on a real-corpus run means the arm is
-    # training zorbulax4 while the results file says otherwise.
     logging.warning("KIWI_DATASET_FILE not present — falling back to the built-in "
-                    "4-fact zorbulax corpus. If this run was configured for another "
-                    "dataset, its results are MISLABELLED.")
+                    "4-fact zorbulax corpus (no dataset was configured).")
     tok = AutoTokenizer.from_pretrained(model_id)
     samples = []
     for prompt_text, answer_text in FACTS:
@@ -107,7 +139,10 @@ def main():
     model_id = os.getenv("KIWI_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
     epochs = int(os.getenv("KIWI_EPOCHS", "10"))
     seed_idx = int(os.getenv("KIWI_SEED", "1"))
-    scenario_name = "single_machine_offload"
+    # From the orchestrator, so log lines carry the arm that is actually
+    # running. Hardcoding it meant an `sm_offload` run printed
+    # "[single_machine_offload seed 2]" — the legacy arm's name.
+    scenario_name = os.getenv("KIWI_SCENARIO", "single_machine_offload")
     
     out_dir = "/output"
     out_file = os.path.join(out_dir, "deepspeed_result.json")
