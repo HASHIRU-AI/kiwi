@@ -269,6 +269,30 @@ def main():
             torch_dtype=dtype,
         )
 
+        # Gradient checkpointing, matching the Kiwi workers and
+        # SingleMachineRunner. This arm was the ONLY one without it, which made
+        # it both the heaviest on activation memory and a different compute
+        # path from everything it is compared against.
+        #
+        # It is also the fix for the OOM this arm hit on real data: without
+        # checkpointing every decoder layer's forward intermediates are kept
+        # for the backward pass — dominated by three MLP tensors of
+        # T x 4864 x 2 bytes per layer — which at 256-token TruthfulQA samples
+        # overruns a 640 MiB budget partway through a run. Checkpointing keeps
+        # only each layer's input and recomputes the rest, ~25x less, for
+        # roughly 30% more step time.
+        #
+        # Must precede get_peft_model. enable_input_require_grads installs a
+        # hook on the input embeddings; without it torch.utils.checkpoint sees
+        # no grad-requiring input, warns, and silently produces NO gradients.
+        if os.getenv("KIWI_GRAD_CHECKPOINT", "1") == "1":
+            model.enable_input_require_grads()
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            model.config.use_cache = False
+            logging.info("Gradient checkpointing ENABLED (matches the other arms)")
+
         model = get_peft_model(model, SHARED_TRAIN_CONFIG["lora_config"])
         model.train()
 

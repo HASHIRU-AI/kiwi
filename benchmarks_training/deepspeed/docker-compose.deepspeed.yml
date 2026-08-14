@@ -39,6 +39,7 @@ services:
       KIWI_DATASET_FILE: ${KIWI_DATASET_FILE:-/output/dataset.safetensors}
       KIWI_EVAL_EVERY: ${KIWI_EVAL_EVERY:-0}
       KIWI_EVAL_SAMPLES: ${KIWI_EVAL_SAMPLES:-64}
+      KIWI_GRAD_CHECKPOINT: ${KIWI_GRAD_CHECKPOINT:-1}
       # Reduces fragmentation in principle. NOTE: inert under WSL2 (no CUDA VMM
       # support), so on Docker Desktop for Windows this buys nothing — kept for
       # native-Linux runs.
