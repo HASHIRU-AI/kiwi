@@ -27,6 +27,18 @@ services:
       # split, and the loader gathers it at 2x (520 MiB). Training peaks far lower
       # now that stage3_max_reuse_distance=0 stops the tied embedding being pinned.
       KIWI_GPU_BUDGET_MIB: ${KIWI_GPU_BUDGET_MIB:-640}
+      # Every variable the container reads must be DECLARED here. Setting it
+      # in the orchestrator's subprocess environment is not enough: Compose
+      # uses the host environment only to interpolate ${...} in this file, and
+      # passes nothing else through. An undeclared variable is silently absent
+      # inside the container, which is why the corpus and eval settings had no
+      # effect even with a correct orchestrator — KIWI_EVAL_EVERY fell back to
+      # its 0 default and disabled eval entirely.
+      KIWI_SCENARIO: ${KIWI_SCENARIO:-single_machine_offload}
+      KIWI_DATASET_NAME: ${KIWI_DATASET_NAME:-zorbulax4}
+      KIWI_DATASET_FILE: ${KIWI_DATASET_FILE:-/output/dataset.safetensors}
+      KIWI_EVAL_EVERY: ${KIWI_EVAL_EVERY:-0}
+      KIWI_EVAL_SAMPLES: ${KIWI_EVAL_SAMPLES:-64}
       # Reduces fragmentation in principle. NOTE: inert under WSL2 (no CUDA VMM
       # support), so on Docker Desktop for Windows this buys nothing — kept for
       # native-Linux runs.
