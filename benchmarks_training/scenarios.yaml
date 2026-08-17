@@ -1,104 +1,92 @@
 # ══════════════════════════════════════════════════════════════════════════
-# Two corpora, two jobs (Phase 1).
+# Kiwi training benchmark scenarios
 #
-#   zorbulax4 — 4 facts, memorization. FAST and it is the correctness smoke
-#               test, but maximally NON-I.I.D. under sharding: each replica
-#               memorizes different facts and the merge erases both. Averaging
-#               QUALITY conclusions drawn from it are invalid. Kept forever,
-#               scoped to what it can actually answer. No held-out split
-#               exists, so eval_every is left at 0.
-#   alpaca1k  — 1,000 train + 200 held-out from yahma/alpaca-cleaned, fixed
-#               seed, fixed slice. I.i.d.-shardable, so this is where the
-#               sparse-vs-DiLoCo A/B is decided, on HELD-OUT loss.
+# Two corpora, two jobs:
 #
-# Rule of thumb from the plan: iterate on zorbulax4 for correctness (fast),
-# run alpaca1k for conclusions (valid).
+#   zorbulax4  — 4 facts, memorization. Fast, and the correctness smoke test.
+#                But maximally NON-I.I.D. under sharding: each replica
+#                memorizes different facts and the merge erases both, so
+#                averaging-QUALITY conclusions drawn from it are invalid.
+#                Kept only for the legacy baselines below. No held-out split
+#                exists, so eval_every stays 0.
+#   truthfulqa — 600 train + 150 held-out. Chosen by probe over alpaca1k,
+#                gsm8k and sql_create_context: it was the only corpus whose
+#                eval loss kept falling (drop 0.854, second-half descent
+#                0.159; the others plateaued within 100–500 samples). The
+#                A/B is decided here, on HELD-OUT loss.
 #
-# Eval cadence: eval_every counts SAMPLES CONSUMED, and each point averages
-# `eval_samples` held-out examples through the live pipeline. 100/64 costs
-# ~640 extra forward passes against 1,000 train steps (~20% overhead, since
-# an eval forward skips the backward). The plan suggests ~25; at 64 samples
-# a point that would be ~85% overhead and the measurement would cost more
-# than the experiment. Tighten it if a run has budget to spare.
+# Why truthfulqa works when "harder" corpora did not: sql and gsm8k start at
+# LOW loss because each has a learnable template the model fits in ~100
+# samples, after which the residual is irreducible. alpaca starts moderate
+# but its residual is genuine AMBIGUITY ("write a poem" has many valid
+# continuations). truthfulqa starts highest because its answers are
+# deliberately counterintuitive corrections to common misconceptions, so the
+# model's prior actively fights the target — and unlike ambiguity, that gap
+# is REDUCIBLE. The criterion is "high loss that is reducible", not "a hard
+# task".
+#
+# Eval cadence: eval_every counts SAMPLES CONSUMED; each point averages
+# `eval_samples` held-out examples. 100/64 costs ~450 extra forward passes
+# against 600 train steps. Do NOT change eval_every or full_sync_every in
+# isolation — the sparse arms' eval points land just after full-sync rounds
+# only because the two cadences align, and breaking that would make eval
+# measure a single drifted replica instead of the consensus model.
+#
+# Averaging cadence, all mesh arms: a DENSE merge every 10 steps per replica.
+#   kiwi_mesh2_dense   X=10, all rounds dense
+#   kiwi_mesh2_outer   X=10, all rounds dense, applied through the outer optimizer
+#   kiwi_mesh2_sparse5  X=1  (a cheap 5% round every step), every 10th round dense
+# Holding the dense-merge cadence equal across arms is what makes them
+# one-variable comparisons.
+#
+# History: 18 scenarios were removed once their questions were settled — the
+# R=2 regression diagnostic sweep (X-sweep, shard modes, freeze_a, mirror,
+# matched_steps), the zorbulax smoke suite, and three unrun A/B extras
+# (sparse20, sparse_diloco, alpaca_lr2x). Their findings are recorded in
+# IMPLEMENTATION_PLAN.md under "established experimental facts"; the configs
+# are in git history.
 # ══════════════════════════════════════════════════════════════════════════
 
 scenarios:
-  - name: "single_machine"
+
+  # ══════════════════════════════════════════════════════════════════════
+  # LEGACY zorbulax4 baselines — 40-sample runs (10 epochs x 4 facts).
+  #
+  # Kept so the recorded benchmark_results/ numbers stay reproducible from
+  # config. Do not "modernise" these: changing epochs, X or the corpus makes
+  # them incomparable with the results they exist to reproduce. For anything
+  # new, use the truthfulqa arms below.
+  # ══════════════════════════════════════════════════════════════════════
+
+  - name: "sm_zorb"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 5
     epochs: 10
     target_loss: 2.0
-    workers: [] # In-process
+    workers: []          # In-process
 
-  - name: "single_machine_offload"
+  - name: "sm_offload_zorb"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 5
     epochs: 10
     target_loss: 2.0
-    workers: [] # In-process
+    workers: []          # In-process (own DeepSpeed container)
 
-  # - name: "single_machine_qlora"
-  #   model: "Qwen/Qwen2.5-0.5B-Instruct"
-  #   num_seeds: 5
-  #   epochs: 10
-  #   target_loss: 2.0
-  #   workers: [] # In-process
-
-  # The control (§6.2): the existing 3-stage pipeline, renamed. Non-negotiable —
-  # without it "averaging works" cannot be separated from "we changed the compute".
-  - name: "dp1"
+  # The pipeline control. Non-negotiable: without it "averaging works" cannot
+  # be separated from "we changed the compute".
+  - name: "kiwi_pipeline_zorb"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 5
     epochs: 10
     target_loss: 2.0
-    workers: [0.9, 0.9, 0.9] # 3 workers via gateway
+    workers: [0.9, 0.9, 0.9]      # 3 workers via gateway
     replicas: 1
     compose: "docker-compose.internet.yml"
 
-  # Diagnostic control: R=1 driven through MeshRunner. The work queue, the
-  # consumer, the barrier and the /round fan-out all execute, but with a single
-  # contributor every merge is a mathematical no-op (expect=0, send_to=[]).
-  #
-  # So dp1_mesh vs dp1 isolates HARNESS PLUMBING from AVERAGING SEMANTICS:
-  #   - dp1_mesh ~= dp1  -> the plumbing is sound; any dp2 gap is real
-  #     behaviour of weight averaging, not a bug in the round path.
-  #   - dp1_mesh <  dp1  -> the round path itself is damaging the adapter, and
-  #     the dp2 result says nothing about averaging.
-  - name: "dp1_mesh"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
-    num_seeds: 5
-    epochs: 10
-    target_loss: 2.0
-    workers: [0.9, 0.9, 0.9]
-    replicas: 1
-    average_every: 2
-    compose: "docker-compose.internet.yml"
-    runner: "mesh"        # force MeshRunner despite R=1
-
-  # Headline (§6.2): does the mesh run and learn without regression?
-  # X=2 (not 10) so rounds actually fire ~10 times per run at N=4 (§6.3).
-  # 7 workers = 2 pipes x 3 stages + 1 spare (the §3.10 reference layout).
-  # Needs ~6.6 GB. On a small card (<8 GB) switch both dp2 scenarios to
-  # docker-compose.mesh-nospare.yml and drop `workers` to six entries; that
-  # trades spare promotion for the R-degrades-to-1 path.
-  - name: "dp2"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
-    num_seeds: 5
-    epochs: 10
-    target_loss: 2.0
-    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] # 7 workers: 2 pipes + 1 spare
-    replicas: 2
-    average_every: 2
-    compose: "docker-compose.mesh.yml"
-
-  # Same mesh as dp2, but each replica is pinned to a fixed slice of the
-  # dataset (replica r owns samples[r::R]) instead of taking whatever the
-  # shared queue hands it. This is the §6.7 static-shard mode, and it mirrors
-  # what scratch/test_stage6_mesh.py does — which converged to ~0.01 while the
-  # queue-driven dp2 stalled around 1.3 on identical hardware and settings.
-  # If dp2_static ~= dp1, the mesh is fine and the queue's per-window
-  # re-pairing is what breaks averaging at N=4.
-  - name: "dp2_static"
+  # 7 workers = 2 pipes x 3 stages + 1 spare. Needs ~6.6 GB. On a card under
+  # 8 GB switch to docker-compose.mesh-nospare.yml and drop to six workers,
+  # which trades spare promotion for the R-degrades-to-1 path.
+  - name: "kiwi_mesh2_zorb"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 5
     epochs: 10
@@ -107,279 +95,34 @@ scenarios:
     replicas: 2
     average_every: 2
     compose: "docker-compose.mesh.yml"
-    shard_mode: "static"
-
-  # Third assignment regime: same fixed grouping as dp2_static, but the groups
-  # ROTATE between replicas each window, so every replica eventually sees every
-  # fact while still specialising on a consistent subset between merges.
-  # This is exactly what scratch/test_stage6_mesh.py does — the run that
-  # converged to ~0.01 where queue-driven dp2 stalled at ~1.3. If dp2_rotate
-  # reproduces ~0.01, the e2e result is explained and the variable is the data
-  # assignment, not the mesh.
-  - name: "dp2_rotate"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
-    num_seeds: 5
-    epochs: 10
-    target_loss: 2.0
-    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
-    replicas: 2
-    average_every: 2
-    compose: "docker-compose.mesh.yml"
-    shard_mode: "rotate"
-
-  # Fault injection mid-run (§6.2). Fully valid at N=4 — recovery needs no
-  # data diversity. Kills an active worker that has a same-stage spare, so the
-  # spare is promoted with ZERO transfer and R holds at 2 — throughput and
-  # convergence should both be unaffected. `degraded_sample_fraction` records
-  # any samples trained below nominal R (expected: 0.0 with a spare present).
-  # - name: "dp2_kill"
-  #   model: "Qwen/Qwen2.5-0.5B-Instruct"
-  #   num_seeds: 5
-  #   epochs: 10
-  #   target_loss: 2.0
-  #   workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
-  #   replicas: 2
-  #   average_every: 2
-  #   compose: "docker-compose.mesh.yml"
-  #   kill_after_epochs: 5
-
-  # ── Diagnostic sweep: WHY does R=2 regress when R=1 (dp1_mesh) does not? ──
-  # dp2 / dp2_static / dp2_rotate all landed ~1.1-1.6 regardless of how data was
-  # assigned, so the cause is the averaging operation, not the data. Two
-  # candidate mechanisms, and these scenarios separate them:
-  #
-  #   (a) MERGE FREQUENCY vs ADAM. Moments are local and never averaged (§4.2),
-  #       so every merge hands Adam a weight jump it knows nothing about. At
-  #       X=2 half of all steps follow such a jump. If this dominates, loss
-  #       should IMPROVE monotonically as X grows.
-  #   (b) LoRA BILINEARITY. mean(A)*mean(B) != mean(A*B); the cross terms are
-  #       spurious and are present at EVERY merge regardless of X. If this
-  #       dominates, the X sweep stays flat and only freeze_a helps.
-  #
-  # Note the design doc predicts the opposite of (a): it argues smaller X means
-  # less drift and therefore a more accurate merge. Worth settling by measuring.
-
-  - name: "dp2_x1"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
-    num_seeds: 3
-    epochs: 10
-    target_loss: 2.0
-    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
-    replicas: 2
-    average_every: 1
-    compose: "docker-compose.mesh.yml"
-
-  - name: "dp2_x5"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
-    num_seeds: 3
-    epochs: 10
-    target_loss: 2.0
-    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
-    replicas: 2
-    average_every: 5
-    compose: "docker-compose.mesh.yml"
-
-  - name: "dp2_x20"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
-    num_seeds: 3
-    epochs: 10
-    target_loss: 2.0
-    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
-    replicas: 2
-    average_every: 20
-    compose: "docker-compose.mesh.yml"
-
-  # §3.5 mitigation: hold LoRA A at its random init and train/average only B.
-  # All replicas then share an identical A, the cross terms vanish, and weight
-  # averaging becomes EXACT — at some cost in capacity. If this alone recovers
-  # dp1-like convergence, bilinearity was the cause.
-  - name: "dp2_freeze_a"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
-    num_seeds: 3
-    epochs: 10
-    target_loss: 2.0
-    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
-    replicas: 2
-    average_every: 2
-    compose: "docker-compose.mesh.yml"
-    freeze_lora_a: true
-
-  # Control for freeze_a: same toggle at R=1, so any capacity loss from
-  # freezing A is measured WITHOUT any averaging in play.
-  - name: "dp1_freeze_a"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
-    num_seeds: 3
-    epochs: 10
-    target_loss: 2.0
-    workers: [0.9, 0.9, 0.9]
-    replicas: 1
-    compose: "docker-compose.internet.yml"
-    freeze_lora_a: true
-
-  # THE MISSING CONTROL. queue/static/rotate all gave each replica a disjoint
-  # half of every window, so they never tested whether replicas sharing data
-  # fixes averaging. Here both replicas train on the SAME batches, so the two
-  # adapters should stay nearly identical and the merge has nothing to
-  # reconcile. Compare per STEPS PER REPLICA (40) against dp1 (40 steps), not
-  # on samples consumed — each batch is trained twice here.
-  #   mirror ~= dp1   -> averaging is sound; the dp2 penalty is entirely the
-  #                      cost of merging models trained on different data.
-  #   mirror still bad-> the merge damages weights even with nothing to
-  #                      reconcile, and the bug is in averaging itself.
-  - name: "dp2_mirror"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
-    num_seeds: 3
-    epochs: 10
-    target_loss: 2.0
-    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
-    replicas: 2
-    average_every: 2
-    compose: "docker-compose.mesh.yml"
-    shard_mode: "mirror"
-
-  # LINEAR SCALING RULE. Averaging makes the effective update the MEAN of the R
-  # local updates, so at a fixed LR an R=2 mesh travels ~half the distance per
-  # sample that R=1 does — the equal-samples comparison handicaps the mesh
-  # before averaging quality even enters. Standard correction: LR x R.
-  # If dp2_lr2x closes most of the gap to dp1, the "regression" was largely a
-  # missing hyperparameter adjustment, not a defect in the mesh.
-  - name: "dp2_lr2x"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
-    num_seeds: 3
-    epochs: 10
-    target_loss: 2.0
-    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
-    replicas: 2
-    average_every: 2
-    compose: "docker-compose.mesh.yml"
-    lr_scale: 2.0
-
-  # MATCHED SEQUENTIAL DEPTH — the comparison the mesh actually exists to win.
-  #
-  # Every other dp2 scenario splits one epoch's data across replicas (standard
-  # DDP semantics), so at 10 epochs each replica takes only 20 steps against
-  # dp1's 40. On the samples-consumed axis dp2 is then handicapped BY
-  # CONSTRUCTION: averaging combines displacements by taking their mean, so R
-  # replicas x X steps advances about X steps, not R*X. A flawless
-  # implementation would still trail dp1 there.
-  #
-  # Here epochs are doubled so each replica takes 40 steps, matching dp1's
-  # sequential depth while consuming 80 samples. That is the throughput claim:
-  # "in the same number of sequential steps we processed twice the data."
-  #
-  # Read this one against dp1 by FINAL LOSS (see diagnostic_summary.png), not
-  # on the samples axis — the evaluator's equal-samples comparison truncates to
-  # the overlapping range and would silently compare only the first 40 samples.
-  - name: "dp2_matched_steps"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
-    num_seeds: 3
-    epochs: 20          # 20 x 4 = 80 samples -> 40 steps per replica at R=2
-    target_loss: 2.0
-    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
-    replicas: 2
-    average_every: 2
-    compose: "docker-compose.mesh.yml"
 
   # ══════════════════════════════════════════════════════════════════════
-  # SMOKE SUITE — does the MACHINERY work? (not: does it converge better)
+  # THE A/B — truthfulqa, 1 epoch (600 samples), held-out loss.
   #
-  # zorbulax4 on purpose: 4 samples/epoch, so these finish in minutes, and
-  # correctness is what is being checked. Convergence numbers from these are
-  # meaningless — the fixture is maximally non-i.i.d. under sharding and
-  # every averaging-quality conclusion from it is invalid. Run with
-  # --seeds 1; read the container log, not the loss curve.
+  # Reference -> control -> baseline -> mechanisms, so each comparison
+  # changes one thing:
+  #   sm  vs sm_offload   does CPU offload change what is learned?
+  #   sm  vs kiwi_pipeline   does splitting the model across workers?
+  #   kiwi_pipeline vs kiwi_mesh2_dense   what does averaging cost at equal samples?
+  #   kiwi_mesh2_dense vs sparse5/diloco  which mechanism closes that gap?
   #
-  # Sized so each mechanism fires MANY times. A run where the outer step
-  # happens once proves almost nothing: the first dense round only
-  # establishes the anchor and deliberately does not step.
+  # Naming: <system>[_<topology>][_<mechanism>][_<variant>].
+  #   sm            single GPU, no pipeline, no averaging
+  #   kiwi_pipeline model split across workers, ONE pipeline (R=1)
+  #   kiwi_mesh2    2 pipelines whose adapters are averaged
+  #   _zorb         the legacy zorbulax4 baselines above; the corpus is in the
+  #                 name only there, because those arms share a topology with
+  #                 the truthfulqa ones and would otherwise collide
+  # Keys now match the display labels in plot.py's CONFIG_STYLES, so what you
+  # type on the command line is what you read on the figure.
+  #
+  # These keys were renamed from dp1/dp2/*_alpaca. Results are matched by
+  # scenario name, so results files predating the rename will not line up —
+  # that was accepted deliberately in favour of consistent naming.
   # ══════════════════════════════════════════════════════════════════════
 
-  # Sparse path + full-sync cadence.
-  # 10 epochs x 4 = 40 samples; X=1 -> window 2 -> 20 rounds.
-  # Full syncs at rounds 10 and 20. Expect p=0.05 on the rest, and
-  # payload_bytes ~20x smaller than a dense round.
-  - name: "smoke_sparse"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
-    num_seeds: 1
-    epochs: 10
-    target_loss: 2.0
-    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
-    replicas: 2
-    average_every: 1
-    sparse_p: 0.05
-    full_sync_every: 10
-    compose: "docker-compose.mesh.yml"
-
-  # DiLoCo outer optimizer, dense rounds.
-  # 20 epochs x 4 = 80 samples; X=4 -> window 8 -> 10 rounds.
-  # Expect "anchor established" ONCE (round 1) then 9 outer steps. Every
-  # round is dense, so every round after the first carries OUTER.
-  - name: "smoke_diloco"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
-    num_seeds: 1
-    epochs: 20
-    target_loss: 2.0
-    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
-    replicas: 2
-    average_every: 4
-    outer_opt: true
-    compose: "docker-compose.mesh.yml"
-
-  # The combination, and the one with a real invariant to check: the outer
-  # step must fire ONLY on full-sync rounds. A sparse round touches a
-  # different ~p of coordinates each time, so a delta measured over one is
-  # not a coherent pseudo-gradient.
-  # 10 epochs x 4 = 40 samples; X=1 -> 20 rounds; full sync every 5
-  # -> rounds 5, 10, 15, 20 dense; outer on those four only.
-  - name: "smoke_sparse_diloco"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
-    num_seeds: 1
-    epochs: 10
-    target_loss: 2.0
-    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
-    replicas: 2
-    average_every: 1
-    sparse_p: 0.05
-    full_sync_every: 5
-    outer_opt: true
-    compose: "docker-compose.mesh.yml"
-
-  # Recovery path with sparse averaging in force: kill an active worker that
-  # has a same-stage spare. The spare has been receiving sparse payloads all
-  # along, so promotion should cost ~0 and degraded_sample_fraction stay 0.0.
-  - name: "smoke_sparse_kill"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
-    num_seeds: 1
-    epochs: 10
-    target_loss: 2.0
-    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
-    replicas: 2
-    average_every: 1
-    sparse_p: 0.05
-    full_sync_every: 5
-    kill_after_epochs: 5
-    compose: "docker-compose.mesh.yml"
-
-  # ══════════════════════════════════════════════════════════════════════
-  # GATE 1 (Phase 1): real corpus + held-out eval.
-  #
-  # These two exist to re-validate the pipeline path on data that can
-  # actually support a generalization claim, BEFORE any averaging change
-  # is measured. Run them and read the eval curves:
-  #
-  #   sm_alpaca  — train loss falls, eval loss falls then FLATTENS. If eval
-  #                loss never moves, the corpus/masking/LR is wrong and
-  #                nothing downstream means anything.
-  #   dp1_alpaca — must match sm_alpaca within seed noise. dp1 is a pure
-  #                pipeline split with no averaging, so any gap here is a
-  #                pipeline bug and would otherwise be misattributed to
-  #                averaging in every dp2 comparison that follows.
-  #
-  # 1 epoch = 1,000 samples. Do NOT raise this to 10: alpaca is not a
-  # memorization fixture and 10 epochs would just measure overfitting.
-  # ══════════════════════════════════════════════════════════════════════
-
-  - name: "sm_alpaca"
+  # Reference: one GPU, whole model, no pipeline, no averaging.
+  - name: "sm"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 3
     epochs: 1
@@ -388,19 +131,14 @@ scenarios:
     eval_every: 100
     eval_samples: 64
     batch_size: 1
-    workers: []          # In-process reference
+    workers: []
 
-  # DeepSpeed ZeRO-3 CPU-offload reference, on the real corpus.
-  #
-  # Separate from the legacy `single_machine_offload` (zorbulax4, 10 epochs),
-  # which stays put so its 40-sample baseline remains reproducible.
-  #
-  # This arm runs in its own container. The orchestrator now exports the
-  # tokenised corpus to the results directory — already bind-mounted at
-  # /output — and run_offload.py loads it, so this trains the SAME data as
-  # every other arm and emits an eval curve that can be compared with them.
-  # Previously only KIWI_MODEL/EPOCHS/SEED crossed the boundary and the arm
-  # silently trained its own built-in 4-fact set.
+  # DeepSpeed ZeRO-3 CPU-offload reference. Runs in its own container; the
+  # orchestrator exports the tokenised corpus to the results directory
+  # (already bind-mounted at /output) so this trains the SAME data as every
+  # other arm. Every KIWI_* variable it reads must also be DECLARED in
+  # docker-compose.deepspeed.yml — Compose uses the host environment only for
+  # ${...} interpolation and forwards nothing else.
   - name: "sm_offload"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 3
@@ -410,9 +148,12 @@ scenarios:
     eval_every: 100
     eval_samples: 64
     batch_size: 1
-    workers: []          # In-process (own DeepSpeed container)
+    workers: []
 
-  - name: "dp1_alpaca"
+  # Pipeline control: the model split across 3 workers, R=1, no averaging.
+  # Any gap between this and sm is a PIPELINE bug; only a gap between
+  # this and the mesh arms is attributable to averaging.
+  - name: "kiwi_pipeline"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 3
     epochs: 1
@@ -425,40 +166,10 @@ scenarios:
     replicas: 1
     compose: "docker-compose.internet.yml"
 
-  # ══════════════════════════════════════════════════════════════════════
-  # PHASE 5 — the A/B this whole plan exists to settle.
-  #
-  # Established by the diagnostic run, not up for re-litigation here:
-  # the round/queue/barrier plumbing is sound (dp1_mesh ~= dp1), the uniform
-  # merge does not damage weights (dp2_mirror ~= dp1), and LoRA bilinearity
-  # is not the dominant cause at this scale (dp2_freeze_a still bad). What
-  # DID move the needle was merge FREQUENCY: only X=20 — one merge for the
-  # whole run — recovered. Both mechanisms below attack that directly:
-  #
-  #   sparse — merge every step, but perturb only ~p of the coordinates, so
-  #            local Adam moments stay approximately valid.
-  #   DiLoCo — merge rarely (X=8) and route the jump through an outer
-  #            Nesterov optimizer instead of overwriting weights.
-  #
-  # Read them on EVAL loss at equal samples consumed. All share R=2, 7
-  # workers (2 pipes + 1 spare), 3 seeds, 1 epoch of alpaca1k.
-  # ══════════════════════════════════════════════════════════════════════
-
-  # The A/B baseline: current uniform averaging on real data.
-  #
-  # average_every: 10, not the 2 this was originally tuned at. X=2 dates from
-  # when a run was 40 samples; at 600+ samples it fires a ~4.2 s dense barrier
-  # every 4 samples — 150 rounds per run, almost all of it overhead, and it
-  # made this the slowest arm in the matrix by 3x. X=10 keeps the arm dense
-  # and uniform (which is what it exists to represent) at a sane cadence.
-  #
-  # Deliberately NOT changed: eval_every (100) and full_sync_every (10)
-  # anywhere. The sparse arms' eval points currently land just after full-sync
-  # rounds only because a 100-sample eval cadence aligns with the fs=10
-  # cadence; perturbing either breaks that alignment and eval would silently
-  # measure one drifted replica instead of the consensus model. The proper fix
-  # is to gate eval on dense rounds, which is deferred.
-  - name: "dp2_alpaca"
+  # The A/B baseline: dense uniform averaging, every 10 steps per replica.
+  # (X was 2 when a run was 40 samples; at 600 that fired a ~4 s barrier every
+  # 4 samples — 150 rounds of mostly overhead.)
+  - name: "kiwi_mesh2_dense"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 3
     epochs: 1
@@ -471,10 +182,14 @@ scenarios:
     average_every: 10
     compose: "docker-compose.mesh.yml"
 
-  # Sparse averaging at the design default. average_every: 1 is deliberate —
-  # the claim is that sparse merges are cheap enough to do EVERY step, which
-  # is also what makes this the stepping stone to the async design.
-  - name: "dp2_sparse5"
+  # Mechanism 1 — sparse averaging. A round EVERY step, but each exchanges
+  # only 5% of adapter values, so a merge perturbs ~p of the weights and the
+  # local Adam moments stay approximately valid. Every 10th round is dense,
+  # which restores exact replica agreement (measured: spread collapses to
+  # 0.000000 at each full sync) and keeps spare promotion zero-cost.
+  # Frequent cheap rounds ARE the mechanism — raising average_every turns
+  # this into "dense averaging that drops 95% of the update".
+  - name: "kiwi_mesh2_sparse5"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 3
     epochs: 1
@@ -489,10 +204,11 @@ scenarios:
     full_sync_every: 10
     compose: "docker-compose.mesh.yml"
 
-  # Sensitivity point. If p=0.20 is no better than p=0.05, sparsity is doing
-  # its work through "small perturbation" as claimed; if it is much better,
-  # the mechanism is really just "more averaging" and the story changes.
-  - name: "dp2_sparse20"
+  # Mechanism 2 — DiLoCo outer optimizer. Same dense merges as kiwi_mesh2_dense at
+  # the same cadence, but applied through a Nesterov outer step (lr 0.7,
+  # momentum 0.9) instead of overwriting weights. Same merge frequency as the
+  # baseline, so the outer optimizer is the only variable.
+  - name: "kiwi_mesh2_outer"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 3
     epochs: 1
@@ -502,64 +218,18 @@ scenarios:
     eval_samples: 64
     workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
     replicas: 2
-    average_every: 1
-    sparse_p: 0.20
-    full_sync_every: 10
-    compose: "docker-compose.mesh.yml"
-
-  # DiLoCo arm: dense merges, but RARE (X=8) and applied through an outer
-  # Nesterov step (lr 0.7, momentum 0.9). Rare merges are the point — do not
-  # "fix" this by lowering average_every.
-  - name: "dp2_diloco"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
-    num_seeds: 3
-    epochs: 1
-    target_loss: 2.0
-    dataset: "truthfulqa"
-    eval_every: 100
-    eval_samples: 64
-    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
-    replicas: 2
-    # X=10, matching dp2_alpaca. Every round here is dense, so this IS the
-    # full-sync cadence, and holding it equal to the dense baseline makes
-    # dp2_alpaca vs dp2_diloco a clean one-variable comparison: same merge
-    # frequency, the only difference being whether the merge goes through the
-    # outer optimizer. At X=8 vs 10 the arms differed in two things at once.
     average_every: 10
     outer_opt: true
     compose: "docker-compose.mesh.yml"
 
-  # Optional combination: sparse rounds every step, with the outer step
-  # taken at each full sync (the only rounds where a complete pseudo-gradient
-  # exists). Run it only if the two mechanisms separately both help — if
-  # either is neutral, this arm cannot be interpreted.
-  - name: "dp2_sparse_diloco"
-    model: "Qwen/Qwen2.5-0.5B-Instruct"
-    num_seeds: 3
-    epochs: 1
-    target_loss: 2.0
-    dataset: "truthfulqa"
-    eval_every: 100
-    eval_samples: 64
-    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
-    replicas: 2
-    average_every: 1
-    sparse_p: 0.05
-    full_sync_every: 10
-    outer_opt: true
-    compose: "docker-compose.mesh.yml"
-
-  # Recovery on real data: the sparse arm plus a mid-run worker loss. A
-  # same-stage spare has been receiving sparse payloads all along, so the
-  # spare is promoted with ~0 transfer, R holds at 2, and
-  # degraded_sample_fraction should stay 0.0.
+  # Recovery: the sparse arm plus a mid-run worker loss. A same-stage spare
+  # has been receiving sparse payloads throughout, so promotion should cost
+  # ~0, R should hold at 2, and degraded_sample_fraction should stay 0.0.
   #
-  # kill_after_SAMPLES, not kill_after_epochs. These runs are 1 epoch, and an
-  # epoch-boundary kill fires only once the epoch has completed — i.e. after
-  # the last sample, with nothing left to train. The scenario would run green
-  # and measure nothing. 300 puts the kill at the halfway point, leaving an
-  # equal amount of training either side of it.
-  - name: "dp2_sparse5_kill"
+  # kill_after_SAMPLES, not kill_after_epochs: these runs are 1 epoch, and an
+  # epoch-boundary kill fires only once the epoch completes — after the last
+  # sample, with nothing left to train. 300 is the halfway point.
+  - name: "kiwi_mesh2_sparse5_kill"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 3
     epochs: 1
@@ -572,15 +242,38 @@ scenarios:
     average_every: 1
     sparse_p: 0.05
     full_sync_every: 10
-    kill_after_samples: 300
+    kill_after_samples: 309
     compose: "docker-compose.mesh.yml"
 
-  # LR sanity seed for the R=2 arms (working note in the plan): weight
-  # averaging makes the effective update the MEAN of R local updates, so at
-  # fixed LR an R=2 mesh travels ~half the distance per sample. Record one
-  # lr_scale: 2.0 arm so a gap that is really a missing hyperparameter is
-  # not reported as an averaging defect.
-  - name: "dp2_alpaca_lr2x"
+  # ══════════════════════════════════════════════════════════════════════
+  # NO-SPARE VARIANTS — 6 workers (2 pipes x 3 stages), no spare.
+  #
+  # Each mirrors the arm above it EXACTLY except for the worker count and the
+  # compose file. Same corpus, seeds, epochs, eval cadence, R, and each arm's
+  # own averaging settings — so the only variable is whether a hot spare
+  # exists.
+  #
+  # What this measures is the COST OF KEEPING A SPARE, not "more workers
+  # learn better". The spare never trains; it only RECEIVES round payloads so
+  # it stays promotable at ~0 transfer. R is 2 either way and the data
+  # schedule is identical, so convergence should match within seed noise.
+  # A visible convergence gap would mean the spare is influencing training,
+  # which it must not — that would be a bug, not a result.
+  #
+  # The difference should show up in cost instead:
+  #   - fewer processes contending for one GPU (6 vs 7)
+  #   - contributors fan out to 1 same-stage peer instead of 2, so smaller
+  #     round payload traffic and one less merge per round
+  # Both push the barrier time down. Read avg_round_ms and the round_profile,
+  # not just the loss curves.
+  #
+  # Deliberately NO kill variant: with no spare there is nothing to promote,
+  # so a kill loses the pipe and degrades R to 1. That is the graceful-
+  # degradation path — a different question from zero-cost promotion, and it
+  # would be misread as "kill with 6 workers vs kill with 7".
+  # ══════════════════════════════════════════════════════════════════════
+
+  - name: "kiwi_mesh2_dense_nospare"
     model: "Qwen/Qwen2.5-0.5B-Instruct"
     num_seeds: 3
     epochs: 1
@@ -588,8 +281,36 @@ scenarios:
     dataset: "truthfulqa"
     eval_every: 100
     eval_samples: 64
-    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
     replicas: 2
-    average_every: 10      # matches dp2_alpaca — this is its LR control
-    lr_scale: 2.0
-    compose: "docker-compose.mesh.yml"
+    average_every: 10
+    compose: "docker-compose.mesh-nospare.yml"
+
+  - name: "kiwi_mesh2_sparse5_nospare"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 3
+    epochs: 1
+    target_loss: 2.0
+    dataset: "truthfulqa"
+    eval_every: 100
+    eval_samples: 64
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 1
+    sparse_p: 0.05
+    full_sync_every: 10
+    compose: "docker-compose.mesh-nospare.yml"
+
+  - name: "kiwi_mesh2_outer_nospare"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 3
+    epochs: 1
+    target_loss: 2.0
+    dataset: "truthfulqa"
+    eval_every: 100
+    eval_samples: 64
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 10
+    outer_opt: true
+    compose: "docker-compose.mesh-nospare.yml"

@@ -7,11 +7,11 @@ import matplotlib.pyplot as plt
 # All curves in the results JSON are on the SAMPLES-CONSUMED axis (§6.5) —
 # under data parallelism "step" no longer means one thing across scenarios.
 
-# DISPLAY names only. Scenario KEYS (scenarios.yaml, results JSON, code
-# identifiers) are deliberately left as dp1/dp2/... — renaming them would
-# orphan every existing results file and silently break cross-run comparison,
-# since results are matched by key. This dict and _style() are the only layer
-# that decides what a human reads.
+# Display labels. Scenario keys in scenarios.yaml were renamed to match these
+# (dp1/dp2/*_alpaca -> sm / kiwi_pipeline / kiwi_mesh2_*), so the name you type
+# on the command line is the name you read on the figure. Results are matched
+# by key, so files predating that rename fall through to _style()'s anonymous
+# fallback — they still plot, just without labels or stable colours.
 #
 # Conventions:
 #   "Single GPU"    — no pipeline, no averaging
@@ -24,55 +24,60 @@ import matplotlib.pyplot as plt
 # figure, so a reader can track an arm across the comparison set without
 # re-reading legends. Baselines cool, mesh arms warm.
 CONFIG_STYLES = {
-    # ── Baselines — blues/greys ──
+    # ── Legacy zorbulax4 baselines (40-sample runs) ──
+    "sm_zorb": {"color": "#1f77b4", "label": "Single GPU (reference)"},
+    "sm_offload_zorb": {"color": "#8c9eb2", "label": "Single GPU + CPU offload"},
+    "kiwi_pipeline_zorb": {"color": "#d62728", "label": "Kiwi pipeline"},
+    "kiwi_mesh2_zorb": {"color": "#2ca02c", "label": "Kiwi mesh ×2 — dense avg"},
+
+    # ── The real-corpus A/B (truthfulqa) ──
+    # Deliberately distinct hues from the zorbulax4 family above: the two
+    # corpora must never be read as one series on a shared axis.
+    "sm": {"color": "#08306b", "label": "Single GPU (reference)"},
+    "sm_offload": {"color": "#6baed6", "label": "Single GPU + CPU offload"},
+    "kiwi_pipeline": {"color": "#a50f15", "label": "Kiwi pipeline"},
+    "kiwi_mesh2_dense": {"color": "#238b45", "label": "Kiwi mesh ×2 — dense avg"},
+    "kiwi_mesh2_sparse5": {"color": "#fd8d3c", "label": "Kiwi mesh ×2 — sparse 5%"},
+    "kiwi_mesh2_outer": {"color": "#6a51a3", "label": "Kiwi mesh ×2 — outer optimizer"},
+    "kiwi_mesh2_sparse5_kill": {"color": "#00441b", "label": "Kiwi mesh ×2 — sparse 5% + worker kill"},
+
+    # ── No-spare variants (6 workers) ──
+    # Lighter shade of each 7-worker counterpart's hue, so a spare/no-spare
+    # pair reads as one family on a shared axis while staying distinguishable.
+    "kiwi_mesh2_dense_nospare": {"color": "#74c476", "label": "Kiwi mesh ×2 — dense avg, no spare"},
+    "kiwi_mesh2_sparse5_nospare": {"color": "#fdbe85", "label": "Kiwi mesh ×2 — sparse 5%, no spare"},
+    "kiwi_mesh2_outer_nospare": {"color": "#9e9ac8", "label": "Kiwi mesh ×2 — outer opt, no spare"},
+
+    # ── Retired scenarios that still appear in ARCHIVED results ──
+    # These are gone from scenarios.yaml, but benchmark_results*/ files
+    # reference them by key. Dropping their styles would not break plotting —
+    # _style() falls back — but old figures would lose their labels and get an
+    # arbitrary fallback colour, so the archive stops being readable. Cheap to
+    # keep; delete only alongside the results that use them.
+    "distributed_3stage": {"color": "#d62728", "label": "Kiwi pipeline"},
+    "single_machine_qlora": {"color": "#6a51a3", "label": "Single GPU (QLoRA)"},
+    "dp2_sparse20": {"color": "#a63603", "label": "Kiwi mesh ×2 — sparse 20%"},
+    "dp2_sparse_diloco": {"color": "#c994c7", "label": "Kiwi mesh ×2 — sparse 5% + outer opt"},
+    # Pre-rename keys for the same arms, so results produced before the
+    # dp*/…_alpaca -> kiwi_* rename still render with labels and their
+    # original colours. Delete this block once those results are superseded.
     "single_machine": {"color": "#1f77b4", "label": "Single GPU (reference)"},
     "single_machine_offload": {"color": "#8c9eb2", "label": "Single GPU + CPU offload"},
-    "single_machine_qlora": {"color": "#6a51a3", "label": "Single GPU (QLoRA)"},
-    # ── R=1 pipeline controls — reds ──
-    "distributed_3stage": {"color": "#d62728", "label": "Kiwi pipeline"},
     "dp1": {"color": "#d62728", "label": "Kiwi pipeline"},
-    "dp1_mesh": {"color": "#ff9896", "label": "Kiwi pipeline (mesh harness)"},
-    "dp1_freeze_a": {"color": "#e377c2", "label": "Kiwi pipeline — LoRA A frozen"},
-    # ── R=2, data-assignment variants — greens ──
     "dp2": {"color": "#2ca02c", "label": "Kiwi mesh ×2 — dense avg"},
-    "dp2_static": {"color": "#98df8a", "label": "Kiwi mesh ×2 — static shards"},
-    "dp2_rotate": {"color": "#5fa855", "label": "Kiwi mesh ×2 — rotating shards"},
-    "dp2_mirror": {"color": "#17becf", "label": "Kiwi mesh ×2 — mirrored shards"},
-    # ── R=2, X sweep — oranges (light -> dark as X grows) ──
-    "dp2_x1": {"color": "#ffbb78", "label": "Kiwi mesh ×2 — avg every 1 step"},
-    "dp2_x5": {"color": "#ff7f0e", "label": "Kiwi mesh ×2 — avg every 5 steps"},
-    "dp2_x20": {"color": "#b35806", "label": "Kiwi mesh ×2 — avg every 20 steps"},
-    # ── Ablations ──
-    "dp2_freeze_a": {"color": "#9467bd", "label": "Kiwi mesh ×2 — LoRA A frozen"},
-    "dp2_matched_steps": {"color": "#8c6d31", "label": "Kiwi mesh ×2 — matched steps"},
-    "dp2_lr2x": {"color": "#74c476", "label": "Kiwi mesh ×2 — dense avg, LR ×2"},
-    "dp2_kill": {"color": "#006d2c", "label": "Kiwi mesh ×2 — dense avg + worker kill"},
-    "dp3": {"color": "#17becf", "label": "Kiwi mesh ×3 — dense avg"},
-    # ── Phase 5: the real-corpus A/B ──
-    # Deliberately distinct hues from the zorbulax4 families above: the two
-    # corpora must never be read as one series on a shared axis.
     "sm_alpaca": {"color": "#08306b", "label": "Single GPU (reference)"},
-    "sm_offload": {"color": "#6baed6", "label": "Single GPU + CPU offload"},
     "dp1_alpaca": {"color": "#a50f15", "label": "Kiwi pipeline"},
     "dp2_alpaca": {"color": "#238b45", "label": "Kiwi mesh ×2 — dense avg"},
-    "dp2_alpaca_lr2x": {"color": "#74c476", "label": "Kiwi mesh ×2 — dense avg, LR ×2"},
     "dp2_sparse5": {"color": "#fd8d3c", "label": "Kiwi mesh ×2 — sparse 5%"},
-    "dp2_sparse20": {"color": "#a63603", "label": "Kiwi mesh ×2 — sparse 20%"},
     "dp2_diloco": {"color": "#6a51a3", "label": "Kiwi mesh ×2 — outer optimizer"},
-    "dp2_sparse_diloco": {"color": "#c994c7", "label": "Kiwi mesh ×2 — sparse 5% + outer opt"},
-    "dp2_alpaca_kill": {"color": "#00441b", "label": "Kiwi mesh ×2 — dense avg + worker kill"},
     "dp2_sparse5_kill": {"color": "#00441b", "label": "Kiwi mesh ×2 — sparse 5% + worker kill"},
-    # ── Smoke arms (zorbulax4 machinery checks) ──
-    "smoke_sparse": {"color": "#fdae6b", "label": "Smoke — sparse 5%"},
-    "smoke_diloco": {"color": "#9e9ac8", "label": "Smoke — outer optimizer"},
-    "smoke_sparse_diloco": {"color": "#dadaeb", "label": "Smoke — sparse 5% + outer opt"},
-    "smoke_sparse_kill": {"color": "#31a354", "label": "Smoke — sparse 5% + worker kill"},
 }
 
-# Scenarios whose samples-consumed axis is not comparable to the others.
-# dp2_mirror trains every batch on EVERY replica, so its sample count is
-# inflated R-fold; it must be read per steps-per-replica instead.
-_INFLATED_SAMPLE_AXIS = {"dp2_mirror"}
+# Scenarios whose samples-consumed axis is not comparable to the others —
+# e.g. a mirrored-shard arm trains every batch on EVERY replica, inflating its
+# sample count R-fold. Empty now that dp2_mirror is retired; kept because the
+# hazard reappears the moment such an arm is added back.
+_INFLATED_SAMPLE_AXIS = set()
 
 _FALLBACK_PALETTE = [
     "#7f7f7f", "#bcbd22", "#c49c94", "#dbdb8d", "#9edae5", "#c7c7c7",
@@ -250,15 +255,15 @@ def _plot_eval_panel(eval_runs, scenario_names, title, question, outfile,
 COMPARISONS = [
     dict(
         slug="01_baselines",
-        scenarios=["single_machine", "single_machine_offload", "sm_alpaca",
-                   "sm_offload", "dp1_alpaca"],
+        scenarios=["sm_zorb", "sm_offload_zorb", "sm",
+                   "sm_offload", "kiwi_pipeline"],
         title="Does splitting the model across workers change what it learns?",
         question="Single GPU vs CPU-offload vs Kiwi's pipeline. All three should "
                  "overlap — this is the correctness anchor for everything below.",
     ),
     dict(
         slug="02_pipeline_vs_mesh",
-        scenarios=["dp1_alpaca", "dp2_alpaca"],
+        scenarios=["kiwi_pipeline", "kiwi_mesh2_dense"],
         title="What does data-parallel averaging cost at equal samples consumed?",
         question="Expect the mesh to trail: at R=2 each replica takes half the "
                  "sequential steps for the same data. This is a known handicap of "
@@ -267,27 +272,158 @@ COMPARISONS = [
     ),
     dict(
         slug="03_averaging_mechanisms",
-        scenarios=["dp2_alpaca", "dp2_sparse5", "dp2_diloco", "dp2_sparse_diloco"],
+        scenarios=["kiwi_mesh2_dense", "kiwi_mesh2_sparse5", "kiwi_mesh2_outer", "dp2_sparse_diloco"],
         title="Which averaging mechanism closes the gap?",
         question="Sparse slices, an outer optimizer, or both — measured against "
                  "dense uniform averaging.",
         by_steps=True,
     ),
+    # Renders only against archived results: dp2_sparse20 was retired from
+    # scenarios.yaml, so new runs produce a 2-arm figure (dense vs 5%) rather
+    # than a sweep. Restore that scenario to get the sensitivity point back —
+    # without it there is no evidence separating "sparsity helps" from "any
+    # amount of averaging helps".
     dict(
         slug="04_sparse_p_sweep",
-        scenarios=["dp2_alpaca", "dp2_sparse5", "dp2_sparse20"],
+        scenarios=["kiwi_mesh2_dense", "kiwi_mesh2_sparse5", "dp2_sparse20"],
         title="How much sparsity can averaging tolerate?",
         question="Dense (p=1.0) vs 20% vs 5% of adapter values exchanged per round.",
     ),
+    # Per-mechanism pairs. The combined six-arm figure below shows everything
+    # at once; these isolate one pair each, because three overlapping pairs on
+    # one axis is exactly the readability problem this whole registry exists
+    # to avoid.
+    dict(
+        slug="08a_spare_cost_dense",
+        scenarios=["kiwi_mesh2_dense", "kiwi_mesh2_dense_nospare"],
+        title="Hot spare vs none — dense averaging",
+        question="7 workers (2 pipes + spare) vs 6. Curves should overlap: the "
+                 "spare never trains.",
+    ),
+    dict(
+        slug="08b_spare_cost_sparse5",
+        scenarios=["kiwi_mesh2_sparse5", "kiwi_mesh2_sparse5_nospare"],
+        title="Hot spare vs none — sparse 5%",
+        question="7 workers (2 pipes + spare) vs 6. Curves should overlap: the "
+                 "spare never trains.",
+    ),
+    dict(
+        slug="08c_spare_cost_outer",
+        scenarios=["kiwi_mesh2_outer", "kiwi_mesh2_outer_nospare"],
+        title="Hot spare vs none — outer optimizer",
+        question="7 workers (2 pipes + spare) vs 6. Curves should overlap: the "
+                 "spare never trains.",
+    ),
+    dict(
+        slug="08_spare_cost",
+        scenarios=["kiwi_mesh2_dense", "kiwi_mesh2_dense_nospare",
+                   "kiwi_mesh2_sparse5", "kiwi_mesh2_sparse5_nospare",
+                   "kiwi_mesh2_outer", "kiwi_mesh2_outer_nospare"],
+        title="What does keeping a hot spare cost?",
+        question="7 workers (2 pipes + spare) vs 6 (2 pipes). The spare never "
+                 "trains — it only receives round payloads to stay promotable — "
+                 "so each pair should OVERLAP. A visible gap means the spare is "
+                 "influencing training, which would be a bug. The real "
+                 "difference is in avg_round_ms and the round profile.",
+    ),
     dict(
         slug="05_recovery",
-        scenarios=["dp2_sparse5", "dp2_sparse5_kill", "dp2_alpaca_kill",
-                   "dp2_alpaca", "dp2_kill", "smoke_sparse", "smoke_sparse_kill"],
+        scenarios=["kiwi_mesh2_sparse5", "kiwi_mesh2_sparse5_kill", "kiwi_mesh2_dense"],
         title="Does killing a worker mid-run change the learning curve?",
         question="A same-stage spare has been receiving round payloads all along, "
                  "so promotion should cost ~0 and the curve should not bend.",
     ),
 ]
+
+
+# Spare / no-spare pairs. Same mechanism, 7 workers (2 pipes + spare) vs 6.
+SPARE_PAIRS = [
+    ("dense avg", "kiwi_mesh2_dense", "kiwi_mesh2_dense_nospare"),
+    ("sparse 5%", "kiwi_mesh2_sparse5", "kiwi_mesh2_sparse5_nospare"),
+    ("outer opt", "kiwi_mesh2_outer", "kiwi_mesh2_outer_nospare"),
+]
+
+
+def _plot_spare_cost_bars(data, output_dir):
+    """What the spare costs, in the units where it actually shows up.
+
+    The eval panels for these pairs are the NULL result: the spare never
+    trains, it only receives round payloads to stay promotable, so the curves
+    should sit on top of each other. Plotting only those would leave the
+    reader with "no difference" and no answer.
+
+    The difference is in cost, for two structural reasons: one fewer process
+    contending for the GPU, and contributors fanning out to one same-stage
+    peer instead of two (so one less inbound payload and one less merge per
+    round). This chart puts those numbers side by side with the percentage
+    delta, which is the actual price of fault tolerance.
+    """
+    metrics = data.get("metrics", {})
+    pairs = [(label, a, b) for label, a, b in SPARE_PAIRS
+             if a in metrics and b in metrics]
+    if not pairs:
+        print("    [skip] 09_spare_cost_bars: need both arms of at least one "
+              "spare/no-spare pair in the same results file")
+        return
+
+    panels = [
+        ("avg_round_ms", "Averaging barrier (ms)", "lower is better"),
+        ("avg_samples_per_sec", "Throughput (samples/s)", "higher is better"),
+        ("avg_step_time_ms", "Train step (ms)", "lower is better"),
+    ]
+    available = [p for p in panels
+                 if any(metrics[a].get(p[0]) or metrics[b].get(p[0])
+                        for _l, a, b in pairs)]
+    if not available:
+        print("    [skip] 09_spare_cost_bars: no cost metrics recorded")
+        return
+
+    fig, axes = plt.subplots(1, len(available), figsize=(6 * len(available), 5.5))
+    if len(available) == 1:
+        axes = [axes]
+
+    x = np.arange(len(pairs))
+    width = 0.36
+    for ax, (key, title, direction) in zip(axes, available):
+        spare = [float(metrics[a].get(key) or 0.0) for _l, a, _b in pairs]
+        nospare = [float(metrics[b].get(key) or 0.0) for _l, _a, b in pairs]
+        ax.bar(x - width / 2, spare, width, label="7 workers (with spare)",
+               color="#238b45")
+        ax.bar(x + width / 2, nospare, width, label="6 workers (no spare)",
+               color="#a1d99b")
+        for i, (s, n) in enumerate(zip(spare, nospare)):
+            if s and n:
+                # Signed cost of KEEPING the spare, so a positive number always
+                # reads as "the spare costs this much" regardless of whether
+                # the metric is better-high or better-low.
+                delta = (s - n) / n * 100 if "samples_per_sec" not in key else (n - s) / s * 100
+                ax.annotate(f"{delta:+.0f}%", xy=(i, max(s, n)),
+                            xytext=(0, 4), textcoords="offset points",
+                            ha="center", fontsize=10, color="#333333")
+        ax.set_xticks(x)
+        ax.set_xticklabels([p[0] for p in pairs])
+        ax.set_title(f"{title}\n({direction}; % = cost of the spare)", fontsize=11)
+        ax.grid(True, axis="y", linestyle="--", alpha=0.6)
+        ax.legend(fontsize=9)
+
+    fig.suptitle("What does keeping a hot spare cost?\n"
+                 "Convergence should be identical — the spare never trains. "
+                 "This is where the difference actually lands.", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "09_spare_cost_bars.png"), dpi=300)
+    fig.savefig(os.path.join(output_dir, "09_spare_cost_bars.svg"))
+    plt.close(fig)
+    print(f"    [ok]   09_spare_cost_bars  ({len(pairs)} pair(s))")
+
+    print("\n  Cost of the hot spare (7 workers vs 6):")
+    for label, a, b in pairs:
+        row = [f"    {label:12s}"]
+        for key, title, _d in available:
+            s, n = metrics[a].get(key), metrics[b].get(key)
+            if s and n:
+                delta = (s - n) / n * 100 if "samples_per_sec" not in key else (n - s) / s * 100
+                row.append(f"{title.split(' (')[0]} {s:8.1f} vs {n:8.1f} ({delta:+.0f}%)")
+        print("  ".join(row))
 
 
 def _best_mesh_arm(eval_runs, scenario_config):
@@ -320,11 +456,35 @@ def _plot_comparisons(data, output_dir):
     def replicas(name):
         return max(1, int((cfg.get(name, {}) or {}).get("replicas", 1) or 1))
 
+    def _one_corpus(slug, names):
+        """Never plot two corpora on one loss axis.
+
+        Several comparisons list both the zorbulax4 and truthfulqa version of
+        an arm, because the registry is corpus-agnostic and skips whatever is
+        absent. That works only while a results file holds one corpus. Run
+        both into the same file and e.g. 01_baselines would overlay a 4-fact
+        memorization curve on a 600-sample held-out curve — different loss
+        scales, silently comparable-looking, completely meaningless.
+        Keep the largest group and say what was dropped.
+        """
+        groups = {}
+        for n in names:
+            groups.setdefault((cfg.get(n, {}) or {}).get("dataset", "unknown"), []).append(n)
+        if len(groups) <= 1:
+            return names
+        keep = max(groups.values(), key=len)
+        dropped = {k: v for k, v in groups.items() if v is not keep}
+        print(f"    [note] {slug}: results contain multiple corpora; plotting "
+              f"{(cfg.get(keep[0], {}) or {}).get('dataset', '?')} only, "
+              f"excluding {dropped}")
+        return keep
+
     for spec in COMPARISONS:
         names = [n for n in spec["scenarios"] if n in eval_runs]
         if not names:
             print(f"    [skip] {spec['slug']}: none of its scenarios are in this run")
             continue
+        names = _one_corpus(spec["slug"], names)
         _plot_eval_panel(
             eval_runs, names, spec["title"], spec["question"],
             os.path.join(cmp_dir, spec["slug"]),
@@ -344,7 +504,7 @@ def _plot_comparisons(data, output_dir):
 
     # ── 06 headline: reference, pipeline, and the winning mesh arm ──
     best = _best_mesh_arm(eval_runs, cfg)
-    headline = [n for n in ("single_machine", "sm_alpaca", "dp1", "dp1_alpaca")
+    headline = [n for n in ("sm_zorb", "sm", "kiwi_pipeline_zorb", "kiwi_pipeline")
                 if n in eval_runs]
     if best:
         headline.append(best)
@@ -357,6 +517,8 @@ def _plot_comparisons(data, output_dir):
             os.path.join(cmp_dir, "06_headline"),
             events=events, scenario_config=cfg,
         )
+
+    _plot_spare_cost_bars(data, cmp_dir)
 
     # ── 07 wall-clock: the axis kiwi exists to win ──
     # Best-effort. Mesh arms report samples/sec directly; sequential arms only
@@ -666,7 +828,7 @@ def plot_convergence(results_path: str, output_dir: str):
     ax4.bar(labels, [metrics.get(c, {}).get("avg_step_time_ms", 0) for c in configs],
             color=colors, alpha=0.7)
     ax4.set_title("Avg Step Time (ms) — shared-GPU caveat:\n"
-                  "dp_R vs dp1 measures communication overlap, NOT DP scaling (§6.1)")
+                  "dp_R vs kiwi_pipeline_zorb measures communication overlap, NOT DP scaling (§6.1)")
     ax4.set_ylabel("Time (ms)")
     ax4.grid(True, axis='y', linestyle="--", alpha=0.6)
     plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45, ha='right', fontsize=8)
@@ -844,10 +1006,10 @@ def plot_convergence(results_path: str, output_dir: str):
         plt.xscale("symlog", linthresh=1e-3)
         plt.xlabel("Final loss (mean over seeds, ±1 std) — symlog scale")
 
-        ref = finals.get("dp1", finals.get("distributed_3stage"))
+        ref = finals.get("kiwi_pipeline_zorb", finals.get("distributed_3stage"))
         if ref:
             plt.axvline(ref[0], color="#d62728", linestyle="--", linewidth=1.2,
-                        label=f"dp1 control = {ref[0]:.4f}")
+                        label=f"kiwi_pipeline_zorb control = {ref[0]:.4f}")
             plt.legend(loc="lower right", fontsize=9)
 
         plt.title("Final loss by scenario — note the steps/replica column.\n"
