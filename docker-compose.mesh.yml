@@ -77,6 +77,17 @@ services:
       # reproduce a pre-checkpointing timing baseline.
       KIWI_GRAD_CHECKPOINT: ${KIWI_GRAD_CHECKPOINT:-1}
       KIWI_T_ROUND: "120"
+      # CPU thread cap — MERGE_PERF_PLAN.md §4.1A. Seven workers share this
+      # host, so a per-process default of os.cpu_count() intra-op threads
+      # oversubscribes it ~7x during a round. Set here as well as in the
+      # Dockerfile so it can be A/B-ed without rebuilding the image:
+      #   KIWI_TORCH_THREADS=30 docker compose ... up -d   # old behaviour
+      # OMP/MKL must be in the environment because those libraries size
+      # their pools at init; worker.py reads KIWI_TORCH_THREADS and calls
+      # torch.set_num_threads() to match.
+      KIWI_TORCH_THREADS: ${KIWI_TORCH_THREADS:-2}
+      OMP_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
+      MKL_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./worker.py:/app/worker.py
@@ -118,6 +129,17 @@ services:
       # reproduce a pre-checkpointing timing baseline.
       KIWI_GRAD_CHECKPOINT: ${KIWI_GRAD_CHECKPOINT:-1}
       KIWI_T_ROUND: "120"
+      # CPU thread cap — MERGE_PERF_PLAN.md §4.1A. Seven workers share this
+      # host, so a per-process default of os.cpu_count() intra-op threads
+      # oversubscribes it ~7x during a round. Set here as well as in the
+      # Dockerfile so it can be A/B-ed without rebuilding the image:
+      #   KIWI_TORCH_THREADS=30 docker compose ... up -d   # old behaviour
+      # OMP/MKL must be in the environment because those libraries size
+      # their pools at init; worker.py reads KIWI_TORCH_THREADS and calls
+      # torch.set_num_threads() to match.
+      KIWI_TORCH_THREADS: ${KIWI_TORCH_THREADS:-2}
+      OMP_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
+      MKL_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./worker.py:/app/worker.py
@@ -159,6 +181,17 @@ services:
       # reproduce a pre-checkpointing timing baseline.
       KIWI_GRAD_CHECKPOINT: ${KIWI_GRAD_CHECKPOINT:-1}
       KIWI_T_ROUND: "120"
+      # CPU thread cap — MERGE_PERF_PLAN.md §4.1A. Seven workers share this
+      # host, so a per-process default of os.cpu_count() intra-op threads
+      # oversubscribes it ~7x during a round. Set here as well as in the
+      # Dockerfile so it can be A/B-ed without rebuilding the image:
+      #   KIWI_TORCH_THREADS=30 docker compose ... up -d   # old behaviour
+      # OMP/MKL must be in the environment because those libraries size
+      # their pools at init; worker.py reads KIWI_TORCH_THREADS and calls
+      # torch.set_num_threads() to match.
+      KIWI_TORCH_THREADS: ${KIWI_TORCH_THREADS:-2}
+      OMP_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
+      MKL_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./worker.py:/app/worker.py
@@ -200,6 +233,17 @@ services:
       # reproduce a pre-checkpointing timing baseline.
       KIWI_GRAD_CHECKPOINT: ${KIWI_GRAD_CHECKPOINT:-1}
       KIWI_T_ROUND: "120"
+      # CPU thread cap — MERGE_PERF_PLAN.md §4.1A. Seven workers share this
+      # host, so a per-process default of os.cpu_count() intra-op threads
+      # oversubscribes it ~7x during a round. Set here as well as in the
+      # Dockerfile so it can be A/B-ed without rebuilding the image:
+      #   KIWI_TORCH_THREADS=30 docker compose ... up -d   # old behaviour
+      # OMP/MKL must be in the environment because those libraries size
+      # their pools at init; worker.py reads KIWI_TORCH_THREADS and calls
+      # torch.set_num_threads() to match.
+      KIWI_TORCH_THREADS: ${KIWI_TORCH_THREADS:-2}
+      OMP_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
+      MKL_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./worker.py:/app/worker.py
@@ -241,6 +285,17 @@ services:
       # reproduce a pre-checkpointing timing baseline.
       KIWI_GRAD_CHECKPOINT: ${KIWI_GRAD_CHECKPOINT:-1}
       KIWI_T_ROUND: "120"
+      # CPU thread cap — MERGE_PERF_PLAN.md §4.1A. Seven workers share this
+      # host, so a per-process default of os.cpu_count() intra-op threads
+      # oversubscribes it ~7x during a round. Set here as well as in the
+      # Dockerfile so it can be A/B-ed without rebuilding the image:
+      #   KIWI_TORCH_THREADS=30 docker compose ... up -d   # old behaviour
+      # OMP/MKL must be in the environment because those libraries size
+      # their pools at init; worker.py reads KIWI_TORCH_THREADS and calls
+      # torch.set_num_threads() to match.
+      KIWI_TORCH_THREADS: ${KIWI_TORCH_THREADS:-2}
+      OMP_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
+      MKL_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./worker.py:/app/worker.py
@@ -282,6 +337,17 @@ services:
       # reproduce a pre-checkpointing timing baseline.
       KIWI_GRAD_CHECKPOINT: ${KIWI_GRAD_CHECKPOINT:-1}
       KIWI_T_ROUND: "120"
+      # CPU thread cap — MERGE_PERF_PLAN.md §4.1A. Seven workers share this
+      # host, so a per-process default of os.cpu_count() intra-op threads
+      # oversubscribes it ~7x during a round. Set here as well as in the
+      # Dockerfile so it can be A/B-ed without rebuilding the image:
+      #   KIWI_TORCH_THREADS=30 docker compose ... up -d   # old behaviour
+      # OMP/MKL must be in the environment because those libraries size
+      # their pools at init; worker.py reads KIWI_TORCH_THREADS and calls
+      # torch.set_num_threads() to match.
+      KIWI_TORCH_THREADS: ${KIWI_TORCH_THREADS:-2}
+      OMP_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
+      MKL_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./worker.py:/app/worker.py
@@ -323,6 +389,17 @@ services:
       # reproduce a pre-checkpointing timing baseline.
       KIWI_GRAD_CHECKPOINT: ${KIWI_GRAD_CHECKPOINT:-1}
       KIWI_T_ROUND: "120"
+      # CPU thread cap — MERGE_PERF_PLAN.md §4.1A. Seven workers share this
+      # host, so a per-process default of os.cpu_count() intra-op threads
+      # oversubscribes it ~7x during a round. Set here as well as in the
+      # Dockerfile so it can be A/B-ed without rebuilding the image:
+      #   KIWI_TORCH_THREADS=30 docker compose ... up -d   # old behaviour
+      # OMP/MKL must be in the environment because those libraries size
+      # their pools at init; worker.py reads KIWI_TORCH_THREADS and calls
+      # torch.set_num_threads() to match.
+      KIWI_TORCH_THREADS: ${KIWI_TORCH_THREADS:-2}
+      OMP_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
+      MKL_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./worker.py:/app/worker.py
