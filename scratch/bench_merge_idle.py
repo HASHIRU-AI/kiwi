@@ -64,6 +64,22 @@ Falsifiable predictions, if the OpenMP-team story is right:
      brand-new team rather than a sleeping one.
 If (1) does not reproduce, the mechanism is something else again and the next
 step is a Tier-2 local cluster run, not more microbenchmarks.
+
+OUTCOME: (1) DID NOT REPRODUCE. This hypothesis is dead; the script is kept as
+the record of it. On the target box: gap 0.0s = 26.8 ms, gap 3.0s = 23.2 ms
+(0.9x), and OMP_WAIT_POLICY=active / GOMP_SPINCOUNT=infinite were both no-ops.
+Idle time before a merge is irrelevant.
+
+The one real signal here was the thread-pool penalty -- pool 44-48 ms and
+fresh_pool 51 ms against 23-27 ms on the main thread, which does apply to
+_apply_round_merge running under asyncio.to_thread. But 2x is not 152x.
+
+The actual cause (MERGE_PERF_FINDINGS.md) was thread oversubscription x
+per-tensor op count, and THIS SCRIPT COULD NOT HAVE FOUND IT: it runs a single
+process, and the effect needs 7 concurrent processes each with a 30-thread team.
+Its own "go to a Tier-2 cluster run" advice was the correct next step -- what
+actually settled it was A/B-ing scratch/mesh_v4_baseline.py against mesh.py in
+the live cluster, which is cheap because mesh.py is bind-mounted.
 """
 
 from __future__ import annotations

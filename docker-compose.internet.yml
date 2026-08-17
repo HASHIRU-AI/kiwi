@@ -59,6 +59,17 @@ services:
       # alpaca1k sequence lengths under the 0.9 GB cap; set to 0 only to
       # reproduce a pre-checkpointing timing baseline.
       KIWI_GRAD_CHECKPOINT: ${KIWI_GRAD_CHECKPOINT:-1}
+      # CPU thread cap — MERGE_PERF_PLAN.md §4.1A / MERGE_PERF_FINDINGS.md.
+      # Multiple workers share this host, so a per-process default of
+      # os.cpu_count() intra-op threads oversubscribes it, and every ATen op
+      # above the ~32k-element parallel grain size then pays a contended
+      # OpenMP fork/join. Measured on the A10 box: the v4 per-tensor merge
+      # cost 3,800 ms at 30 threads and 9 ms at 2. Set here as well as in the
+      # Dockerfile so it is A/B-able without an image rebuild:
+      #   KIWI_TORCH_THREADS=30 docker compose ... up -d   # old behaviour
+      KIWI_TORCH_THREADS: ${KIWI_TORCH_THREADS:-2}
+      OMP_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
+      MKL_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./worker.py:/app/worker.py
@@ -99,6 +110,17 @@ services:
       # alpaca1k sequence lengths under the 0.9 GB cap; set to 0 only to
       # reproduce a pre-checkpointing timing baseline.
       KIWI_GRAD_CHECKPOINT: ${KIWI_GRAD_CHECKPOINT:-1}
+      # CPU thread cap — MERGE_PERF_PLAN.md §4.1A / MERGE_PERF_FINDINGS.md.
+      # Multiple workers share this host, so a per-process default of
+      # os.cpu_count() intra-op threads oversubscribes it, and every ATen op
+      # above the ~32k-element parallel grain size then pays a contended
+      # OpenMP fork/join. Measured on the A10 box: the v4 per-tensor merge
+      # cost 3,800 ms at 30 threads and 9 ms at 2. Set here as well as in the
+      # Dockerfile so it is A/B-able without an image rebuild:
+      #   KIWI_TORCH_THREADS=30 docker compose ... up -d   # old behaviour
+      KIWI_TORCH_THREADS: ${KIWI_TORCH_THREADS:-2}
+      OMP_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
+      MKL_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./worker.py:/app/worker.py
@@ -140,6 +162,17 @@ services:
       # alpaca1k sequence lengths under the 0.9 GB cap; set to 0 only to
       # reproduce a pre-checkpointing timing baseline.
       KIWI_GRAD_CHECKPOINT: ${KIWI_GRAD_CHECKPOINT:-1}
+      # CPU thread cap — MERGE_PERF_PLAN.md §4.1A / MERGE_PERF_FINDINGS.md.
+      # Multiple workers share this host, so a per-process default of
+      # os.cpu_count() intra-op threads oversubscribes it, and every ATen op
+      # above the ~32k-element parallel grain size then pays a contended
+      # OpenMP fork/join. Measured on the A10 box: the v4 per-tensor merge
+      # cost 3,800 ms at 30 threads and 9 ms at 2. Set here as well as in the
+      # Dockerfile so it is A/B-able without an image rebuild:
+      #   KIWI_TORCH_THREADS=30 docker compose ... up -d   # old behaviour
+      KIWI_TORCH_THREADS: ${KIWI_TORCH_THREADS:-2}
+      OMP_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
+      MKL_NUM_THREADS: ${KIWI_TORCH_THREADS:-2}
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./worker.py:/app/worker.py

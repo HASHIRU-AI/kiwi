@@ -920,20 +920,29 @@ def _apply_round_merge(
             merged = outer_step(
                 _outer_anchor, merged, _outer_buf, OUTER_LR, OUTER_MU, timings=timings
             )
-            # Refresh the anchor IN PLACE (MERGE_PERF_PLAN.md §4.1D). The old
-            # dict-of-clones allocated a fresh copy of the whole adapter every
-            # dense round and dropped the previous one on the floor for the GC.
-            # copy_ reuses the buffers allocated on the anchor round, which is
-            # both cheaper and steadier on memory — and it is the same bytes
-            # either way, so the outer step stays bit-identical across replicas.
-            if _outer_anchor.keys() == merged.keys():
-                for key, value in merged.items():
-                    _outer_anchor[key].copy_(value)
-            else:
-                # Defensive: the adapter's key set is fixed for a worker's
-                # lifetime, so this cannot fire — but a silent shape mismatch
-                # in copy_ would be far worse than one extra allocation.
-                _outer_anchor = {k: v.detach().clone() for k, v in merged.items()}
+            # A fresh dict of clones, as before Phase 1D.
+            #
+            # An earlier version refreshed the anchor IN PLACE with copy_ to
+            # avoid re-allocating the adapter every dense round
+            # (MERGE_PERF_PLAN.md §4.1D). Reverted, on cost/benefit rather than
+            # on evidence of a defect: the clone cost 474-750 ms per round in v4
+            # only because 140 OpenMP-parallel copies each paid a contended
+            # fork/join, and with the thread cap and the vectorised merge
+            # outer_ms is now 14.2 ms in TOTAL. The in-place version has no
+            # measurable benefit left, and it is aliasing-sensitive in a way the
+            # unit tests do not cover: with an fp32 adapter, `.to(float32)`
+            # inside outer_step returns the anchor tensor ITSELF rather than a
+            # copy, so the anchor is simultaneously an input to the step and the
+            # buffer being overwritten. That is correct as written — the reads
+            # all complete first — but it is a trap for the next edit, and an
+            # allocation that does not register is not worth guarding.
+            #
+            # NOTE: this was first reverted because the DiLoCo arm diverged in
+            # benchmark_results_v5/merge_perf (eval 1.696 -> 2.251). That run
+            # turned out to have trained at KIWI_LR=2e-4 against v4's 5e-5, so
+            # it says nothing about this code either way. The revert stands on
+            # the reasoning above, not on that run.
+            _outer_anchor = {k: v.detach().clone() for k, v in merged.items()}
             outer_applied = True
         if timings is not None:
             timings["outer_ms"] = (time.perf_counter() - t_outer) * 1000

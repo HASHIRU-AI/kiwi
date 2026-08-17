@@ -55,9 +55,32 @@ Usage
     python scratch/bench_merge.py --procs 7          # match the real cluster
     python scratch/bench_merge.py --json out.json    # machine-readable
 
-Run it on the box that produced the profile if you can; the answer is
-hardware-specific. But run it anywhere -- section 4 needs only a CPU, and a
-1-thread-vs-default gap on ANY multicore machine is already the signal.
+RESOLVED -- READ THIS BEFORE TRUSTING A NEGATIVE RESULT FROM THIS SCRIPT.
+See MERGE_PERF_FINDINGS.md for the full account.
+
+The cause was thread oversubscription after all, but this script UNDERSTATED it
+by two orders of magnitude and the wrong conclusion was drawn from it. The
+pathology needs THREE ingredients at once:
+
+    many tensors  x  many threads per process  x  many processes
+
+    this script, --procs 7 on a 20-core laptop (14 threads):      40 ms
+    single process on the 30-core target box (30 threads):        25 ms
+    the real cluster: 7 processes x 30 threads on 30 cores:    3,800 ms
+
+Barrier cost scales superlinearly in TEAM SIZE, so 7x14 threads on 20 cores
+looks like a negligible 3.9x while 7x30 on 30 cores is 400x. Section 5 is
+therefore only meaningful when run ON THE TARGET HOST with --procs matching the
+real worker count. A cheap result here does NOT mean the merge is cheap in the
+cluster.
+
+What this script did get right, and why it is kept: section 4's grain-size
+probe identified the mechanism (4.1 us at 1 thread vs 45.9 us at 14 threads for
+32,769 elements; 1.00x at 32,767). That fixed per-region cost, multiplied by the
+~280 elementwise ops of a 140-tensor R=2 merge, is the whole story.
+
+Note also that the real adapter is fp32, not bf16 -- pass --dtype float32 to
+match it. The default here is bf16, which halves the bytes.
 """
 
 from __future__ import annotations
