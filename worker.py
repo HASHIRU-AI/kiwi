@@ -871,12 +871,22 @@ def _apply_round_merge(
     # copies inside the merge loop), so the fallback exists only for callers
     # that predate the own_cpu argument.
     own = own_cpu if own_cpu is not None else get_peft_model_state_dict(model)
+    # `timings` is threaded into the merge itself so the round line breaks the
+    # merge down into convert / accumulate / divide / cast. Three separate
+    # microbenchmarks (scratch/bench_merge.py, scratch/bench_merge_idle.py)
+    # failed to reproduce the v4 cluster's 3.8 s dense merge — an isolated
+    # byte-matched merge is ~25 ms — so the sub-phase split has to come from a
+    # real round on the real box. Same reasoning as the Phase 2.1 split between
+    # merge_compute_ms and apply_ms.
     if p < 1.0:
         merged = merge_sparse(
-            own, received, contribute, round_id=round_id, p=p, own_name=NODE_NAME
+            own, received, contribute, round_id=round_id, p=p, own_name=NODE_NAME,
+            timings=timings,
         )
     else:
-        merged = merge_adapters(own, received, contribute, own_name=NODE_NAME)
+        merged = merge_adapters(
+            own, received, contribute, own_name=NODE_NAME, timings=timings
+        )
     if timings is not None:
         timings["merge_compute_ms"] = (time.perf_counter() - t0) * 1000
     if merged is None:
@@ -907,7 +917,9 @@ def _apply_round_merge(
             print(f"[{NODE_NAME}] Outer optimizer: anchor established at round "
                   f"{round_id} (no outer step on the first dense round)", flush=True)
         else:
-            merged = outer_step(_outer_anchor, merged, _outer_buf, OUTER_LR, OUTER_MU)
+            merged = outer_step(
+                _outer_anchor, merged, _outer_buf, OUTER_LR, OUTER_MU, timings=timings
+            )
             # Refresh the anchor IN PLACE (MERGE_PERF_PLAN.md §4.1D). The old
             # dict-of-clones allocated a fresh copy of the whole adapter every
             # dense round and dropped the previous one on the floor for the GC.

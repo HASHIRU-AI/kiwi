@@ -6,6 +6,7 @@ run on CPU with only torch installed.
 
 from __future__ import annotations
 
+import time
 import zlib
 
 import torch
@@ -74,7 +75,9 @@ def _target_device(
 
 
 def _accumulate(
-    per_contribution: list[list[torch.Tensor]], dev: torch.device
+    per_contribution: list[list[torch.Tensor]],
+    dev: torch.device,
+    timings: dict[str, float] | None = None,
 ) -> list[torch.Tensor]:
     """Sum lists of tensors elementwise in fp32, in the order given.
 
@@ -90,17 +93,31 @@ def _accumulate(
     the in-place adds below would corrupt a peer's payload — or our own live
     weights, when `contribute=True`.
     """
+    convert_ms = 0.0
+    add_ms = 0.0
     acc: list[torch.Tensor] | None = None
     for tensors in per_contribution:
+        t0 = time.perf_counter()
         converted = [
             t.detach().to(device=dev, dtype=torch.float32, copy=acc is None)
             for t in tensors
         ]
+        t1 = time.perf_counter()
+        convert_ms += (t1 - t0) * 1000
         if acc is None:
             acc = converted
         else:
             torch._foreach_add_(acc, converted)
+            add_ms += (time.perf_counter() - t1) * 1000
     assert acc is not None  # callers return early on an empty contribution list
+    if timings is not None:
+        # Split out because these have completely different fixes and a single
+        # merge_compute_ms cannot tell them apart. Three microbenchmarks failed
+        # to reproduce the v4 cluster's 3.8 s merge (see scratch/bench_merge.py
+        # and scratch/bench_merge_idle.py), so the next measurement has to come
+        # from inside a real round.
+        timings["merge_convert_ms"] = convert_ms
+        timings["merge_accum_ms"] = add_ms
     return acc
 
 
@@ -110,6 +127,7 @@ def merge_adapters(
     contribute: bool,
     own_name: str = "",
     device: torch.device | str | None = None,
+    timings: dict[str, float] | None = None,
 ) -> dict[str, torch.Tensor] | None:
     """Uniform mean of adapter state dicts (§3.5).
 
@@ -145,10 +163,19 @@ def merge_adapters(
     n = len(contributions)
     dev = _target_device(own, keys, device)
     acc = _accumulate(
-        [[sd[k] for k in keys] for _sender, sd in contributions], dev
+        [[sd[k] for k in keys] for _sender, sd in contributions], dev, timings
     )
+    t0 = time.perf_counter()
     torch._foreach_div_(acc, float(n))
-    return {k: acc[i].to(own[k].dtype) for i, k in enumerate(keys)}
+    t1 = time.perf_counter()
+    merged = {k: acc[i].to(own[k].dtype) for i, k in enumerate(keys)}
+    if timings is not None:
+        timings["merge_div_ms"] = (t1 - t0) * 1000
+        timings["merge_cast_ms"] = (time.perf_counter() - t1) * 1000
+        timings["merge_tensors"] = float(len(keys))
+        timings["merge_params"] = float(sum(own[k].numel() for k in keys))
+        timings["merge_n"] = float(n)
+    return merged
 
 
 # ── Sparse averaging (Phase 3) ──────────────────────────────────────────────
@@ -234,6 +261,7 @@ def merge_sparse(
     p: float,
     own_name: str = "",
     device: torch.device | str | None = None,
+    timings: dict[str, float] | None = None,
 ) -> dict[str, torch.Tensor] | None:
     """Average only the masked entries; leave everything else untouched.
 
@@ -301,8 +329,11 @@ def merge_sparse(
     acc = _accumulate(
         [[sd[k].detach().reshape(-1) for k in keys] for _sender, sd in contributions],
         dev,
+        timings,
     )
+    t0 = time.perf_counter()
     torch._foreach_div_(acc, float(n))
+    t1 = time.perf_counter()
 
     merged: dict[str, torch.Tensor] = {}
     for i, k in enumerate(keys):
@@ -310,6 +341,17 @@ def merge_sparse(
         flat = base.reshape(-1)          # a view of `base` (it is contiguous)
         flat[masks[k].to(dev)] = acc[i].to(own[k].dtype)
         merged[k] = flat.view(own[k].shape)
+    if timings is not None:
+        timings["merge_div_ms"] = (t1 - t0) * 1000
+        # Clone-plus-scatter, the sparse path's own overhead. In the v4 logs
+        # p=0.05 rounds cost ~100 ms against ~50 ms for a full dense round on
+        # the same worker, despite touching 20x fewer elements — so this step,
+        # not the arithmetic, is what sparse averaging actually pays for.
+        timings["merge_scatter_ms"] = (time.perf_counter() - t1) * 1000
+        timings["merge_tensors"] = float(len(keys))
+        timings["merge_params"] = float(sum(own[k].numel() for k in keys))
+        timings["merge_masked"] = float(sum(masks[k].numel() for k in keys))
+        timings["merge_n"] = float(n)
     return merged
 
 
@@ -323,6 +365,7 @@ def outer_step(
     lr: float = 0.7,
     mu: float = 0.9,
     device: torch.device | str | None = None,
+    timings: dict[str, float] | None = None,
 ) -> dict[str, torch.Tensor]:
     """One Nesterov outer step: anchor + nesterov(avg - anchor).
 
@@ -350,6 +393,7 @@ def outer_step(
     stepped: dict[str, torch.Tensor] = {k: anchor[k] for k in all_keys if k not in avg}
 
     if keys:
+        t_start = time.perf_counter()
         dev = _target_device(anchor, keys, device)
         # copy=False on the anchor: it is only ever read below.
         anchor_f32 = [
@@ -362,6 +406,7 @@ def outer_step(
             avg[k].detach().to(device=dev, dtype=torch.float32, copy=True) for k in keys
         ]
         torch._foreach_sub_(delta, anchor_f32)
+        t_delta = time.perf_counter()
 
         # m = mu * m + delta, batched. Keys absent from `buf` (the first outer
         # step) seed from delta; in steady state every key is present, so the
@@ -379,6 +424,7 @@ def outer_step(
                 momentum[i] = updated[j]
         for i, k in enumerate(keys):
             buf[k] = momentum[i]
+        t_momentum = time.perf_counter()
 
         # anchor + lr * (delta + mu * m). Written as four batched ops rather
         # than one fused add(alpha=) so the arithmetic is the same expression
@@ -389,8 +435,15 @@ def outer_step(
         torch._foreach_add_(update, delta)
         torch._foreach_mul_(update, lr)
         torch._foreach_add_(update, anchor_f32)
+        t_update = time.perf_counter()
         for i, k in enumerate(keys):
             stepped[k] = update[i].to(anchor[k].dtype)
+        if timings is not None:
+            timings["outer_delta_ms"] = (t_delta - t_start) * 1000
+            timings["outer_momentum_ms"] = (t_momentum - t_delta) * 1000
+            timings["outer_update_ms"] = (t_update - t_momentum) * 1000
+            timings["outer_cast_ms"] = (time.perf_counter() - t_update) * 1000
+            timings["outer_tensors"] = float(len(keys))
 
     # Sorted insertion order, matching the previous implementation.
     return {k: stepped[k] for k in all_keys}
