@@ -40,6 +40,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HOME=/root/.cache/huggingface \
     DEBIAN_FRONTEND=noninteractive
 
+# CPU thread cap — MERGE_PERF_PLAN.md §4.1A.
+# Several worker containers share one host, so a per-process default of
+# os.cpu_count() intra-op threads oversubscribes the machine by that factor
+# during an averaging round, and every ATen op above the ~32k parallel grain
+# size pays a contended OpenMP fork/join. OMP/MKL must be set in the
+# environment because those libraries size their pools at init; the
+# KIWI_TORCH_THREADS block at the top of worker.py reads it and calls
+# torch.set_num_threads() to match. Raise it for one-worker-per-host.
+ENV OMP_NUM_THREADS=2 \
+    MKL_NUM_THREADS=2 \
+    KIWI_TORCH_THREADS=2
+
 # Install Python 3.10, pip, and build tools
 RUN apt-get update && \
     apt-get install -y --no-install-recommends python3.10 python3-pip build-essential && \

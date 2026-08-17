@@ -1,0 +1,406 @@
+{
+  "env": {
+    "torch": "2.6.0+cu124",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "cpu_count": 20,
+    "default_threads": 14,
+    "dtype": "bfloat16",
+    "tensors": 112,
+    "params": 2932736,
+    "bytes": 5865472
+  },
+  "functions": {
+    "merge_adapters R=2": {
+      "min_ms": 10.094699973706156,
+      "median_ms": 10.342200024751946,
+      "mean_ms": 10.392560003674589,
+      "max_ms": 10.89269999647513
+    },
+    "merge_adapters R=3": {
+      "min_ms": 14.120900013949722,
+      "median_ms": 14.755349984625354,
+      "mean_ms": 15.103649997035973,
+      "max_ms": 16.630400030408055
+    },
+    "merge_sparse p=0.05 R=3": {
+      "min_ms": 44.94200000772253,
+      "median_ms": 45.97589999320917,
+      "mean_ms": 46.35537499561906,
+      "max_ms": 50.14010000741109
+    },
+    "sparse_snapshot": {
+      "min_ms": 36.126499995589256,
+      "median_ms": 36.780749971512705,
+      "mean_ms": 37.07737999211531,
+      "max_ms": 39.723799971397966
+    },
+    "outer_step": {
+      "min_ms": 17.552100005559623,
+      "median_ms": 18.03730000392534,
+      "mean_ms": 18.193034996511415,
+      "max_ms": 19.122300029266626
+    },
+    "outer_step (warm buf)": {
+      "min_ms": 19.569600000977516,
+      "median_ms": 19.923249987186864,
+      "mean_ms": 19.99190499773249,
+      "max_ms": 21.416000032331795
+    }
+  },
+  "phases": {
+    "allocate accumulators": {
+      "min_ms": 1.594599976669997,
+      "median_ms": 1.6699999978300184,
+      "mean_ms": 1.7019150051055476,
+      "max_ms": 1.9558999920263886
+    },
+    "convert only (.float().cpu())": {
+      "min_ms": 3.9276999887079,
+      "median_ms": 4.213550011627376,
+      "mean_ms": 4.223170003388077,
+      "max_ms": 4.570199991576374
+    },
+    "accumulate, pre-converted": {
+      "min_ms": 3.336200024932623,
+      "median_ms": 3.558000025805086,
+      "mean_ms": 3.6334750009700656,
+      "max_ms": 4.506899975240231
+    },
+    "convert+accumulate (as-is)": {
+      "min_ms": 7.301000005099922,
+      "median_ms": 7.499100029235706,
+      "mean_ms": 7.559690007474273,
+      "max_ms": 8.018599997740239
+    },
+    "divide + cast to dtype": {
+      "min_ms": 4.294499987736344,
+      "median_ms": 4.532349994406104,
+      "mean_ms": 4.555154993431643,
+      "max_ms": 4.908400005660951
+    },
+    "_foreach_add_ (pre-converted)": {
+      "min_ms": 3.069199970923364,
+      "median_ms": 3.185200010193512,
+      "mean_ms": 3.2315249962266535,
+      "max_ms": 3.529599984176457
+    }
+  },
+  "thread_sweep": {
+    "1": {
+      "min_ms": 5.385800031945109,
+      "median_ms": 5.615849979221821,
+      "mean_ms": 5.698015002417378,
+      "max_ms": 6.3316000159829855
+    },
+    "2": {
+      "min_ms": 7.34140002168715,
+      "median_ms": 7.704199990257621,
+      "mean_ms": 7.820854996680282,
+      "max_ms": 9.126500051934272
+    },
+    "4": {
+      "min_ms": 7.4399999575689435,
+      "median_ms": 7.710800040513277,
+      "mean_ms": 7.772375005879439,
+      "max_ms": 8.598199987318367
+    },
+    "14": {
+      "min_ms": 10.013400053139776,
+      "median_ms": 10.201049997704104,
+      "mean_ms": 10.25191500375513,
+      "max_ms": 10.699200036469847
+    }
+  },
+  "grain": [
+    {
+      "numel": 4096,
+      "1thr": 0.0014710001414641738,
+      "default": 0.0015079998411238194,
+      "ratio_default_over_1thr": 1.025152750578812
+    },
+    {
+      "numel": 14336,
+      "1thr": 0.003006500191986561,
+      "default": 0.003000499855261296,
+      "ratio_default_over_1thr": 0.9980042120930982
+    },
+    {
+      "numel": 32767,
+      "1thr": 0.004198499955236912,
+      "default": 0.004204500000923872,
+      "ratio_default_over_1thr": 1.0014290927119045
+    },
+    {
+      "numel": 32769,
+      "1thr": 0.004143000114709139,
+      "default": 0.04590049997204915,
+      "ratio_default_over_1thr": 11.079048684813182
+    },
+    {
+      "numel": 77824,
+      "1thr": 0.011525999871082604,
+      "default": 0.04753149987664074,
+      "ratio_default_over_1thr": 4.123850460548048
+    },
+    {
+      "numel": 262144,
+      "1thr": 0.052906999771948904,
+      "default": 0.05968850018689409,
+      "ratio_default_over_1thr": 1.1281777542513516
+    }
+  ],
+  "concurrent": {
+    "default threads": {
+      "slowest_median_ms": 40.05210002651438,
+      "fastest_median_ms": 16.68589998735115,
+      "mean_median_ms": 32.07295715609299,
+      "wall_ms": 4111.692900012713
+    },
+    "1 thread": {
+      "slowest_median_ms": 14.216899988241494,
+      "fastest_median_ms": 11.730799975339323,
+      "mean_median_ms": 12.85545713368005,
+      "wall_ms": 5348.840999999084
+    },
+    "2 threads": {
+      "slowest_median_ms": 21.899200044572353,
+      "fastest_median_ms": 15.92580002034083,
+      "mean_median_ms": 18.11521429668314,
+      "wall_ms": 7272.558500000741
+    }
+  },
+  "impls": {
+    "1": {
+      "R=2 current (per-tensor +=)": {
+        "min_ms": 6.368700007442385,
+        "median_ms": 9.05784999486059,
+        "mean_ms": 8.740655001020059,
+        "max_ms": 10.774799971841276,
+        "bitwise_vs_current": 1.0
+      },
+      "R=2 _foreach_add_": {
+        "min_ms": 7.673699990846217,
+        "median_ms": 8.38000004296191,
+        "mean_ms": 8.321950005483814,
+        "max_ms": 9.053400019183755,
+        "bitwise_vs_current": 1.0
+      },
+      "R=2 flat buffer": {
+        "min_ms": 6.799600028898567,
+        "median_ms": 7.092149986419827,
+        "mean_ms": 7.181674998719245,
+        "max_ms": 7.952800020575523,
+        "bitwise_vs_current": 1.0
+      },
+      "R=2 flat buffer, preallocated": {
+        "min_ms": 6.840399990323931,
+        "median_ms": 7.688149984460324,
+        "mean_ms": 7.5563699880149215,
+        "max_ms": 8.509100007358938,
+        "bitwise_vs_current": 1.0
+      },
+      "R=3 current (per-tensor +=)": {
+        "min_ms": 9.944299992639571,
+        "median_ms": 10.853299987502396,
+        "mean_ms": 11.000539993983693,
+        "max_ms": 13.209400000050664,
+        "bitwise_vs_current": 1.0
+      },
+      "R=3 _foreach_add_": {
+        "min_ms": 9.102499985601753,
+        "median_ms": 9.78150000446476,
+        "mean_ms": 9.88999999826774,
+        "max_ms": 12.286000011954457,
+        "bitwise_vs_current": 1.0
+      },
+      "R=3 flat buffer": {
+        "min_ms": 11.106599995400757,
+        "median_ms": 11.74104999518022,
+        "mean_ms": 11.770959995919839,
+        "max_ms": 12.552300002425909,
+        "bitwise_vs_current": 1.0
+      },
+      "R=3 flat buffer, preallocated": {
+        "min_ms": 11.284400010481477,
+        "median_ms": 11.91284999367781,
+        "mean_ms": 11.948314990149811,
+        "max_ms": 12.951600016094744,
+        "bitwise_vs_current": 1.0
+      }
+    },
+    "2": {
+      "R=2 current (per-tensor +=)": {
+        "min_ms": 11.862499988637865,
+        "median_ms": 12.81149999704212,
+        "mean_ms": 14.259834995027632,
+        "max_ms": 36.01360000902787,
+        "bitwise_vs_current": 1.0
+      },
+      "R=2 _foreach_add_": {
+        "min_ms": 9.584899991750717,
+        "median_ms": 11.14299998153001,
+        "mean_ms": 10.963984989211895,
+        "max_ms": 11.541199986822903,
+        "bitwise_vs_current": 1.0
+      },
+      "R=2 flat buffer": {
+        "min_ms": 10.50920004490763,
+        "median_ms": 11.628599982941523,
+        "mean_ms": 11.595295000006445,
+        "max_ms": 12.442099978215992,
+        "bitwise_vs_current": 1.0
+      },
+      "R=2 flat buffer, preallocated": {
+        "min_ms": 9.847700013779104,
+        "median_ms": 10.609299992211163,
+        "mean_ms": 10.657750011887401,
+        "max_ms": 11.701500043272972,
+        "bitwise_vs_current": 1.0
+      },
+      "R=3 current (per-tensor +=)": {
+        "min_ms": 16.262499964796007,
+        "median_ms": 17.089950008084998,
+        "mean_ms": 17.13869999803137,
+        "max_ms": 18.10400001704693,
+        "bitwise_vs_current": 1.0
+      },
+      "R=3 _foreach_add_": {
+        "min_ms": 12.91230000788346,
+        "median_ms": 13.815550017170608,
+        "mean_ms": 14.015575000667013,
+        "max_ms": 15.944599988870323,
+        "bitwise_vs_current": 1.0
+      },
+      "R=3 flat buffer": {
+        "min_ms": 12.823900033254176,
+        "median_ms": 14.351899997564033,
+        "mean_ms": 14.332109992392361,
+        "max_ms": 15.811899967957288,
+        "bitwise_vs_current": 1.0
+      },
+      "R=3 flat buffer, preallocated": {
+        "min_ms": 13.222599984146655,
+        "median_ms": 13.62330000847578,
+        "mean_ms": 14.005745007307269,
+        "max_ms": 15.647799998987466,
+        "bitwise_vs_current": 1.0
+      }
+    },
+    "4": {
+      "R=2 current (per-tensor +=)": {
+        "min_ms": 11.862399987876415,
+        "median_ms": 13.221850007539615,
+        "mean_ms": 13.619215003564022,
+        "max_ms": 16.67260000249371,
+        "bitwise_vs_current": 1.0
+      },
+      "R=2 _foreach_add_": {
+        "min_ms": 8.110499999020249,
+        "median_ms": 9.986599994590506,
+        "mean_ms": 10.513114996138029,
+        "max_ms": 15.154599968809634,
+        "bitwise_vs_current": 1.0
+      },
+      "R=2 flat buffer": {
+        "min_ms": 7.823500025551766,
+        "median_ms": 8.731400012038648,
+        "mean_ms": 8.715790012502111,
+        "max_ms": 9.595500014256686,
+        "bitwise_vs_current": 1.0
+      },
+      "R=2 flat buffer, preallocated": {
+        "min_ms": 8.595600025728345,
+        "median_ms": 9.436899999855086,
+        "mean_ms": 9.657274995697662,
+        "max_ms": 13.789699994958937,
+        "bitwise_vs_current": 1.0
+      },
+      "R=3 current (per-tensor +=)": {
+        "min_ms": 14.115700032562017,
+        "median_ms": 15.058750024763867,
+        "mean_ms": 15.239179998752661,
+        "max_ms": 17.238000000361353,
+        "bitwise_vs_current": 1.0
+      },
+      "R=3 _foreach_add_": {
+        "min_ms": 10.7609000406228,
+        "median_ms": 11.59650000045076,
+        "mean_ms": 11.695385008351877,
+        "max_ms": 12.74640002520755,
+        "bitwise_vs_current": 1.0
+      },
+      "R=3 flat buffer": {
+        "min_ms": 10.421100014355034,
+        "median_ms": 11.187900003278628,
+        "mean_ms": 11.150179998367094,
+        "max_ms": 12.014599982649088,
+        "bitwise_vs_current": 1.0
+      },
+      "R=3 flat buffer, preallocated": {
+        "min_ms": 10.198700008913875,
+        "median_ms": 11.373999994248152,
+        "mean_ms": 11.257389999809675,
+        "max_ms": 12.070299999322742,
+        "bitwise_vs_current": 1.0
+      }
+    },
+    "14": {
+      "R=2 current (per-tensor +=)": {
+        "min_ms": 14.47230001213029,
+        "median_ms": 15.74285002425313,
+        "mean_ms": 15.656060015317053,
+        "max_ms": 16.909099998883903,
+        "bitwise_vs_current": 1.0
+      },
+      "R=2 _foreach_add_": {
+        "min_ms": 11.79059996502474,
+        "median_ms": 11.964299977989867,
+        "mean_ms": 11.990754996077158,
+        "max_ms": 12.549299979582429,
+        "bitwise_vs_current": 1.0
+      },
+      "R=2 flat buffer": {
+        "min_ms": 9.235200006514788,
+        "median_ms": 10.146450018510222,
+        "mean_ms": 9.986955003114417,
+        "max_ms": 10.6618000427261,
+        "bitwise_vs_current": 1.0
+      },
+      "R=2 flat buffer, preallocated": {
+        "min_ms": 9.408999991137534,
+        "median_ms": 15.928200009511784,
+        "mean_ms": 14.854644986917265,
+        "max_ms": 18.162499996833503,
+        "bitwise_vs_current": 1.0
+      },
+      "R=3 current (per-tensor +=)": {
+        "min_ms": 32.15370001271367,
+        "median_ms": 33.38574996450916,
+        "mean_ms": 33.42553999682423,
+        "max_ms": 34.95840000687167,
+        "bitwise_vs_current": 1.0
+      },
+      "R=3 _foreach_add_": {
+        "min_ms": 26.88230003695935,
+        "median_ms": 28.397949994541705,
+        "mean_ms": 28.819904988631606,
+        "max_ms": 32.69169997656718,
+        "bitwise_vs_current": 1.0
+      },
+      "R=3 flat buffer": {
+        "min_ms": 20.509399997536093,
+        "median_ms": 21.36074998998083,
+        "mean_ms": 21.509300003526732,
+        "max_ms": 23.513499996624887,
+        "bitwise_vs_current": 1.0
+      },
+      "R=3 flat buffer, preallocated": {
+        "min_ms": 20.938600006047636,
+        "median_ms": 21.35344999260269,
+        "mean_ms": 21.38134499255102,
+        "max_ms": 22.643100004643202,
+        "bitwise_vs_current": 1.0
+      }
+    }
+  }
+}

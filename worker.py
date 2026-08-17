@@ -9,6 +9,29 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any
 
+# ── CPU thread cap (MERGE_PERF_PLAN.md §4.1A) ───────────────────────────────
+#
+# Several workers share one host (dp2 = 7 processes on one box), and each one
+# defaults to os.cpu_count() intra-op threads. During an averaging round they
+# all run CPU tensor math at the same instant, so the machine is oversubscribed
+# by a factor of `workers`, and every ATen elementwise op above the ~32k-element
+# parallel grain size pays a contended OpenMP fork/join. That is the leading
+# explanation for the v4 profile's 3.3-second merge over ~12M fp32 additions —
+# ~100x slower than the arithmetic warrants. scratch/bench_merge.py is what
+# settles it; whatever the verdict there, one worker per core beats seven
+# workers each claiming every core, so this cap is right either way.
+#
+# Set BEFORE `import torch`: torch.set_num_threads() below is the authoritative
+# knob, but OpenMP and MKL read their environment at library init, and a runtime
+# call cannot un-spawn a team that was already sized at import time.
+#
+# 2 is a default for the "many workers, one host" case this project measures.
+# A real multi-host deployment with one worker per machine should raise it —
+# hence the env var rather than a constant.
+TORCH_THREADS = max(1, int(os.getenv("KIWI_TORCH_THREADS", "2")))
+os.environ.setdefault("OMP_NUM_THREADS", str(TORCH_THREADS))
+os.environ.setdefault("MKL_NUM_THREADS", str(TORCH_THREADS))
+
 import httpx
 import torch
 import torch.nn.functional as F
@@ -21,6 +44,16 @@ from peft import LoraConfig, get_peft_model
 import ipaddress
 from urllib.parse import urlparse
 from transport import KiwiTransport, create_transport
+
+# The authoritative intra-op setting. The env vars above sized OpenMP's team at
+# library init; this makes torch agree, and covers builds that ignore the env.
+torch.set_num_threads(TORCH_THREADS)
+try:
+    # Inter-op (task-level) parallelism is unused — nothing here submits
+    # parallel ATen tasks — but its pool competes for the same cores.
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    pass  # already initialised (module re-imported under a test runner)
 
 
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://gateway:8080").rstrip("/")
@@ -559,6 +592,14 @@ async def lifespan(_: FastAPI):
     global is_first_stage, is_last_stage, model, transport
 
     _enforce_vram_cap()
+    # Logged because the whole merge-performance fix hinges on this number and a
+    # deployment that silently reverts to os.cpu_count() would look like a
+    # regression with no visible cause.
+    print(
+        f"[{NODE_NAME}] CPU threads: intra-op={torch.get_num_threads()} "
+        f"(KIWI_TORCH_THREADS={TORCH_THREADS}, host cpus={os.cpu_count()})",
+        flush=True,
+    )
 
     initial_peers = []
     if P2P_TRANSPORT == "p2p":
@@ -862,12 +903,25 @@ def _apply_round_merge(
             # The merged average is by construction identical on every
             # replica, so anchoring on it makes the first outer step the first
             # point at which they are guaranteed to agree.
-            _outer_anchor = {k: v.clone() for k, v in merged.items()}
+            _outer_anchor = {k: v.detach().clone() for k, v in merged.items()}
             print(f"[{NODE_NAME}] Outer optimizer: anchor established at round "
                   f"{round_id} (no outer step on the first dense round)", flush=True)
         else:
             merged = outer_step(_outer_anchor, merged, _outer_buf, OUTER_LR, OUTER_MU)
-            _outer_anchor = {k: v.clone() for k, v in merged.items()}
+            # Refresh the anchor IN PLACE (MERGE_PERF_PLAN.md §4.1D). The old
+            # dict-of-clones allocated a fresh copy of the whole adapter every
+            # dense round and dropped the previous one on the floor for the GC.
+            # copy_ reuses the buffers allocated on the anchor round, which is
+            # both cheaper and steadier on memory — and it is the same bytes
+            # either way, so the outer step stays bit-identical across replicas.
+            if _outer_anchor.keys() == merged.keys():
+                for key, value in merged.items():
+                    _outer_anchor[key].copy_(value)
+            else:
+                # Defensive: the adapter's key set is fixed for a worker's
+                # lifetime, so this cannot fire — but a silent shape mismatch
+                # in copy_ would be far worse than one extra allocation.
+                _outer_anchor = {k: v.detach().clone() for k, v in merged.items()}
             outer_applied = True
         if timings is not None:
             timings["outer_ms"] = (time.perf_counter() - t_outer) * 1000
@@ -1084,6 +1138,10 @@ async def _run_round(params: dict[str, Any]) -> dict[str, Any]:
         "p": p,
         "outer": bool(outer and p >= 1.0),            # planned by the gateway
         "outer_applied": bool(timings.get("outer_applied", 0.0)),  # actually ran
+        # Reported per round so a profile table is self-describing: the same
+        # merge code costs wildly different amounts at different thread counts,
+        # and comparing two runs without knowing this is meaningless.
+        "torch_threads": torch.get_num_threads(),
         "timings_ms": timings,
     }
 

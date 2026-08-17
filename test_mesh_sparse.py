@@ -653,3 +653,164 @@ class TestOuterStep:
         buf: dict = {}
         outer_step(anchor, _sd(2.0, torch.bfloat16), buf, lr=0.7, mu=0.9)
         assert all(v.dtype == torch.float32 for v in buf.values())
+
+
+# ── Replica agreement under the performance rewrite (MERGE_PERF_PLAN.md §6.6) ─
+
+
+@needs_torch
+class TestReplicaAgreementAtR3Plus:
+    """The invariant any merge optimisation is most likely to break.
+
+    MERGE_PERF_PLAN.md §5.1 draws the distinction precisely: results are NOT
+    required to be bitwise equal to the old CPU implementation, but replicas
+    ARE required to be bitwise equal to EACH OTHER. fp32 addition is not
+    associative, so the moment accumulation order depends on arrival order,
+    thread scheduling, or contributor count, replicas silently diverge and
+    "agreement = checkpoint" — which spare promotion and zero-cost recovery
+    both rest on — stops being true.
+
+    The existing TestFullSync case covers R=3 in one dense round with peers
+    supplied in dict order. These push on the two things a vectorised or
+    batched implementation is most likely to get wrong: ARRIVAL ORDER (each
+    replica sees its peers in a different sequence, which is what actually
+    happens — payloads arrive when they arrive) and REPEATED ROUNDS (a
+    per-round preallocated buffer that is not fully overwritten would drift
+    only from round 2 onward).
+    """
+
+    @staticmethod
+    def _replicas(count: int, dtype=torch.float32) -> dict:
+        return {
+            f"w{i}": _sd(float(i + 1), dtype, seed=200 + i) for i in range(count)
+        }
+
+    @pytest.mark.parametrize("count", [3, 4, 5])
+    def test_dense_merge_agrees_under_shuffled_arrival_order(self, count):
+        from mesh import merge_adapters
+
+        state = self._replicas(count)
+        merged = {}
+        for i, (name, own) in enumerate(state.items()):
+            peers = [(n, 10, sd) for n, sd in state.items() if n != name]
+            # Rotate so every replica sees a DIFFERENT arrival order. The
+            # canonical sender-name sort inside merge_adapters is the only
+            # thing standing between this and divergence.
+            peers = peers[i:] + peers[:i]
+            merged[name] = merge_adapters(own, peers, contribute=True, own_name=name)
+
+        ref = merged["w0"]
+        for name, m in merged.items():
+            for k in ref:
+                assert torch.equal(m[k], ref[k]), (
+                    f"R={count}: {name} diverged from w0 on {k} "
+                    f"(max abs diff {(m[k].float() - ref[k].float()).abs().max():.3e})"
+                )
+
+    def test_dense_merge_agrees_over_repeated_rounds(self):
+        from mesh import merge_adapters
+
+        # Round 1 can pass by luck with a stale-buffer bug; rounds 2..6 cannot.
+        count = 4
+        state = self._replicas(count)
+        for rid in range(1, 7):
+            new = {}
+            for i, (name, own) in enumerate(state.items()):
+                peers = [(n, 10, sd) for n, sd in state.items() if n != name]
+                peers = peers[i:] + peers[:i]
+                new[name] = merge_adapters(own, peers, contribute=True, own_name=name)
+            state = new
+            ref = state["w0"]
+            for name, m in state.items():
+                for k in ref:
+                    assert torch.equal(m[k], ref[k]), (
+                        f"round {rid}: {name} diverged from w0 on {k}"
+                    )
+
+    def test_sparse_merge_agrees_on_masked_entries_at_r4(self):
+        from mesh import merge_sparse, round_mask, sparse_snapshot
+
+        p, count = 0.25, 4
+        state = self._replicas(count)
+        merged = {}
+        for i, (name, own) in enumerate(state.items()):
+            peers = [(n, 10, sparse_snapshot(sd, 3, p)) for n, sd in state.items() if n != name]
+            peers = peers[i:] + peers[:i]
+            merged[name] = merge_sparse(own, peers, contribute=True,
+                                        round_id=3, p=p, own_name=name)
+
+        ref = merged["w0"]
+        for name, m in merged.items():
+            for k in ref:
+                idx = round_mask(k, state[name][k].numel(), 3, p)
+                assert torch.equal(m[k].reshape(-1)[idx], ref[k].reshape(-1)[idx]), (
+                    f"{name} diverged from w0 on masked entries of {k}"
+                )
+
+    def test_outer_step_chain_agrees_across_replicas(self):
+        from mesh import merge_adapters, outer_step
+
+        # DiLoCo end to end: dense merge, then an outer step per replica with
+        # its own local momentum buffer. Because the merge output is identical
+        # everywhere and outer_step is a pure function of (anchor, avg, buf),
+        # the buffers must stay identical too — that is what lets the momentum
+        # buffer be local and never transmitted (§5.6).
+        count = 3
+        state = self._replicas(count)
+        anchors: dict = {}
+        bufs: dict = {name: {} for name in state}
+
+        for rid in range(1, 6):
+            new = {}
+            for i, (name, own) in enumerate(state.items()):
+                peers = [(n, 10, sd) for n, sd in state.items() if n != name]
+                peers = peers[i:] + peers[:i]
+                avg = merge_adapters(own, peers, contribute=True, own_name=name)
+                if anchors.get(name) is None:
+                    # First dense round only establishes the anchor (worker.py).
+                    anchors[name] = {k: v.clone() for k, v in avg.items()}
+                    new[name] = avg
+                else:
+                    stepped = outer_step(anchors[name], avg, bufs[name], 0.7, 0.9)
+                    anchors[name] = {k: v.clone() for k, v in stepped.items()}
+                    new[name] = stepped
+            state = new
+
+            ref = state["w0"]
+            for name, m in state.items():
+                for k in ref:
+                    assert torch.equal(m[k], ref[k]), (
+                        f"round {rid}: {name} weights diverged on {k}"
+                    )
+            ref_buf = bufs["w0"]
+            for name, b in bufs.items():
+                for k in ref_buf:
+                    assert torch.equal(b[k], ref_buf[k]), (
+                        f"round {rid}: {name} momentum buffer diverged on {k}"
+                    )
+
+    def test_spare_at_r4_matches_contributors_bitwise(self):
+        from mesh import merge_adapters
+
+        # A spare merges without contributing. It must land on exactly the
+        # contributors' mean — bitwise, not approximately — otherwise promoting
+        # it is not free (§5.4).
+        state = self._replicas(4)
+        contributors = {n: sd for n, sd in state.items() if n != "w3"}
+        spare_own = state["w3"]
+
+        merged = {}
+        for i, (name, own) in enumerate(contributors.items()):
+            peers = [(n, 10, sd) for n, sd in contributors.items() if n != name]
+            peers = peers[i:] + peers[:i]
+            merged[name] = merge_adapters(own, peers, contribute=True, own_name=name)
+
+        spare = merge_adapters(
+            spare_own,
+            [(n, 10, sd) for n, sd in contributors.items()],
+            contribute=False,
+            own_name="w3",
+        )
+        ref = merged["w0"]
+        for k in ref:
+            assert torch.equal(spare[k], ref[k]), f"spare diverged from actives on {k}"

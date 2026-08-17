@@ -40,11 +40,76 @@ def filter_skewed(
     return kept, dropped
 
 
+# ── Vectorised accumulation helpers (MERGE_PERF_PLAN.md §4.1B) ──────────────
+#
+# The merge is ~12M fp32 additions over ~112 small tensors. In the v4 profile
+# that cost 3,267 ms — roughly 3.6 Melem-ops/s, about 100x below what a single
+# core manages. The arithmetic is not what was expensive; the per-tensor Python
+# loop around it was, because each iteration is a separate ATen dispatch and,
+# for the tensors above ATen's ~32k-element parallel grain size, a separate
+# (and with 7 workers per host, contended) OpenMP fork/join. See
+# scratch/bench_merge.py section 6, which races this implementation against the
+# per-tensor loop it replaced.
+#
+# torch._foreach_* does the identical arithmetic with ONE dispatch for the
+# whole list, which is exactly why optimizers use it. Nothing about the
+# numerics changes: same fp32 elementwise adds, same values, same order.
+
+
+def _target_device(
+    own: dict[str, torch.Tensor],
+    keys: list[str],
+    device: torch.device | str | None,
+) -> torch.device:
+    """Where to do the arithmetic. Defaults to where `own` already lives.
+
+    Deliberately NOT hard-coded to CPU or CUDA. mesh.py must stay importable
+    and testable with a CPU-only torch (§5.7) — that property is what lets the
+    whole merge be developed and unit-tested on a machine with no usable GPU —
+    and a future GPU-side merge (§4.1C) needs only to pass a device in.
+    """
+    if device is not None:
+        return torch.device(device)
+    return own[keys[0]].device if keys else torch.device("cpu")
+
+
+def _accumulate(
+    per_contribution: list[list[torch.Tensor]], dev: torch.device
+) -> list[torch.Tensor]:
+    """Sum lists of tensors elementwise in fp32, in the order given.
+
+    `per_contribution` must already be in canonical sender-name-sorted order —
+    fp32 addition is not associative, so the caller owning that ordering is
+    what keeps replicas bit-identical (§5.1).
+
+    The first contribution SEEDS the accumulator rather than being added into a
+    zeros buffer. `0.0 + x` is exactly `x` in fp32, so this removes a full pass
+    over the adapter (and an allocation of ~12 MB of zeros) without changing a
+    single bit. `copy=True` is load-bearing: without it, a contribution that is
+    already fp32 on the target device would be returned as-is by `.to()`, and
+    the in-place adds below would corrupt a peer's payload — or our own live
+    weights, when `contribute=True`.
+    """
+    acc: list[torch.Tensor] | None = None
+    for tensors in per_contribution:
+        converted = [
+            t.detach().to(device=dev, dtype=torch.float32, copy=acc is None)
+            for t in tensors
+        ]
+        if acc is None:
+            acc = converted
+        else:
+            torch._foreach_add_(acc, converted)
+    assert acc is not None  # callers return early on an empty contribution list
+    return acc
+
+
 def merge_adapters(
     own: dict[str, torch.Tensor],
     received: list[Received],
     contribute: bool,
     own_name: str = "",
+    device: torch.device | str | None = None,
 ) -> dict[str, torch.Tensor] | None:
     """Uniform mean of adapter state dicts (§3.5).
 
@@ -78,12 +143,12 @@ def merge_adapters(
     contributions.sort(key=lambda t: t[0])  # canonical order, self included
 
     n = len(contributions)
-    acc = {k: torch.zeros(own[k].shape, dtype=torch.float32) for k in keys}
-    for _sender, sd in contributions:
-        for k in keys:
-            acc[k] += sd[k].detach().float().cpu()
-
-    return {k: (acc[k] / n).to(own[k].dtype) for k in keys}
+    dev = _target_device(own, keys, device)
+    acc = _accumulate(
+        [[sd[k] for k in keys] for _sender, sd in contributions], dev
+    )
+    torch._foreach_div_(acc, float(n))
+    return {k: acc[i].to(own[k].dtype) for i, k in enumerate(keys)}
 
 
 # ── Sparse averaging (Phase 3) ──────────────────────────────────────────────
@@ -168,6 +233,7 @@ def merge_sparse(
     round_id: int,
     p: float,
     own_name: str = "",
+    device: torch.device | str | None = None,
 ) -> dict[str, torch.Tensor] | None:
     """Average only the masked entries; leave everything else untouched.
 
@@ -228,16 +294,21 @@ def merge_sparse(
     contributions.sort(key=lambda t: t[0])  # canonical order, self included
 
     n = len(contributions)
-    acc = {k: torch.zeros(masks[k].numel(), dtype=torch.float32) for k in keys}
-    for _sender, sd in contributions:
-        for k in keys:
-            acc[k] += sd[k].detach().reshape(-1).float().cpu()
+    dev = _target_device(own, keys, device)
+    # Same vectorised accumulation as the dense path, over the same canonically
+    # ordered contributions. Using one shared helper is what makes the p >= 1.0
+    # bitwise equivalence (§5.2) hold by construction rather than by review.
+    acc = _accumulate(
+        [[sd[k].detach().reshape(-1) for k in keys] for _sender, sd in contributions],
+        dev,
+    )
+    torch._foreach_div_(acc, float(n))
 
     merged: dict[str, torch.Tensor] = {}
-    for k in keys:
-        base = own[k].detach().cpu().clone()
+    for i, k in enumerate(keys):
+        base = own[k].detach().to(dev).clone()
         flat = base.reshape(-1)          # a view of `base` (it is contiguous)
-        flat[masks[k]] = (acc[k] / n).to(own[k].dtype)
+        flat[masks[k].to(dev)] = acc[i].to(own[k].dtype)
         merged[k] = flat.view(own[k].shape)
     return merged
 
@@ -251,6 +322,7 @@ def outer_step(
     buf: dict[str, torch.Tensor],
     lr: float = 0.7,
     mu: float = 0.9,
+    device: torch.device | str | None = None,
 ) -> dict[str, torch.Tensor]:
     """One Nesterov outer step: anchor + nesterov(avg - anchor).
 
@@ -272,15 +344,53 @@ def outer_step(
     sequence of rounds, so every replica computes a bit-identical result and
     "agreement = checkpoint" survives.
     """
-    out: dict[str, torch.Tensor] = {}
-    for key in sorted(anchor.keys()):
-        if key not in avg:
-            out[key] = anchor[key]
-            continue
-        anchor_f32 = anchor[key].detach().float().cpu()
-        delta = avg[key].detach().float().cpu() - anchor_f32
-        momentum = buf.get(key)
-        momentum = delta.clone() if momentum is None else mu * momentum + delta
-        buf[key] = momentum
-        out[key] = (anchor_f32 + lr * (delta + mu * momentum)).to(anchor[key].dtype)
-    return out
+    all_keys = sorted(anchor.keys())
+    keys = [k for k in all_keys if k in avg]
+    # Keys the average does not cover pass through untouched, exactly as before.
+    stepped: dict[str, torch.Tensor] = {k: anchor[k] for k in all_keys if k not in avg}
+
+    if keys:
+        dev = _target_device(anchor, keys, device)
+        # copy=False on the anchor: it is only ever read below.
+        anchor_f32 = [
+            anchor[k].detach().to(device=dev, dtype=torch.float32) for k in keys
+        ]
+        # copy=True on delta: it is subtracted into in place, and without the
+        # copy an already-fp32 `avg` would be mutated — which would corrupt the
+        # merged average the caller is about to store as the next anchor.
+        delta = [
+            avg[k].detach().to(device=dev, dtype=torch.float32, copy=True) for k in keys
+        ]
+        torch._foreach_sub_(delta, anchor_f32)
+
+        # m = mu * m + delta, batched. Keys absent from `buf` (the first outer
+        # step) seed from delta; in steady state every key is present, so the
+        # `old` branch is the one that matters and it is a single pair of
+        # dispatches for the whole adapter.
+        momentum: list[torch.Tensor] = [None] * len(keys)  # type: ignore[list-item]
+        old = [i for i, k in enumerate(keys) if k in buf]
+        for i, k in enumerate(keys):
+            if k not in buf:
+                momentum[i] = delta[i].clone()
+        if old:
+            updated = torch._foreach_mul([buf[keys[i]] for i in old], mu)
+            torch._foreach_add_(updated, [delta[i] for i in old])
+            for j, i in enumerate(old):
+                momentum[i] = updated[j]
+        for i, k in enumerate(keys):
+            buf[k] = momentum[i]
+
+        # anchor + lr * (delta + mu * m). Written as four batched ops rather
+        # than one fused add(alpha=) so the arithmetic is the same expression
+        # tree as before: float + and * are commutative bitwise, but a fused
+        # multiply-add is not, and the DiLoCo eval-loss band (§2 criterion 5)
+        # is not worth risking on a rounding difference.
+        update = torch._foreach_mul(momentum, mu)
+        torch._foreach_add_(update, delta)
+        torch._foreach_mul_(update, lr)
+        torch._foreach_add_(update, anchor_f32)
+        for i, k in enumerate(keys):
+            stepped[k] = update[i].to(anchor[k].dtype)
+
+    # Sorted insertion order, matching the previous implementation.
+    return {k: stepped[k] for k in all_keys}
