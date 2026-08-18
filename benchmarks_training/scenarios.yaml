@@ -245,6 +245,61 @@ scenarios:
     kill_after_samples: 309
     compose: "docker-compose.mesh.yml"
 
+  # Kill variant of the DENSE arm. Same 309-sample kill as sparse5_kill, so the
+  # three kill arms differ only in averaging mechanism.
+  #
+  # What it adds over sparse5_kill: this spare has been receiving DENSE payloads
+  # every 10 steps rather than sparse ones every step. Its adapter is exactly
+  # the contributors' mean as of the last round — the same "agreement =
+  # checkpoint" property, but re-established 10x less often. If promotion is
+  # zero-cost only because sparse rounds keep the spare continuously fresh,
+  # this is the arm where that shows up.
+  - name: "kiwi_mesh2_dense_kill"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 3
+    epochs: 1
+    target_loss: 2.0
+    dataset: "truthfulqa"
+    eval_every: 100
+    eval_samples: 64
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 10
+    kill_after_samples: 309
+    compose: "docker-compose.mesh.yml"
+
+  # Kill variant of the DiLoCo arm — the most demanding of the three.
+  #
+  # The outer optimizer keeps state that is LOCAL and never transmitted: the
+  # anchor and the Nesterov momentum buffer (§4.2, same invariant as the Adam
+  # moments). A promoted spare therefore cannot be handed that state by its
+  # peers; it has to already hold the right values.
+  #
+  # It does, by construction: _apply_round_merge runs the outer step for every
+  # worker that merges, contributor or not, so a spare has been maintaining an
+  # identical anchor and momentum buffer through every dense round it absorbed.
+  # This arm is what verifies it. If the spare's local outer state had drifted —
+  # a missed round, an anchor established at a different point — promotion would
+  # silently produce a replica computing a DIFFERENT outer step from its peers,
+  # breaking bit-identity with no error raised anywhere.
+  #
+  # A convergence gap here that is absent from dense_kill points at the outer
+  # state, not at promotion.
+  - name: "kiwi_mesh2_outer_kill"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 3
+    epochs: 1
+    target_loss: 2.0
+    dataset: "truthfulqa"
+    eval_every: 100
+    eval_samples: 64
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 10
+    outer_opt: true
+    kill_after_samples: 309
+    compose: "docker-compose.mesh.yml"
+
   # ══════════════════════════════════════════════════════════════════════
   # NO-SPARE VARIANTS — 6 workers (2 pipes x 3 stages), no spare.
   #
