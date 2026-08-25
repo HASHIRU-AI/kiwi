@@ -1,6 +1,7 @@
 import json
 import os
 import argparse
+import textwrap
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -48,6 +49,20 @@ CONFIG_STYLES = {
     "kiwi_mesh2_sparse5_nospare": {"color": "#fdbe85", "label": "Kiwi mesh ×2 — sparse 5%, no spare"},
     "kiwi_mesh2_outer_nospare": {"color": "#9e9ac8", "label": "Kiwi mesh ×2 — outer opt, no spare"},
 
+    # ── Simulated WAN, 75 ms RTT (WAN_SIMULATION_PLAN.md) ──
+    # Same hue as the LAN counterpart, dashed. A WAN arm and its 0 ms control
+    # are the SAME arm on two networks, so they must read as one family — eight
+    # unrelated colours would hide the pairing that is the whole comparison.
+    # Colour stays scenario identity; linestyle carries the network.
+    "kiwi_pipeline_wan75": {"color": "#a50f15", "linestyle": "--",
+                            "label": "Kiwi pipeline — 75 ms WAN"},
+    "kiwi_mesh2_dense_wan75": {"color": "#238b45", "linestyle": "--",
+                               "label": "Kiwi mesh ×2 — dense, 75 ms WAN"},
+    "kiwi_mesh2_sparse5_wan75": {"color": "#fd8d3c", "linestyle": "--",
+                                 "label": "Kiwi mesh ×2 — sparse 5%, 75 ms WAN"},
+    "kiwi_mesh2_outer_wan75": {"color": "#6a51a3", "linestyle": "--",
+                               "label": "Kiwi mesh ×2 — outer opt, 75 ms WAN"},
+
     # ── Retired scenarios that still appear in ARCHIVED results ──
     # These are gone from scenarios.yaml, but benchmark_results*/ files
     # reference them by key. Dropping their styles would not break plotting —
@@ -85,12 +100,15 @@ _FALLBACK_PALETTE = [
 
 
 def _style(name):
+    # "linestyle" is guaranteed present so call sites can pass it unconditionally
+    # rather than each remembering a .get() default — a forgotten one would draw
+    # a WAN arm solid and make it indistinguishable from its LAN control.
     if name in CONFIG_STYLES:
-        return CONFIG_STYLES[name]
+        return {"linestyle": "-", **CONFIG_STYLES[name]}
     # Deterministic distinct colour for anything new, so an unregistered
     # scenario is still readable rather than another anonymous grey line.
     idx = sum(ord(c) for c in name) % len(_FALLBACK_PALETTE)
-    return {"color": _FALLBACK_PALETTE[idx], "label": name}
+    return {"color": _FALLBACK_PALETTE[idx], "label": name, "linestyle": "-"}
 
 
 def _verdicts(eval_data):
@@ -199,7 +217,7 @@ def _plot_eval_panel(eval_runs, scenario_names, title, question, outfile,
         style = _style(name)
         spread = f" ± {std[-1]:.4f}" if n_seeds > 1 else ""
         plt.plot(grid, mean, color=style["color"], linewidth=2.4,
-                 marker="o", markersize=4,
+                 linestyle=style["linestyle"], marker="o", markersize=4,
                  label=f"{style['label']}  →  {mean[-1]:.4f}{spread}")
         if n_seeds > 1:
             plt.fill_between(grid, mean - std, mean + std,
@@ -225,9 +243,13 @@ def _plot_eval_panel(eval_runs, scenario_names, title, question, outfile,
                     xytext=(5, 0), textcoords="offset points", fontsize=9,
                     rotation=90, va="top", color="#333333")
     n_seeds = max(s[3] for s in series.values())
-    subtitle = question
+    # Wrapped, not raw: plt.title does not wrap, so a long `question` renders as
+    # one line that runs off both edges of the figure and gets clipped in the
+    # saved PNG. 08_spare_cost has always been long enough to hit this; the WAN
+    # panels are too. Width is tuned to figsize=(11, 6.5) at fontsize=11.
+    subtitle = textwrap.fill(question, 108)
     if extra_note:
-        subtitle += f"\n{extra_note}"
+        subtitle += f"\n{textwrap.fill(extra_note, 108)}"
     subtitle += f"\n{n_seeds} seed(s); band = ±1 std across seeds"
     if n_seeds < 2:
         subtitle += " — ZERO-WIDTH AT 1 SEED, apparent gaps may be noise"
@@ -332,6 +354,62 @@ COMPARISONS = [
         title="Does killing a worker mid-run change the learning curve?",
         question="A same-stage spare has been receiving round payloads all along, "
                  "so promotion should cost ~0 and the curve should not bend.",
+    ),
+    # ── Simulated WAN (WAN_SIMULATION_PLAN.md) ──
+    # These panels are the CORRECTNESS CHECK, not the result. Latency changes
+    # WHEN a merge happens in wall-clock, never WHAT it computes, so at equal
+    # samples consumed each LAN/WAN pair must overlap. A visible gap is a bug in
+    # the merge path under delay — chase it before writing anything up.
+    #
+    # The actual WAN result lives in 07_wallclock and in avg_round_ms x
+    # avg_rounds: 300 rounds/run for sparse5 against 30 for dense, each now
+    # paying a real round trip.
+    dict(
+        slug="10a_wan_pipeline",
+        scenarios=["kiwi_pipeline", "kiwi_pipeline_wan75"],
+        title="Pipeline on a LAN vs a 75 ms WAN",
+        question="R=1, no averaging — so this isolates the cost of the pipeline "
+                 "stage hops alone (~6 one-way traversals per training step). "
+                 "Curves must overlap; only wall-clock should move.",
+        require_all=True,
+    ),
+    dict(
+        slug="10b_wan_dense",
+        scenarios=["kiwi_mesh2_dense", "kiwi_mesh2_dense_wan75"],
+        title="Dense averaging on a LAN vs a 75 ms WAN",
+        question="30 merges per run of 11.7 MB each. Few, large rounds — the "
+                 "arm that should tolerate latency best.",
+        require_all=True,
+    ),
+    dict(
+        slug="10c_wan_sparse5",
+        scenarios=["kiwi_mesh2_sparse5", "kiwi_mesh2_sparse5_wan75"],
+        title="Sparse 5% on a LAN vs a 75 ms WAN",
+        question="300 merges per run of 1.7 MB each. v6 showed the sparse round "
+                 "costs the same as a dense one despite 7x less data, i.e. it "
+                 "pays for round trips rather than bytes — and it makes ten times "
+                 "as many of them. This is where latency should bite hardest.",
+        require_all=True,
+    ),
+    dict(
+        slug="10d_wan_outer",
+        scenarios=["kiwi_mesh2_outer", "kiwi_mesh2_outer_wan75"],
+        title="Outer optimizer on a LAN vs a 75 ms WAN",
+        question="Same merge cadence and payload as dense, applied through a "
+                 "Nesterov outer step. Should track dense's WAN behaviour.",
+        require_all=True,
+    ),
+    dict(
+        slug="10_wan_all",
+        scenarios=["kiwi_pipeline", "kiwi_pipeline_wan75",
+                   "kiwi_mesh2_dense", "kiwi_mesh2_dense_wan75",
+                   "kiwi_mesh2_sparse5", "kiwi_mesh2_sparse5_wan75",
+                   "kiwi_mesh2_outer", "kiwi_mesh2_outer_wan75"],
+        title="Every arm, LAN (solid) vs 75 ms WAN (dashed)",
+        question="Each pair shares a colour. All eight curves should sit on top "
+                 "of one another at equal samples — the network changes cost, "
+                 "not learning. Read the ordering off 07_wallclock instead.",
+        require_all=True,
     ),
 ]
 
@@ -484,6 +562,17 @@ def _plot_comparisons(data, output_dir):
         if not names:
             print(f"    [skip] {spec['slug']}: none of its scenarios are in this run")
             continue
+        # A/B comparisons where one arm alone says nothing. Without this, an
+        # older results file (no WAN arms) renders "LAN vs 75 ms WAN" figures
+        # containing only the LAN curve — a comparison with nothing to compare,
+        # captioned as though both were present. Opt-in, so the partial-render
+        # behaviour every other comparison relies on is unchanged.
+        if spec.get("require_all"):
+            absent = [n for n in spec["scenarios"] if n not in eval_runs]
+            if absent:
+                print(f"    [skip] {spec['slug']}: needs every arm of the pair; "
+                      f"missing {', '.join(absent)}")
+                continue
         names = _one_corpus(spec["slug"], names)
         _plot_eval_panel(
             eval_runs, names, spec["title"], spec["question"],
@@ -572,7 +661,8 @@ def plot_convergence(results_path: str, output_dir: str):
         mean, std = losses.mean(axis=0), losses.std(axis=0)
 
         style = _style(config_name)
-        plt.plot(grid, mean, label=f"{style['label']} Mean", color=style["color"], linewidth=2)
+        plt.plot(grid, mean, label=f"{style['label']} Mean", color=style["color"],
+                 linewidth=2, linestyle=style["linestyle"])
         plt.fill_between(grid, mean - std, mean + std, color=style["color"], alpha=0.3)
 
         target_loss = 2.0
@@ -628,7 +718,8 @@ def plot_convergence(results_path: str, output_dir: str):
             mean, std = losses.mean(axis=0), losses.std(axis=0)
             style = _style(config_name)
             plt.plot(grid, mean, label=f"{style['label']} (eval)",
-                     color=style["color"], linewidth=2.2, marker="o", markersize=3)
+                     color=style["color"], linewidth=2.2, linestyle=style["linestyle"],
+                     marker="o", markersize=3)
             plt.fill_between(grid, mean - std, mean + std,
                              color=style["color"], alpha=0.25)
 
@@ -689,7 +780,7 @@ def plot_convergence(results_path: str, output_dir: str):
                 style = _style(config_name)
                 spread = f" ± {std[-1]:.4f}" if n_seeds > 1 else ""
                 plt.plot(grid, mean, color=style["color"], linewidth=2.4,
-                         marker="o", markersize=4,
+                         linestyle=style["linestyle"], marker="o", markersize=4,
                          label=f"{style['label']}  →  {mean[-1]:.4f}{spread}")
                 if n_seeds > 1:
                     plt.fill_between(grid, mean - std, mean + std,
@@ -757,7 +848,7 @@ def plot_convergence(results_path: str, output_dir: str):
                 xs = [p["samples"] for p in points]
                 ys = [p["spread_l2"] for p in points]
                 plt.plot(xs, ys, color=style["color"], alpha=0.75,
-                         linewidth=1.4,
+                         linewidth=1.4, linestyle=style["linestyle"],
                          label=style["label"] if seed_i == 0 else None)
                 full_x = [p["samples"] for p in points if p.get("full_sync")]
                 full_y = [p["spread_l2"] for p in points if p.get("full_sync")]
@@ -868,7 +959,8 @@ def plot_convergence(results_path: str, output_dir: str):
             n = min(len(s) for s in spreads_per_seed)
             spread = np.array([s[:n] for s in spreads_per_seed]).mean(axis=0)
             style = _style(scenario_name)
-            plt.plot(range(1, n + 1), spread, label=style["label"], color=style["color"])
+            plt.plot(range(1, n + 1), spread, label=style["label"],
+                     color=style["color"], linestyle=style["linestyle"])
 
         plt.xlabel("Step (per replica)")
         plt.ylabel("Inter-replica loss spread (std)")
@@ -947,6 +1039,7 @@ def plot_convergence(results_path: str, output_dir: str):
         mean, std = arr.mean(axis=0), arr.std(axis=0)
         style = _style(name)
         plt.plot(steps, mean, color=style["color"], linewidth=2,
+                 linestyle=style["linestyle"],
                  label=f"{style['label']}  ({arr.shape[1]} steps)")
         plt.fill_between(steps, mean - std, mean + std,
                          color=style["color"], alpha=0.20)

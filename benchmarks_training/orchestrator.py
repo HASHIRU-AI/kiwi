@@ -19,6 +19,7 @@ from safetensors.torch import save as safetensors_save
 
 from .runners import SingleMachineRunner, DistributedRunner, MeshRunner, QLoRARunner
 from .convergence import ConvergenceEvaluator
+from . import netem
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -76,6 +77,19 @@ class Scenario:
     # DiLoCo-style outer optimizer with Nesterov momentum, applied on dense
     # rounds. The comparison arm against sparse averaging.
     outer_opt: bool = False
+    # ── Simulated WAN (WAN_SIMULATION_PLAN.md) ──
+    # Round-trip latency in ms, applied uniformly to every container-to-container
+    # link with tc netem once the cluster is ready. 0 disables it entirely and is
+    # the LAN control — every v6 arm is implicitly wan_rtt_ms: 0.
+    #
+    # RTT, not one-way: netem shapes egress, so each container is given
+    # wan_rtt_ms/2 and a round trip pays it at both ends. netem.py halves it; do
+    # not pre-halve here.
+    #
+    # Distributed scenarios only. An in-process arm (sm, sm_offload) has no
+    # network to shape, so a non-zero value there is rejected by
+    # _validate_wan_rtt rather than silently ignored.
+    wan_rtt_ms: int = 0
 
 def load_scenarios(yaml_path: str) -> List[Scenario]:
     # encoding="utf-8" is not optional. Without it Python uses the LOCALE
@@ -111,9 +125,11 @@ def load_scenarios(yaml_path: str) -> List[Scenario]:
             full_sync_every=(int(s_dict['full_sync_every'])
                              if s_dict.get('full_sync_every') is not None else None),
             outer_opt=bool(s_dict.get('outer_opt', False)),
+            wan_rtt_ms=int(s_dict.get('wan_rtt_ms', 0)),
         ))
     for s in scenarios:
         _validate_batch_size(s)
+        _validate_wan_rtt(s)
     return scenarios
 
 
@@ -176,6 +192,33 @@ def _validate_batch_size(scenario: Scenario) -> None:
             f"supported. Padded batching needs attention_mask plumbed through the "
             f"pipeline stages and a samples-axis fix, and must be verified against "
             f"the 0.9 GB per-worker VRAM cap first. Use batch_size: 1."
+        )
+
+
+def _validate_wan_rtt(scenario: Scenario) -> None:
+    """Reject a WAN setting that cannot take effect.
+
+    An in-process arm has no containers and no network, so `wan_rtt_ms: 75` on
+    `sm` would apply to nothing. Silently ignoring it is the dangerous option:
+    the scenario would be NAMED as a WAN arm, produce LAN numbers, and be
+    compared against real WAN arms as though the difference were a finding.
+
+    Negative values are rejected for the same reason — netem would refuse the
+    qdisc, and the run would continue undelayed.
+    """
+    if scenario.wan_rtt_ms == 0:
+        return
+    if scenario.wan_rtt_ms < 0:
+        raise ValueError(
+            f"Scenario '{scenario.name}': wan_rtt_ms={scenario.wan_rtt_ms} is negative."
+        )
+    if len(scenario.workers) == 0:
+        raise ValueError(
+            f"Scenario '{scenario.name}': wan_rtt_ms={scenario.wan_rtt_ms} on an "
+            f"in-process scenario (workers: []). There is no container network to "
+            f"shape, so the delay would be silently ignored and the arm would be "
+            f"labelled WAN while producing LAN numbers. Simulated latency applies "
+            f"to distributed scenarios only."
         )
 
 # NOTE: generate_compose_file is NOT currently used — the benchmark drives
@@ -1200,6 +1243,10 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
             events_all = []
             spread_all = []
             profiles_all = []
+            # Measured (not requested) WAN RTT, one entry per seed. Recorded in
+            # scenario_config so a result carries evidence of the network it ran
+            # on, not just the number that was asked for.
+            wan_measured = []
             
             if len(scenario.workers) == 0:
                 # Matched by substring so a second offload arm (a real-corpus
@@ -1390,6 +1437,19 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
 
                     wait_for_cluster(gateway_url, scenario.model, len(scenario.workers))
 
+                    # Simulated WAN goes on AFTER the cluster is ready and
+                    # BEFORE training (WAN_SIMULATION_PLAN.md §2.2): bootstrap
+                    # has its own timeouts and delaying it buys flakiness, not
+                    # signal. Per seed, not per scenario — --force-recreate
+                    # builds new containers, so seed 2 starts with a clean
+                    # network namespace and no qdisc.
+                    if scenario.wan_rtt_ms:
+                        netem.apply_wan(compose, scenario.wan_rtt_ms)
+                        # Raises if the measurement disagrees with the request.
+                        # An un-applied delay yields a complete run whose curves
+                        # look exactly like "latency made no difference".
+                        wan_measured.append(netem.verify(compose, scenario.wan_rtt_ms))
+
                     # Capture logs in a finally: the seed that FAILS is the one
                     # whose logs matter most, and it is also the one that
                     # never reaches the success path.
@@ -1478,6 +1538,15 @@ def run_orchestration(scenarios: List[Scenario], output_dir: str = "benchmark_re
                 "eval_samples": scenario.eval_samples,
                 "batch_size": scenario.batch_size,
                 "num_seeds": scenario.num_seeds,
+                # Simulated network. Both numbers, deliberately: "requested" is
+                # what the config asked for, "measured" is what the containers
+                # actually experienced. A results file that does not say what
+                # network produced it is not reproducible, and a requested value
+                # alone cannot prove the qdisc took.
+                "wan_rtt_ms": scenario.wan_rtt_ms,
+                "wan_measured_rtt_ms": wan_measured,
+                "wan_topology": "uniform" if scenario.wan_rtt_ms else None,
+                "wan_jitter_ms": 0,
             }
             if len(scenario_metrics) > 0:
                 avg_peak_mem = sum(m["peak_gpu_mb"] for m in scenario_metrics) / len(scenario_metrics)
@@ -1608,6 +1677,15 @@ if __name__ == "__main__":
         "--list", action="store_true", help="List scenario names and exit.",
     )
     parser.add_argument(
+        "--wan-rtt", type=int, default=-1,
+        help="Re-point every selected scenario that already declares a WAN to "
+             "this round-trip latency in ms (-1 = use scenarios.yaml). Affects "
+             "only arms whose wan_rtt_ms is already non-zero, so a 0 ms control "
+             "stays a control. For diagnostics — e.g. checking that the "
+             "per-step cost scales linearly with RTT — not for archived runs, "
+             "since the scenario name still carries the original value.",
+    )
+    parser.add_argument(
         "--seeds", type=int, default=0,
         help="Override num_seeds for every selected scenario (0 = use the "
              "value in the config). Use --seeds 1 for a smoke run; never "
@@ -1693,6 +1771,33 @@ if __name__ == "__main__":
         logging.warning(f"Overriding target_loss -> {args.target_loss} for all selected scenarios")
         for s in scenarios:
             s.target_loss = args.target_loss
+
+    if args.wan_rtt >= 0:
+        # Deliberately NOT "all selected scenarios", unlike the overrides
+        # around it. A 0 ms arm is the LAN CONTROL; silently giving it latency
+        # because it happened to be in --only would destroy the only baseline
+        # the WAN arms are measured against, and nothing downstream would show
+        # it. Only arms that already declare a WAN are re-pointed.
+        targets = [s for s in scenarios if s.wan_rtt_ms]
+        if not targets:
+            raise SystemExit(
+                f"--wan-rtt {args.wan_rtt} was given, but none of the selected "
+                f"scenarios declares a WAN (all have wan_rtt_ms: 0). This flag "
+                f"re-points existing WAN arms; it does not add latency to a "
+                f"control arm. Select a *_wan* scenario, or add wan_rtt_ms to "
+                f"scenarios.yaml."
+            )
+        for s in targets:
+            logging.warning(
+                f"Overriding wan_rtt_ms {s.wan_rtt_ms} -> {args.wan_rtt} for "
+                f"'{s.name}' — the NAME still says {s.wan_rtt_ms} ms. This is a "
+                f"diagnostic override: the results file records the effective "
+                f"value in scenario_config, but do not archive a run whose "
+                f"scenario name disagrees with the network it ran on."
+            )
+            s.wan_rtt_ms = args.wan_rtt
+        for s in targets:
+            _validate_wan_rtt(s)
 
     if args.epochs > 0:
         logging.warning(f"Overriding epochs -> {args.epochs} for all selected scenarios")

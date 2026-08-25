@@ -369,3 +369,100 @@ scenarios:
     average_every: 10
     outer_opt: true
     compose: "docker-compose.mesh-nospare.yml"
+
+  # ══════════════════════════════════════════════════════════════════════
+  # SIMULATED WAN — 75 ms RTT, uniform, no jitter (WAN_SIMULATION_PLAN.md).
+  #
+  # Every arm above runs on a Docker bridge where a round trip costs under a
+  # millisecond. That is a lower bound no deployment reaches, and it is the
+  # regime in which "fire a cheap sparse round every step" has never had to
+  # justify its round COUNT. These four arms are verbatim copies of their
+  # LAN counterparts with one line added, so the network is the only variable.
+  #
+  # Why this matters, from the v6 round profile:
+  #   dense    worker_rtt_ms 165.1   payload 11.7 MB    30 rounds/run
+  #   sparse5  worker_rtt_ms 174.4   payload  1.7 MB   300 rounds/run
+  # Sparse ships 7x less data for the SAME round time — the round is paying
+  # for coordination round trips, not for bytes. At 75 ms RTT those trips stop
+  # being free and sparse5 pays them ten times as often. The prediction under
+  # test is that sparse5's wall-clock advantage INVERTS here.
+  #
+  # wan_rtt_ms is round-trip. netem shapes egress, so each container is given
+  # half of it (37.5 ms) and a round trip pays both ends; netem.py does that
+  # halving. Do not pre-halve here, and do not read these as one-way numbers.
+  #
+  # Applied after the cluster reports ready, so bootstrap runs on the LAN and
+  # only training runs on the WAN — see WAN_SIMULATION_PLAN.md §2.2.
+  #
+  # Run these TOGETHER with their 0 ms counterparts in one invocation, so the
+  # control and the WAN arm land in the same results file off the same host on
+  # the same day. Comparing wall-clock against benchmark_results_v6 across a
+  # different machine and a different week is not a comparison:
+  #   --only kiwi_pipeline,kiwi_mesh2_dense,kiwi_mesh2_sparse5,kiwi_mesh2_outer,\
+  #          kiwi_pipeline_wan75,kiwi_mesh2_dense_wan75,\
+  #          kiwi_mesh2_sparse5_wan75,kiwi_mesh2_outer_wan75
+  #
+  # No _kill or _nospare WAN variants: fault tolerance under latency is a
+  # separate question and adding it here would double the sweep and confound it.
+  # No jitter: netem jitter reorders packets, TCP reads reordering as loss, and
+  # loss is explicitly out of scope. If it is wanted, it gets its own arm.
+  # ══════════════════════════════════════════════════════════════════════
+
+  - name: "kiwi_pipeline_wan75"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 3
+    epochs: 1
+    target_loss: 2.0
+    dataset: "truthfulqa"
+    eval_every: 100
+    eval_samples: 64
+    batch_size: 1
+    workers: [0.9, 0.9, 0.9]
+    replicas: 1
+    compose: "docker-compose.internet.yml"
+    wan_rtt_ms: 75
+
+  - name: "kiwi_mesh2_dense_wan75"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 3
+    epochs: 1
+    target_loss: 2.0
+    dataset: "truthfulqa"
+    eval_every: 100
+    eval_samples: 64
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 10
+    compose: "docker-compose.mesh.yml"
+    wan_rtt_ms: 75
+
+  - name: "kiwi_mesh2_sparse5_wan75"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 3
+    epochs: 1
+    target_loss: 2.0
+    dataset: "truthfulqa"
+    eval_every: 100
+    eval_samples: 64
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 1
+    sparse_p: 0.05
+    full_sync_every: 10
+    compose: "docker-compose.mesh.yml"
+    wan_rtt_ms: 75
+
+  - name: "kiwi_mesh2_outer_wan75"
+    model: "Qwen/Qwen2.5-0.5B-Instruct"
+    num_seeds: 3
+    epochs: 1
+    target_loss: 2.0
+    dataset: "truthfulqa"
+    eval_every: 100
+    eval_samples: 64
+    workers: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    replicas: 2
+    average_every: 10
+    outer_opt: true
+    compose: "docker-compose.mesh.yml"
+    wan_rtt_ms: 75
